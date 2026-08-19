@@ -707,7 +707,7 @@ impl ResourceLimits {
 }
 
 /// Checks that a path is an absolute, non-root configuration reference.
-fn validate_absolute_path(field: &'static str, path: &Path) -> RelayResult<()> {
+pub(crate) fn validate_absolute_path(field: &'static str, path: &Path) -> RelayResult<()> {
     let Some(path_text) = path.to_str() else {
         return Err(RelayError::InvalidConfiguration {
             field,
@@ -718,6 +718,15 @@ fn validate_absolute_path(field: &'static str, path: &Path) -> RelayResult<()> {
         return Err(RelayError::InvalidConfiguration {
             field,
             reason: "must be a non-empty absolute path",
+        });
+    }
+    if path_text
+        .split('/')
+        .any(|component| matches!(component, "." | ".."))
+    {
+        return Err(RelayError::InvalidConfiguration {
+            field,
+            reason: "must not contain relative path components",
         });
     }
     Ok(())
@@ -1107,6 +1116,19 @@ server_name = "relay.test"
         let error = parse_error(&input);
         assert!(error.to_string().contains("security.server_cert"));
         assert!(error.to_string().contains("absolute path"));
+    }
+
+    // TEST:relay/src/config.rs[tests::relative_path_components_are_rejected]
+    #[test]
+    fn relative_path_components_are_rejected() {
+        for component in [".", ".."] {
+            let input = VALID_CONFIG.replace(
+                "/Users/test/.config/herdr/herdr.sock",
+                &format!("/Users/test/.config/herdr/{component}/herdr.sock"),
+            );
+            let error = parse_error(&input);
+            assert!(error.to_string().contains("relative path components"));
+        }
     }
 
     // TEST:relay/src/config.rs[tests::invalid_server_identity_is_rejected]

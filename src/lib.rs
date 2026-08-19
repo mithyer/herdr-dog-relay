@@ -9,7 +9,11 @@
 #[cfg(not(unix))]
 compile_error!("herdr-dog-relay currently supports Unix hosts only");
 
+/// Bounded, protocol-agnostic bidirectional byte forwarding.
+pub mod bridge;
 /// Strongly typed configuration and v1 policy constants.
 pub mod config;
 /// Shared error types and the crate result alias.
 pub mod error;
+/// Validated Unix-domain socket access for the configured Herdr endpoint.
+pub mod socket;
