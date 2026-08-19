@@ -7,7 +7,7 @@ pub type RelayResult<T> = Result<T, RelayError>;
 
 /// Redacted, bounded error categories exposed by the relay.
 #[non_exhaustive]
-#[derive(Debug, thiserror::Error)]
+#[derive(Clone, Debug, thiserror::Error)]
 pub enum RelayError {
     /// A configuration field failed a validation rule.
     #[error("invalid configuration for {field}: {reason}")]
@@ -31,6 +31,17 @@ pub enum RelayError {
         /// The operating-system error category without its free-form message.
         kind: io::ErrorKind,
     },
+    /// The configured Unix socket failed an identity or permission check.
+    #[error("Unix socket identity check failed: {operation} ({reason})")]
+    SocketIdentity {
+        /// The stable operation category.
+        operation: &'static str,
+        /// The non-secret identity failure reason.
+        reason: &'static str,
+    },
+    /// The bridge exceeded its bounded whole-stream idle timeout.
+    #[error("byte bridge idle timeout")]
+    BridgeIdleTimeout,
 }
 
 impl RelayError {

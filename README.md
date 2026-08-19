@@ -1,6 +1,6 @@
 # Herdr-dog Relay
 
-Status: Rust implementation in progress. The relay must remain fail-closed and must not claim production deployment or Herdr integration until the documented verification gates pass.
+Status: Rust implementation in progress. The R1 configuration contract and R2 local Unix socket bridge are implemented and locally verified; the relay must remain fail-closed and must not claim production deployment or Herdr integration until the documented verification gates pass.
 
 Herdr-dog Relay is a planned user-level macOS service that exposes a controlled, authenticated network endpoint for a mobile Core and forwards the resulting byte stream to one Herdr Unix socket on the same host.
 
@@ -26,12 +26,22 @@ The relay is not Herdr-dog Core. It does not interpret the Herdr protocol, manag
 - [Operations](docs/operations.md): planned deployment, diagnostics, rollback, and verification procedures.
 - [Port Selection and Discovery](docs/port-selection-and-discovery.md): bounded ten-port selection, authenticated probing, and failure semantics.
 
+## Current Implementation
+
+The current Rust scope includes:
+
+- fail-closed v1 configuration parsing and redacted validation errors;
+- Unix socket type, owner, private-permission, parent-directory, and identity checks;
+- bounded protocol-agnostic bidirectional forwarding with half-close propagation and whole-stream idle timeout;
+- no Herdr payload parsing, logging, persistence, or automatic write retry.
+
+This is local library evidence only. It does not establish a real network listener, TLS/mTLS handshake, deployment, or end-to-end Herdr integration.
 ## Current Non-Goals
 
 This checkpoint does not include:
 
 - a launchd plist;
-- a TCP listener or Unix socket connector;
+- a TCP listener;
 - TLS certificate generation or provisioning;
 - Tailscale configuration changes;
 - Herdr protocol parsing;
