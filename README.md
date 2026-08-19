@@ -19,12 +19,7 @@ The relay is not Herdr-dog Core. It does not interpret the Herdr protocol, manag
 
 ## Documentation
 
-- [Architecture](docs/architecture.md): components, stream ownership, lifecycle, and failure boundaries.
-- [Security and Network Policy](docs/security-and-network-policy.md): the three network classes, defaults, admission rules, authentication, and threat model.
-- [Implementation Plan](docs/implementation-plan.md): dependency-ordered milestones and acceptance gates.
-- [Decision Register](docs/decision-register.md): recorded decisions, owners, evidence, and unresolved questions.
-- [Operations](docs/operations.md): planned deployment, diagnostics, rollback, and verification procedures.
-- [Port Selection and Discovery](docs/port-selection-and-discovery.md): bounded ten-port selection, authenticated probing, and failure semantics.
+Relay design, security, implementation-plan, decision, operations, and port-discovery documents are maintained by the parent Wiki under `/herdr-dog/relay/docs/`. They are intentionally excluded from this submodule's GitHub tree so the relay repository remains focused on source and release artifacts.
 
 ## Current Implementation
 
@@ -38,18 +33,23 @@ The current Rust scope includes:
 - global, per-listener, and in-progress-handshake quotas with bounded deadlines;
 - Unix socket type, owner, private-permission, parent-directory, and identity checks;
 - bounded protocol-agnostic bidirectional forwarding with half-close propagation and whole-stream idle timeout;
+- a `herdogrelay` command-line host that loads validated TOML, handles SIGINT/SIGTERM shutdown, and reports only bounded listener counters;
+- a checksum-verified macOS release installer at [`install.sh`](install.sh) and a tag-triggered GitHub release workflow;
 - no Herdr payload parsing, logging, persistence, or automatic write retry.
 
-This is local Rust library evidence only. It does not establish a real Tailscale path, iPhone/Core-to-Relay connection, deployment, or end-to-end Herdr integration.
+The installer downloads only a versioned macOS release archive into the user's `~/.local/bin` by default. It does not create or overwrite relay configuration, certificates, private keys, or credentials.
+
 ## Current Non-Goals
 
 This checkpoint does not include:
 
-- a relay binary or LaunchAgent deployment artifact;
+- a macOS LaunchAgent deployment artifact;
 - TLS certificate generation or provisioning;
 - Tailscale configuration changes;
 - Herdr protocol parsing;
 - App or Core changes;
 - public-network exposure.
+
+This checkpoint includes the command-line host and release packaging, but it does not establish a real Tailscale path, iPhone/Core-to-Relay connection, deployment, or end-to-end Herdr integration.
 
 Rust implementation is authorized under the recorded decisions. Deployment, LAN/public enablement, and production claims remain gated by the linked verification requirements.
