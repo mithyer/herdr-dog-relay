@@ -113,8 +113,8 @@ jobs:
           RELEASE_TAG: ${{ github.event.inputs.tag || github.ref_name }}
         run: |
           set -eu
-          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
-            gh release upload "$RELEASE_TAG" dist/herdogrelay-macos-*.tar.gz dist/checksums.txt --clobber
+          if gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$RELEASE_TAG" dist/herdogrelay-macos-*.tar.gz dist/checksums.txt --repo "$GITHUB_REPOSITORY" --clobber
           else
-            gh release create "$RELEASE_TAG" dist/herdogrelay-macos-*.tar.gz dist/checksums.txt --generate-notes
+            gh release create "$RELEASE_TAG" dist/herdogrelay-macos-*.tar.gz dist/checksums.txt --repo "$GITHUB_REPOSITORY" --generate-notes
           fi
