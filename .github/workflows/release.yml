@@ -1,0 +1,120 @@
+name: Release herdogrelay
+
+on:
+  # Build release archives when a version tag is pushed.
+  push:
+    tags:
+      - "v*"
+  # Keep manual release reruns available for a tag selected by the operator.
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing release tag to build"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  # Serialize releases for the same tag so checksums cannot mix archives.
+  group: herdogrelay-release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build macOS ${{ matrix.arch }} archive
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - arch: arm64
+            target: aarch64-apple-darwin
+            runner: macos-14
+          - arch: x86_64
+            target: x86_64-apple-darwin
+            runner: macos-14
+    steps:
+      # Check out the exact tagged source used for the release archive.
+      - name: Check out source
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+
+      # Use the repository lockfile so release dependencies cannot drift silently.
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      # Confirm that the release tag and embedded CLI version cannot drift apart.
+      - name: Verify release version
+        env:
+          RELEASE_TAG: ${{ github.event.inputs.tag || github.ref_name }}
+        run: |
+          set -eu
+          package_version="$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "herdr-dog-relay") | .version')"
+          test "v$package_version" = "$RELEASE_TAG"
+
+      # Run the same quality gates used by the local checkpoint before packaging.
+      - name: Validate source
+        run: |
+          cargo fmt --all -- --check
+          cargo clippy --all-targets --all-features --locked -- -D warnings
+          cargo test --all-targets --all-features --locked
+
+      # Build only the user-facing herdogrelay command-line binary.
+      - name: Build herdogrelay
+        run: cargo build --release --locked --bin herdogrelay --target ${{ matrix.target }}
+
+      # Archive the single executable with no config, credential, or local path material.
+      - name: Package archive
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist/package
+          cp "target/${{ matrix.target }}/release/herdogrelay" dist/package/herdogrelay
+          chmod 0755 dist/package/herdogrelay
+          tar -C dist/package -czf "dist/herdogrelay-macos-${{ matrix.arch }}.tar.gz" herdogrelay
+
+      # Pass only the release archive to the publishing job; checksums are generated once there.
+      - name: Upload archive
+        uses: actions/upload-artifact@v4
+        with:
+          name: herdogrelay-macos-${{ matrix.arch }}
+          path: dist/herdogrelay-macos-${{ matrix.arch }}.tar.gz
+          if-no-files-found: error
+
+  publish:
+    name: Publish release archives
+    needs: build
+    runs-on: macos-14
+    steps:
+      # Download both architecture-specific archives into one release directory.
+      - name: Download archives
+        uses: actions/download-artifact@v4
+        with:
+          pattern: herdogrelay-macos-*
+          path: dist
+          merge-multiple: true
+
+      # Generate one deterministic checksum manifest consumed by install.sh.
+      - name: Generate checksums
+        run: |
+          set -eu
+          cd dist
+          shasum -a 256 herdogrelay-macos-*.tar.gz > checksums.txt
+
+      # Update an existing tag release on manual reruns, otherwise create it once.
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.event.inputs.tag || github.ref_name }}
+        run: |
+          set -eu
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            gh release upload "$RELEASE_TAG" dist/herdogrelay-macos-*.tar.gz dist/checksums.txt --clobber
+          else
+            gh release create "$RELEASE_TAG" dist/herdogrelay-macos-*.tar.gz dist/checksums.txt --generate-notes
+          fi
