@@ -39,6 +39,48 @@ pub enum RelayError {
         /// The non-secret identity failure reason.
         reason: &'static str,
     },
+    /// Listener startup was rejected by a stable policy boundary.
+    #[error("relay listener startup failed: {reason}")]
+    ListenerStartup {
+        /// The non-secret startup reason.
+        reason: &'static str,
+    },
+    /// Every v1 candidate port was occupied.
+    #[error("all v1 relay ports are occupied")]
+    PortRangeExhausted,
+    /// An enabled listener address could not be bound.
+    #[error("relay listener address is unavailable")]
+    ListenerAddressUnavailable,
+    /// The accepted peer source was not in the listener allowlist.
+    #[error("relay peer source is not allowed")]
+    SourceNotAllowed,
+    /// The global or per-listener client quota was exhausted.
+    #[error("relay client limit reached")]
+    ClientLimit,
+    /// The concurrent TLS/Relay handshake quota was exhausted.
+    #[error("relay handshake limit reached")]
+    HandshakeLimit,
+    /// The TLS certificate, key, or trust-anchor references are invalid.
+    #[error("TLS configuration failed: {reason}")]
+    TlsConfiguration {
+        /// The non-secret TLS configuration reason.
+        reason: &'static str,
+    },
+    /// The peer failed mandatory TLS client authentication.
+    #[error("TLS client authentication failed")]
+    TlsAuthentication,
+    /// The peer failed the fixed Relay handshake.
+    #[error("Relay handshake failed")]
+    RelayHandshake,
+    /// The TLS and Relay handshake deadline elapsed.
+    #[error("Relay handshake timed out")]
+    RelayHandshakeTimeout,
+    /// The configured milestone does not support this enabled listener class.
+    #[error("listener class is not supported in this milestone")]
+    UnsupportedListenerClass,
+    /// The configured Herdr socket could not be opened within the bounded deadline.
+    #[error("Herdr Unix socket is unavailable")]
+    UpstreamUnavailable,
     /// The bridge exceeded its bounded whole-stream idle timeout.
     #[error("byte bridge idle timeout")]
     BridgeIdleTimeout,

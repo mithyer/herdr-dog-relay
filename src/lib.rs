@@ -15,5 +15,11 @@ pub mod bridge;
 pub mod config;
 /// Shared error types and the crate result alias.
 pub mod error;
+/// Fixed binary challenge handshake used after TLS authentication.
+pub mod handshake;
+/// Authenticated Tailscale listener and bounded client admission.
+pub mod listener;
 /// Validated Unix-domain socket access for the configured Herdr endpoint.
 pub mod socket;
+
+mod tls;

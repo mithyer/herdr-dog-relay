@@ -5,9 +5,14 @@ use ipnet::IpNet;
 use serde::{Deserialize, Deserializer, de::Error as _};
 use std::{
     fs,
-    net::IpAddr,
+    net::{IpAddr, Ipv4Addr},
     path::{Path, PathBuf},
 };
+
+/// The value that asks Relay to resolve Herdr's platform-specific default socket.
+pub const AUTO_HERDR_SOCKET_PATH: &str = "auto";
+/// The complete commented TOML template containing every v1 configuration parameter.
+pub const DEFAULT_CONFIG_TOML: &str = include_str!("../config/default.toml");
 
 /// The v1 listener base port shared by Relay and Core.
 pub const V1_PORT_BASE: u16 = 18_743;
@@ -47,8 +52,8 @@ pub struct RelayConfig {
     relay: RelaySection,
     /// The network listener settings.
     network: NetworkConfig,
-    /// The mandatory mutual-TLS settings.
-    security: SecurityConfig,
+    /// Optional mutual-TLS settings required by any enabled TLS listener.
+    security: Option<SecurityConfig>,
     /// The fixed v1 resource limits.
     limits: ResourceLimits,
 }
@@ -62,8 +67,9 @@ struct RelayConfigWire {
     /// The network listener settings.
     #[serde(default = "default_network_config")]
     network: NetworkConfig,
-    /// The mandatory mutual-TLS settings.
-    security: SecurityConfig,
+    /// Optional mutual-TLS settings required by any enabled TLS listener.
+    #[serde(default)]
+    security: Option<SecurityConfig>,
     /// The fixed v1 resource limits.
     #[serde(default)]
     limits: ResourceLimits,
@@ -99,7 +105,9 @@ impl RelayConfig {
     /// Builds and validates a public configuration from its private wire shape.
     fn from_wire(wire: RelayConfigWire) -> RelayResult<Self> {
         let config = Self {
-            relay: wire.relay,
+            relay: RelaySection {
+                herdr_socket: resolve_herdr_socket(wire.relay.herdr_socket)?,
+            },
             network: wire.network,
             security: wire.security,
             limits: wire.limits,
@@ -130,7 +138,19 @@ impl RelayConfig {
     pub fn validate(&self) -> RelayResult<()> {
         validate_absolute_path("relay.herdr_socket", &self.relay.herdr_socket)?;
         self.network.validate()?;
-        self.security.validate()?;
+        if let Some(security) = &self.security {
+            security.validate()?;
+        }
+        let tls_required = self
+            .network
+            .listeners()
+            .any(|(class, listener)| listener.is_enabled() && listener.uses_tls(class));
+        if tls_required && self.security.is_none() {
+            return Err(RelayError::InvalidConfiguration {
+                field: "security",
+                reason: "TLS-enabled listeners require mutual-TLS settings",
+            });
+        }
         self.limits.validate()
     }
 
@@ -152,13 +172,13 @@ impl RelayConfig {
         &self.network
     }
 
-    /// Returns the validated mutual-TLS configuration.
+    /// Returns the optional validated mutual-TLS configuration.
     ///
     /// # Returns
     ///
-    /// The security configuration.
-    pub fn security(&self) -> &SecurityConfig {
-        &self.security
+    /// The security configuration when at least one TLS listener requires it.
+    pub fn security(&self) -> Option<&SecurityConfig> {
+        self.security.as_ref()
     }
 
     /// Returns the validated resource limits.
@@ -333,18 +353,36 @@ impl ListenerClass {
 }
 
 /// One explicitly configured network listener policy.
-#[derive(Clone, Default, Deserialize)]
+#[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ListenerConfig {
     /// Whether this listener is enabled.
     #[serde(default)]
     enabled: bool,
+    /// Whether this listener wraps the Relay stream in TLS.
+    #[serde(default)]
+    tls: Option<bool>,
     /// The explicit non-wildcard bind address.
     #[serde(default)]
     bind_address: Option<IpAddr>,
     /// The exact source address or CIDR allowlist.
     #[serde(default, deserialize_with = "deserialize_source_networks")]
     allowed_sources: Vec<IpNet>,
+}
+
+/// Supplies safe explicit values for an omitted listener table.
+impl Default for ListenerConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            tls: None,
+            bind_address: Some(IpAddr::V4(Ipv4Addr::LOCALHOST)),
+            allowed_sources: vec![
+                IpNet::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 32)
+                    .expect("localhost IPv4 prefix is valid"),
+            ],
+        }
+    }
 }
 
 impl ListenerConfig {
@@ -355,6 +393,20 @@ impl ListenerConfig {
     /// `true` when this class may bind.
     pub fn is_enabled(&self) -> bool {
         self.enabled
+    }
+
+    /// Returns whether this listener uses TLS under its network-class default.
+    ///
+    /// # Arguments
+    ///
+    /// * `class` - The network class that owns this listener.
+    ///
+    /// # Returns
+    ///
+    /// The explicit setting, or `false` for Tailscale and `true` for LAN/public.
+    pub fn uses_tls(&self, class: ListenerClass) -> bool {
+        self.tls
+            .unwrap_or(!matches!(class, ListenerClass::Tailscale))
     }
 
     /// Returns the explicit bind address, if configured.
@@ -402,38 +454,28 @@ impl ListenerConfig {
     ///
     /// `Ok(())` when the listener policy is explicit and fail-closed.
     pub fn validate(&self, class: ListenerClass) -> RelayResult<()> {
-        let (enabled_field, address_field, sources_field) = match class {
+        let (address_field, sources_field) = match class {
             ListenerClass::Tailscale => (
-                "network.tailscale.enabled",
                 "network.tailscale.bind_address",
                 "network.tailscale.allowed_sources",
             ),
-            ListenerClass::Lan => (
-                "network.lan.enabled",
-                "network.lan.bind_address",
-                "network.lan.allowed_sources",
-            ),
+            ListenerClass::Lan => ("network.lan.bind_address", "network.lan.allowed_sources"),
             ListenerClass::Public => (
-                "network.public.enabled",
                 "network.public.bind_address",
                 "network.public.allowed_sources",
             ),
         };
 
-        if !self.enabled {
-            if self.bind_address.is_some() || !self.allowed_sources.is_empty() {
-                return Err(RelayError::InvalidConfiguration {
-                    field: enabled_field,
-                    reason: "disabled listeners must not define address or sources",
-                });
-            }
+        // Disabled classes may keep explicit safe defaults so a complete TOML template can
+        // describe every field; they still never bind until enabled is true.
+        if !self.enabled && self.bind_address.is_none() && self.allowed_sources.is_empty() {
             return Ok(());
         }
 
         let Some(bind_address) = self.bind_address else {
             return Err(RelayError::InvalidConfiguration {
                 field: address_field,
-                reason: "enabled listeners require an explicit address",
+                reason: "listener source policy requires an explicit address",
             });
         };
         if bind_address.is_unspecified() {
@@ -449,10 +491,13 @@ impl ListenerConfig {
             });
         }
         if self.allowed_sources.is_empty() {
-            return Err(RelayError::InvalidConfiguration {
-                field: sources_field,
-                reason: "enabled listeners require a non-empty source allowlist",
-            });
+            if self.enabled {
+                return Err(RelayError::InvalidConfiguration {
+                    field: sources_field,
+                    reason: "enabled listeners require a non-empty source allowlist",
+                });
+            }
+            return Ok(());
         }
         if self.allowed_sources.len() > MAX_SOURCE_ENTRIES {
             return Err(RelayError::InvalidConfiguration {
@@ -706,6 +751,97 @@ impl ResourceLimits {
     }
 }
 
+/// Resolves the explicit path or Herdr's platform-specific `auto` socket value.
+fn resolve_herdr_socket(path: PathBuf) -> RelayResult<PathBuf> {
+    let socket_override = std::env::var_os("HERDR_SOCKET_PATH");
+    let xdg_config_home = std::env::var_os("XDG_CONFIG_HOME");
+    let home = std::env::var_os("HOME");
+    let session = std::env::var_os("HERDR_SESSION");
+    let app_dir = if cfg!(debug_assertions) {
+        "herdr-dev"
+    } else {
+        "herdr"
+    };
+    let fallback_root = std::env::temp_dir();
+
+    resolve_herdr_socket_from_values(
+        path,
+        socket_override.as_deref(),
+        xdg_config_home.as_deref(),
+        home.as_deref(),
+        session.as_deref(),
+        app_dir,
+        &fallback_root,
+    )
+}
+
+/// Resolves `auto` from injected environment values without mutating process state.
+fn resolve_herdr_socket_from_values(
+    path: PathBuf,
+    socket_override: Option<&std::ffi::OsStr>,
+    xdg_config_home: Option<&std::ffi::OsStr>,
+    home: Option<&std::ffi::OsStr>,
+    session: Option<&std::ffi::OsStr>,
+    app_dir: &str,
+    fallback_root: &Path,
+) -> RelayResult<PathBuf> {
+    if path != Path::new(AUTO_HERDR_SOCKET_PATH) {
+        return Ok(path);
+    }
+
+    if let Some(socket_path) = socket_override {
+        let socket_path = PathBuf::from(socket_path);
+        if socket_path.as_os_str().is_empty() {
+            return Err(RelayError::InvalidConfiguration {
+                field: "HERDR_SOCKET_PATH",
+                reason: "must not be empty when set",
+            });
+        }
+        return Ok(socket_path);
+    }
+
+    let config_root = xdg_config_home
+        .map(PathBuf::from)
+        .or_else(|| home.map(|home| PathBuf::from(home).join(".config")))
+        .unwrap_or_else(|| fallback_root.to_path_buf());
+    resolve_default_herdr_socket(config_root, app_dir, session)
+}
+
+/// Builds Herdr's default socket path from an already selected config root.
+fn resolve_default_herdr_socket(
+    config_root: PathBuf,
+    app_dir: &str,
+    session: Option<&std::ffi::OsStr>,
+) -> RelayResult<PathBuf> {
+    let mut socket_dir = config_root.join(app_dir);
+
+    if let Some(session) = session {
+        let session = session.to_string_lossy();
+        if session != "default" {
+            if !valid_herdr_session_name(&session) {
+                return Err(RelayError::InvalidConfiguration {
+                    field: "HERDR_SESSION",
+                    reason: "must contain only ASCII letters, numbers, '.', '_' or '-'",
+                });
+            }
+            socket_dir = socket_dir.join("sessions").join(session.as_ref());
+        }
+    }
+
+    Ok(socket_dir.join("herdr.sock"))
+}
+
+/// Checks the session-name grammar used by Herdr before joining it to a path.
+fn valid_herdr_session_name(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 64
+        && value != "."
+        && value != ".."
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+}
+
 /// Checks that a path is an absolute, non-root configuration reference.
 pub(crate) fn validate_absolute_path(field: &'static str, path: &Path) -> RelayResult<()> {
     let Some(path_text) = path.to_str() else {
@@ -820,6 +956,7 @@ fn default_port_attempts() -> u8 {
 fn default_tailscale_listener() -> ListenerConfig {
     ListenerConfig {
         enabled: true,
+        tls: Some(false),
         bind_address: None,
         allowed_sources: Vec::new(),
     }
@@ -898,6 +1035,145 @@ server_name = "relay.test"
         }
     }
 
+    // TEST:relay/src/config.rs[tests::default_template_is_complete_and_valid]
+    #[test]
+    fn default_template_is_complete_and_valid() {
+        assert!(DEFAULT_CONFIG_TOML.contains("herdr_socket = \"auto\""));
+        let input = DEFAULT_CONFIG_TOML.replace(
+            "herdr_socket = \"auto\"",
+            "herdr_socket = \"/Users/<user>/.config/herdr/herdr.sock\"",
+        );
+        let config = RelayConfig::from_toml_str(&input)
+            .expect("the complete default TOML template must validate");
+        assert!(config.herdr_socket().is_absolute());
+        assert!(config.herdr_socket().ends_with("herdr.sock"));
+        assert!(
+            config
+                .network()
+                .listener(ListenerClass::Tailscale)
+                .is_enabled()
+        );
+        assert!(
+            !config
+                .network()
+                .listener(ListenerClass::Tailscale)
+                .uses_tls(ListenerClass::Tailscale)
+        );
+        assert!(!config.network().listener(ListenerClass::Lan).is_enabled());
+        assert!(
+            config
+                .network()
+                .listener(ListenerClass::Lan)
+                .uses_tls(ListenerClass::Lan)
+        );
+        assert!(
+            !config
+                .network()
+                .listener(ListenerClass::Public)
+                .is_enabled()
+        );
+        assert!(
+            config
+                .network()
+                .listener(ListenerClass::Public)
+                .uses_tls(ListenerClass::Public)
+        );
+    }
+
+    // TEST:relay/src/config.rs[tests::auto_socket_environment_precedence_is_deterministic]
+    #[test]
+    fn auto_socket_environment_precedence_is_deterministic() {
+        let override_path = Path::new("/override/herdr.sock");
+        let xdg_path = Path::new("/xdg");
+        let home_path = Path::new("/home/test");
+        let fallback_path = Path::new("/tmp/fallback");
+
+        let overridden = resolve_herdr_socket_from_values(
+            PathBuf::from(AUTO_HERDR_SOCKET_PATH),
+            Some(override_path.as_os_str()),
+            Some(xdg_path.as_os_str()),
+            Some(home_path.as_os_str()),
+            Some(std::ffi::OsStr::new("work")),
+            "herdr",
+            fallback_path,
+        )
+        .expect("explicit socket override");
+        assert_eq!(overridden, override_path);
+
+        let xdg_session = resolve_herdr_socket_from_values(
+            PathBuf::from(AUTO_HERDR_SOCKET_PATH),
+            None,
+            Some(xdg_path.as_os_str()),
+            Some(home_path.as_os_str()),
+            Some(std::ffi::OsStr::new("work")),
+            "herdr",
+            fallback_path,
+        )
+        .expect("XDG named session socket");
+        assert_eq!(
+            xdg_session,
+            PathBuf::from("/xdg/herdr/sessions/work/herdr.sock")
+        );
+
+        let home_default = resolve_herdr_socket_from_values(
+            PathBuf::from(AUTO_HERDR_SOCKET_PATH),
+            None,
+            None,
+            Some(home_path.as_os_str()),
+            Some(std::ffi::OsStr::new("default")),
+            "herdr-dev",
+            fallback_path,
+        )
+        .expect("HOME default-session socket");
+        assert_eq!(
+            home_default,
+            PathBuf::from("/home/test/.config/herdr-dev/herdr.sock")
+        );
+    }
+
+    // TEST:relay/src/config.rs[tests::auto_socket_rejects_empty_override]
+    #[test]
+    fn auto_socket_rejects_empty_override() {
+        let error = resolve_herdr_socket_from_values(
+            PathBuf::from(AUTO_HERDR_SOCKET_PATH),
+            Some(std::ffi::OsStr::new("")),
+            None,
+            None,
+            None,
+            "herdr",
+            Path::new("/tmp"),
+        )
+        .expect_err("empty socket override must fail closed");
+        assert!(error.to_string().contains("HERDR_SOCKET_PATH"));
+    }
+
+    // TEST:relay/src/config.rs[tests::auto_socket_resolves_named_session]
+    #[test]
+    fn auto_socket_resolves_named_session() {
+        let path = resolve_default_herdr_socket(
+            PathBuf::from("/Users/test/.config"),
+            "herdr",
+            Some(std::ffi::OsStr::new("work")),
+        )
+        .expect("valid session name");
+        assert_eq!(
+            path,
+            PathBuf::from("/Users/test/.config/herdr/sessions/work/herdr.sock")
+        );
+    }
+
+    // TEST:relay/src/config.rs[tests::auto_socket_rejects_unsafe_session]
+    #[test]
+    fn auto_socket_rejects_unsafe_session() {
+        let error = resolve_default_herdr_socket(
+            PathBuf::from("/Users/test/.config"),
+            "herdr",
+            Some(std::ffi::OsStr::new("../escape")),
+        )
+        .expect_err("path traversal must be rejected");
+        assert!(error.to_string().contains("HERDR_SESSION"));
+    }
+
     // TEST:relay/src/config.rs[tests::valid_configuration_exposes_only_v1_values]
     #[test]
     fn valid_configuration_exposes_only_v1_values() {
@@ -918,6 +1194,24 @@ server_name = "relay.test"
                 .listener(ListenerClass::Tailscale)
                 .bind_address(),
             Some("127.0.0.1".parse().expect("loopback address"))
+        );
+        assert!(
+            !config
+                .network()
+                .listener(ListenerClass::Tailscale)
+                .uses_tls(ListenerClass::Tailscale)
+        );
+        assert!(
+            config
+                .network()
+                .listener(ListenerClass::Lan)
+                .uses_tls(ListenerClass::Lan)
+        );
+        assert!(
+            config
+                .network()
+                .listener(ListenerClass::Public)
+                .uses_tls(ListenerClass::Public)
         );
     }
 
@@ -1096,14 +1390,22 @@ server_name = "relay.test"
         assert!(error.to_string().contains("wildcard addresses"));
     }
 
-    // TEST:relay/src/config.rs[tests::disabled_listener_cannot_retain_policy]
+    // TEST:relay/src/config.rs[tests::disabled_listener_rejects_unsafe_policy]
     #[test]
-    fn disabled_listener_cannot_retain_policy() {
-        let input = format!(
-            "{VALID_CONFIG}\n[network.lan]\nenabled = false\nbind_address = \"127.0.0.1\"\n"
-        );
+    fn disabled_listener_rejects_unsafe_policy() {
+        let input =
+            format!("{VALID_CONFIG}\n[network.lan]\nenabled = false\nbind_address = \"0.0.0.0\"\n");
         let error = parse_error(&input);
-        assert!(error.to_string().contains("disabled listeners"));
+        assert!(error.to_string().contains("wildcard addresses"));
+    }
+
+    // TEST:relay/src/config.rs[tests::enabled_listener_rejects_empty_source_policy]
+    #[test]
+    fn enabled_listener_rejects_empty_source_policy() {
+        let input =
+            VALID_CONFIG.replace("allowed_sources = [\"127.0.0.1\"]", "allowed_sources = []");
+        let error = parse_error(&input);
+        assert!(error.to_string().contains("non-empty source allowlist"));
     }
 
     // TEST:relay/src/config.rs[tests::mtls_file_references_reject_root]
