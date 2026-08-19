@@ -10,9 +10,9 @@ name = "herdr_dog_relay"
 path = "src/lib.rs"
 
 [dependencies]
-ipnet = "2.11"
+ipnet = { version = "2.11", features = ["serde"] }
 rand = "0.9"
-rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 rustls-pemfile = "2.2"
 serde = { version = "1.0", features = ["derive"] }
 thiserror = "2.0"
