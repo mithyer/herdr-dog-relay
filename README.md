@@ -1,6 +1,6 @@
 # Herdr-dog Relay
 
-Status: Rust implementation in progress. The R1 configuration contract and R2 local Unix socket bridge are implemented and locally verified; the relay must remain fail-closed and must not claim production deployment or Herdr integration until the documented verification gates pass.
+Status: Rust implementation in progress. The R1 configuration contract, R2 local Unix socket bridge, and R3 authenticated Tailscale listener library are implemented and locally verified; the external Tailnet/Core/Herdr gate remains open, so the relay must remain fail-closed and must not claim production deployment or end-to-end integration.
 
 Herdr-dog Relay is a planned user-level macOS service that exposes a controlled, authenticated network endpoint for a mobile Core and forwards the resulting byte stream to one Herdr Unix socket on the same host.
 
@@ -9,12 +9,12 @@ The relay is not Herdr-dog Core. It does not interpret the Herdr protocol, manag
 ## Design Summary
 
 - Host: the macOS machine that runs Herdr, such as `mb17`.
-- Downstream: one configured Herdr Unix socket, for example `/Users/<user>/.config/herdr/herdr.sock`.
-- Upstream: an authenticated TCP/TLS connection from the mobile App's embedded Core.
+- Downstream: one configured Herdr Unix socket. The default TOML uses `herdr_socket = "auto"`, which follows Herdr's macOS/Linux config resolution (`$XDG_CONFIG_HOME/herdr/herdr.sock` or `$HOME/.config/herdr/herdr.sock`); named sessions use `sessions/<name>/herdr.sock`, and a debug Herdr build uses `herdr-dev`. An absolute path can pin a deployment.
+- Upstream: a configured transport from the mobile App's embedded Core; Tailscale uses encrypted Tailnet transport by default, while LAN/public use TLS 1.3 by default.
 - Network classes: `tailscale`, `lan`, and `public`.
-- Default policy: `tailscale` enabled; `lan` and `public` disabled.
+- Configuration template: [`config/default.toml`](config/default.toml) contains every TOML parameter with a safe default and an adjacent comment; Tailscale defaults to TLS off, while LAN/public default to TLS on.
 - App-facing setup: the user provides only the relay IP/address; v1 fixes the shared port contract to `18743..18752` (base `18743`, ten attempts), the Relay selects the first available candidate, and the App/Core probes the same range until an authenticated Relay handshake succeeds. Discovery may repeat that fixed sweep no more than three times with bounded backoff.
-- Security posture: explicit listener binding, source allowlists, authenticated clients, bounded resources, no payload logging, and fail-closed policy handling.
+- Security posture: explicit listener binding, source allowlists, class-specific transport authentication, bounded resources, no payload logging, and fail-closed policy handling.
 - Initial deployment: a least-privileged user-level macOS LaunchAgent after the design and implementation gates are approved.
 
 ## Documentation
@@ -30,18 +30,22 @@ The relay is not Herdr-dog Core. It does not interpret the Herdr protocol, manag
 
 The current Rust scope includes:
 
-- fail-closed v1 configuration parsing and redacted validation errors;
+- fail-closed v1 configuration parsing with a complete commented TOML template and redacted validation errors;
+- deterministic first-available selection across ports `18743..18752`;
+- one explicit Tailscale listener with source allowlist admission;
+- TLS 1.3 mutual client authentication for TLS-enabled listeners, with the fixed Relay handshake and source policy also mandatory for the default Tailscale path;
+- fixed `HDRL` challenge/nonce/acknowledgement handshake before Unix-socket access;
+- global, per-listener, and in-progress-handshake quotas with bounded deadlines;
 - Unix socket type, owner, private-permission, parent-directory, and identity checks;
 - bounded protocol-agnostic bidirectional forwarding with half-close propagation and whole-stream idle timeout;
 - no Herdr payload parsing, logging, persistence, or automatic write retry.
 
-This is local library evidence only. It does not establish a real network listener, TLS/mTLS handshake, deployment, or end-to-end Herdr integration.
+This is local Rust library evidence only. It does not establish a real Tailscale path, iPhone/Core-to-Relay connection, deployment, or end-to-end Herdr integration.
 ## Current Non-Goals
 
 This checkpoint does not include:
 
-- a launchd plist;
-- a TCP listener;
+- a relay binary or LaunchAgent deployment artifact;
 - TLS certificate generation or provisioning;
 - Tailscale configuration changes;
 - Herdr protocol parsing;
