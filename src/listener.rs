@@ -519,6 +519,21 @@ fn close_reason_for_error(error: &RelayError) -> ConnectionCloseReason {
         RelayError::UpstreamUnavailable | RelayError::SocketIdentity { .. } => {
             ConnectionCloseReason::UpstreamUnavailable
         }
+        // Missing or refused socket connections are upstream availability, not listener internals.
+        RelayError::Io { operation, kind }
+            if matches!(
+                *kind,
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
+            ) && matches!(
+                *operation,
+                "checking Herdr Unix socket"
+                    | "checking Herdr socket parent"
+                    | "checking Herdr socket path"
+                    | "connecting to Herdr Unix socket"
+            ) =>
+        {
+            ConnectionCloseReason::UpstreamUnavailable
+        }
         RelayError::BridgeIdleTimeout => ConnectionCloseReason::IdleTimeout,
         RelayError::Io { .. } => ConnectionCloseReason::Internal,
         _ => ConnectionCloseReason::Internal,
@@ -898,6 +913,54 @@ mod tests {
         );
         fs::remove_file(socket_path).expect("remove Herdr test socket");
         fs::remove_dir(root).expect("remove Herdr socket directory");
+    }
+
+    // TEST:relay/src/listener.rs[tests::missing_upstream_socket_is_rejected_before_forwarding]
+    #[tokio::test(flavor = "current_thread")]
+    async fn missing_upstream_socket_is_rejected_before_forwarding() {
+        let root = test_directory_path("missing");
+        let socket_path = root.join("herdr.sock");
+        let material = TestMaterial::new();
+        let config = material.config_with_tls(&socket_path, "127.0.0.1", false);
+        let expected_uid = fs::symlink_metadata(&root)
+            .expect("read missing socket parent")
+            .uid();
+        let listener = TailscaleListener::bind(&config, expected_uid)
+            .await
+            .expect("bind missing-socket listener");
+        let address = listener.local_addr().expect("listener address");
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let server = tokio::spawn(listener.serve_until(async move {
+            let _ = shutdown_rx.await;
+        }));
+
+        let mut client = TcpStream::connect(address).await.expect("connect listener");
+        client_handshake(&mut client, ListenerClass::Tailscale)
+            .await
+            .expect("complete Relay handshake before upstream validation");
+        let mut eof = [0_u8; 1];
+        let result = tokio::time::timeout(Duration::from_secs(1), client.read(&mut eof))
+            .await
+            .expect("missing socket close timeout")
+            .expect("read missing socket close");
+        assert_eq!(
+            result, 0,
+            "Relay must close without forwarding to a missing socket"
+        );
+
+        let _ = shutdown_tx.send(());
+        let report = server
+            .await
+            .expect("join missing-socket relay")
+            .expect("stop missing-socket relay");
+        assert_eq!(report.accepted(), 1);
+        assert_eq!(report.completed(), 0);
+        assert_eq!(report.failed(), 1);
+        assert_eq!(
+            report.last_close_reason(),
+            Some(ConnectionCloseReason::UpstreamUnavailable)
+        );
+        fs::remove_dir(root).expect("remove missing socket directory");
     }
 
     // TEST:relay/src/listener.rs[tests::listener_client_quota_rejects_excess_clients]
