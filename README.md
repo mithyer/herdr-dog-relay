@@ -1,6 +1,6 @@
 # Herdr-dog Relay
 
-Status: RSB-2 Manager/relay-child lifecycle is checkpointed in commit `ea78490`; 97 tests and all quality gates passed, and the fresh read-only review found no P0-P2 blockers. No live Broker listener, mb17 deployment, or end-to-end claim is authorized from this package.
+Status: RSB-3 Core/Relay local Broker integration is accepted after 333 Core tests (2 ignored), 104 Relay tests, all quality gates and fresh read-only review. Selective Core/Relay checkpoint is pending. The implementation adds a bounded Manager control listener, multi-lease authority, HDBD validation and local data bridge; App/iOS changes, mb17 deployment, subscriptions, healthy `Online + Current`, actions and arbitrary passthrough remain excluded.
 
 Herdr-dog Relay is a planned user-level macOS service that exposes a controlled, authenticated network endpoint for the Core process and forwards the resulting byte stream to one Herdr Unix socket on the same host.
 
@@ -35,7 +35,9 @@ The current Rust scope includes:
 - bounded protocol-agnostic bidirectional forwarding with half-close propagation and whole-stream idle timeout;
 - a `herdogrelay` command-line host that loads validated TOML, handles SIGINT/SIGTERM shutdown, and reports only bounded listener counters;
 - a checksum-verified macOS release installer at [`install.sh`](install.sh) and a tag-triggered GitHub release workflow;
-- a schema-neutral Manager/relay-child lifecycle with validated Manager configuration, source-aligned existing-session resolution, per-session mode-0600 fingerprints, bounded data-port and lease registries, protected bootstrap IPC, parent-death monitoring, and LaunchAgent rendering;
+- a schema-neutral Manager control listener for bounded HDBR discovery/ensure/heartbeat/release/status;
+- Manager-owned multi-lease authority updates and HDBD session binding before the existing byte bridge;
+- local data-port teardown/reuse tied to Manager lease expiry and idle-grace reap;
 - no Herdr payload parsing, logging, persistence, or automatic write retry.
 
 The installer downloads only a versioned macOS release archive into the user's `~/.local/bin` by default. It does not create or overwrite relay configuration, certificates, private keys, or credentials.
@@ -51,6 +53,6 @@ This checkpoint does not include:
 - App or Core changes;
 - public-network exposure.
 
-This checkpoint includes the command-line host, release packaging, and the RSB-2 local Manager/relay-child contract/fake implementation, but it does not establish a live Broker control listener, real mb17 deployment, LaunchAgent installation, Tailscale/Core-to-Relay session-broker integration, or end-to-end Herdr integration.
+This checkpoint includes the command-line host, release packaging, the RSB-2 local Manager/relay-child contract/fake implementation, and the active RSB-3 local Broker control/data-binding implementation. It does not establish mb17 deployment, LaunchAgent installation, Tailscale/Core-to-Relay production integration, or end-to-end Herdr integration; those remain later gates.
 
 Rust implementation is authorized under the recorded decisions. Broker listeners, deployment, LAN/public enablement, and production claims remain gated by the linked verification requirements.

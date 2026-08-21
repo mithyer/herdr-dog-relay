@@ -380,6 +380,49 @@ impl fmt::Debug for BrokerBindingRequest {
 }
 
 impl BrokerBindingRequest {
+    /// Return the Core instance authority for internal lease lookup.
+    ///
+    /// # Returns
+    ///
+    /// The opaque 16-byte Core identifier; callers must not log it.
+    pub const fn core_instance_id(&self) -> [u8; BROKER_ID_BYTES] {
+        self.core_instance_id
+    }
+
+    /// Return the Broker instance authority for internal lease lookup.
+    ///
+    /// # Returns
+    ///
+    /// The opaque 16-byte Broker identifier; callers must not log it.
+    pub const fn broker_instance_id(&self) -> [u8; BROKER_ID_BYTES] {
+        self.broker_instance_id
+    }
+
+    /// Return the Broker generation authority for internal lease lookup.
+    pub const fn broker_generation(&self) -> u64 {
+        self.broker_generation
+    }
+
+    /// Return the session configuration generation authority.
+    pub const fn configuration_generation(&self) -> u64 {
+        self.configuration_generation
+    }
+
+    /// Return the session fingerprint authority for internal lease lookup.
+    pub const fn session_fingerprint(&self) -> [u8; BROKER_FINGERPRINT_BYTES] {
+        self.session_fingerprint
+    }
+
+    /// Return the lease token authority for internal lease lookup.
+    pub const fn lease_token(&self) -> [u8; BROKER_TOKEN_BYTES] {
+        self.lease_token
+    }
+
+    /// Return the normalized session name without path context.
+    pub fn session(&self) -> &str {
+        &self.session
+    }
+
     /// Decode the Core HDBD request from a complete data frame.
     pub fn decode(frame: &BrokerFrame) -> Result<Self, BrokerProtocolError> {
         if frame.data_kind()? != BrokerDataKind::BindRequest {

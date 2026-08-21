@@ -15,6 +15,8 @@ pub mod bridge;
 pub mod broker;
 /// Strongly typed configuration and v1 policy constants.
 pub mod config;
+/// RSB-3 bounded Broker control listener and session-bound data bridge.
+pub mod control;
 /// Shared error types and the crate result alias.
 pub mod error;
 /// Fixed binary challenge handshake used after TLS authentication.

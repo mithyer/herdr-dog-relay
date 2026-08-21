@@ -134,6 +134,28 @@ impl fmt::Debug for SessionFingerprint {
 }
 
 impl SessionFingerprint {
+    /// Construct an opaque fingerprint from fixed-width bytes.
+    ///
+    /// # Arguments
+    ///
+    /// * `bytes` - The 32-byte fingerprint retained in memory.
+    ///
+    /// # Returns
+    ///
+    /// A typed fingerprint without exposing its contents in diagnostics.
+    pub const fn from_bytes(bytes: [u8; 32]) -> Self {
+        Self(bytes)
+    }
+
+    /// Borrow the fixed-width fingerprint bytes for an internal authority frame.
+    ///
+    /// # Returns
+    ///
+    /// The 32-byte fingerprint; callers must not log or persist the bytes.
+    pub const fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
+
     /// Generate a cryptographically seeded opaque fingerprint for a new session directory.
     fn generate() -> Self {
         Self(random())
@@ -155,6 +177,28 @@ impl fmt::Debug for LeaseToken {
 }
 
 impl LeaseToken {
+    /// Construct an opaque lease token from fixed-width bytes.
+    ///
+    /// # Arguments
+    ///
+    /// * `bytes` - The 32-byte token delivered through protected control/data boundaries.
+    ///
+    /// # Returns
+    ///
+    /// A typed token without exposing its contents in diagnostics.
+    pub const fn from_bytes(bytes: [u8; 32]) -> Self {
+        Self(bytes)
+    }
+
+    /// Borrow the fixed-width token bytes for an internal authority frame.
+    ///
+    /// # Returns
+    ///
+    /// The 32-byte token; callers must not log or persist the bytes.
+    pub const fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
+
     /// Generate an unpredictable in-memory lease token.
     fn generate() -> Self {
         Self(random())
@@ -1049,6 +1093,10 @@ impl LeaseGrant {
 pub struct SessionStatusView {
     /// Canonical session name.
     pub session: SessionName,
+    /// Opaque session fingerprint retained for Core control responses.
+    pub fingerprint: SessionFingerprint,
+    /// Session configuration generation.
+    pub configuration_generation: u64,
     /// Whether a non-secret fingerprint is present.
     pub fingerprint_present: bool,
     /// Current child generation.
@@ -1399,6 +1447,62 @@ impl Manager {
         }
     }
 
+    /// Open the validated Herdr Unix stream for one active lease after authority checks.
+    ///
+    /// # Arguments
+    ///
+    /// * `token` - The in-memory lease token previously issued by `ensure`.
+    /// * `session` - The normalized session bound to the lease.
+    /// * `now` - Current epoch seconds used to reject expired leases.
+    ///
+    /// # Returns
+    ///
+    /// A validated Unix stream or a redacted lease/socket error. The stream carries opaque bytes;
+    /// this method never parses Herdr data.
+    // TEST:relay/tests/rsb3_control.rs[broker_control_round_trip_and_hdbd_gate]
+    pub async fn open_bound_stream(
+        &self,
+        token: LeaseToken,
+        session: &SessionName,
+        now: u64,
+    ) -> RelayResult<UnixStream> {
+        let slot = self.sessions.get(session).ok_or(RelayError::InvalidLease)?;
+        let expires_at = slot
+            .leases
+            .get(&token)
+            .copied()
+            .ok_or(RelayError::InvalidLease)?;
+        if now >= expires_at {
+            return Err(RelayError::InvalidLease);
+        }
+        let connector = UnixSocketConnector::new(
+            &slot.resolved.socket,
+            slot.resolved.socket_identity().owner_uid(),
+        )?;
+        connector
+            .connect_checked(slot.resolved.socket_identity())
+            .await
+    }
+
+    /// Return whether one opaque lease remains active at the supplied epoch second.
+    ///
+    /// # Arguments
+    ///
+    /// * `token` - The in-memory lease authority to inspect.
+    /// * `now` - Current epoch seconds.
+    ///
+    /// # Returns
+    ///
+    /// `true` only while the lease exists and has not expired.
+    // TEST:relay/tests/rsb3_control.rs[broker_control_round_trip_and_hdbd_gate]
+    pub fn lease_is_active(&self, token: LeaseToken, now: u64) -> bool {
+        self.sessions.values().any(|slot| {
+            slot.leases
+                .get(&token)
+                .is_some_and(|expires_at| now < *expires_at)
+        })
+    }
+
     /// Release one lease while retaining an idle child through the configured grace period.
     ///
     /// # Arguments
@@ -1483,6 +1587,8 @@ impl Manager {
             .iter()
             .map(|(session, slot)| SessionStatusView {
                 session: session.clone(),
+                fingerprint: slot.fingerprint,
+                configuration_generation: slot.configuration_generation,
                 fingerprint_present: true,
                 child_generation: slot.child_generation,
                 data_port: slot.data_port,

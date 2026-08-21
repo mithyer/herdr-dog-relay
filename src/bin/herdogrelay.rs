@@ -2,15 +2,16 @@
 
 use herdr_dog_relay::{
     config::{DEFAULT_CONFIG_TOML, RelayConfig},
+    control::BrokerControlServer,
     listener::TailscaleListener,
-    manager::{
-        DEFAULT_MANAGER_CONFIG_TOML, Manager, ManagerConfig, epoch_seconds, run_relay_child,
-    },
+    manager::{DEFAULT_MANAGER_CONFIG_TOML, Manager, ManagerConfig, run_relay_child},
 };
 use std::{
     env, fmt,
+    net::{IpAddr, Ipv4Addr},
     path::{Path, PathBuf},
     process::Command,
+    sync::Arc,
 };
 
 /// The default user-level configuration location used by the CLI.
@@ -317,24 +318,22 @@ fn current_uid() -> Result<u32, CliError> {
 /// Loads the Manager configuration and owns the local lifecycle process until shutdown.
 async fn run_manager(config_path: &Path) -> Result<(), CliError> {
     let config = ManagerConfig::from_path(config_path).map_err(CliError::Relay)?;
-    let mut manager = Manager::open(config, current_uid()?).map_err(CliError::Relay)?;
-    eprintln!(
-        "{COMMAND_NAME}: manager ready generation={} sessions={}",
-        manager.broker_generation(),
-        manager.status().len()
+    let manager = Manager::open(config, current_uid()?).map_err(CliError::Relay)?;
+    let server = Arc::new(
+        BrokerControlServer::bind_preferred(manager, IpAddr::V4(Ipv4Addr::LOCALHOST))
+            .await
+            .map_err(CliError::Relay)?,
     );
-    let mut reap_interval = tokio::time::interval(manager.config().heartbeat_interval());
-    let mut shutdown = Box::pin(shutdown_signal());
-    loop {
-        tokio::select! {
-            _ = &mut shutdown => break,
-            _ = reap_interval.tick() => {
-                let now = epoch_seconds().map_err(CliError::Relay)?;
-                manager.reap(now).await.map_err(CliError::Relay)?;
-            }
-        }
-    }
-    Ok(())
+    let address = server.local_addr().map_err(CliError::Relay)?;
+    eprintln!(
+        "{COMMAND_NAME}: manager control listener on {}:{}",
+        address.ip(),
+        address.port()
+    );
+    server
+        .serve_until(shutdown_signal())
+        .await
+        .map_err(CliError::Relay)
 }
 
 /// Loads the validated configuration, binds the listener, and serves until termination.
