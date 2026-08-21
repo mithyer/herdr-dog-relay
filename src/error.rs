@@ -81,6 +81,24 @@ pub enum RelayError {
     /// The configured Herdr socket could not be opened within the bounded deadline.
     #[error("Herdr Unix socket is unavailable")]
     UpstreamUnavailable,
+    /// A bounded manager state or configuration operation failed.
+    #[error("manager operation failed: {reason}")]
+    Manager {
+        /// The stable non-secret manager failure reason.
+        reason: &'static str,
+    },
+    /// A controlled relay-child lifecycle operation failed.
+    #[error("relay-child lifecycle failed: {reason}")]
+    ChildLifecycle {
+        /// The stable non-secret lifecycle failure reason.
+        reason: &'static str,
+    },
+    /// A manager lease token was absent, expired, or owned by another session.
+    #[error("manager lease is invalid")]
+    InvalidLease,
+    /// A manager fingerprint failed its fixed representation boundary.
+    #[error("manager fingerprint is invalid")]
+    InvalidFingerprint,
     /// The bridge exceeded its bounded whole-stream idle timeout.
     #[error("byte bridge idle timeout")]
     BridgeIdleTimeout,

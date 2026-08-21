@@ -32,6 +32,13 @@ pub struct UnixSocketIdentity {
     parent_mode: u32,
 }
 
+impl UnixSocketIdentity {
+    /// Returns the owner UID captured for this socket identity.
+    pub fn owner_uid(&self) -> u32 {
+        self.owner_uid
+    }
+}
+
 /// A fail-closed policy for one Herdr Unix socket path.
 #[derive(Clone, Debug)]
 pub struct UnixSocketConnector {

@@ -1,6 +1,6 @@
 # Herdr-dog Relay
 
-Status: Rust implementation in progress. The R1 configuration contract, R2 local Unix socket bridge, and R3 authenticated Tailscale listener library are implemented and locally verified; the external Tailnet/Core/Herdr gate remains open, so the relay must remain fail-closed and must not claim production deployment or end-to-end integration.
+Status: RSB-2 Manager/relay-child lifecycle implementation is locally validated with 97 tests and quality gates; the fresh read-only review accepted it with no P0-P2 blockers, and its selective checkpoint is pending. R1-R3 and RSB-1 are checkpointed. No live Broker listener, mb17 deployment, or end-to-end claim is authorized from this package.
 
 Herdr-dog Relay is a planned user-level macOS service that exposes a controlled, authenticated network endpoint for the Core process and forwards the resulting byte stream to one Herdr Unix socket on the same host.
 
@@ -35,6 +35,7 @@ The current Rust scope includes:
 - bounded protocol-agnostic bidirectional forwarding with half-close propagation and whole-stream idle timeout;
 - a `herdogrelay` command-line host that loads validated TOML, handles SIGINT/SIGTERM shutdown, and reports only bounded listener counters;
 - a checksum-verified macOS release installer at [`install.sh`](install.sh) and a tag-triggered GitHub release workflow;
+- a schema-neutral Manager/relay-child lifecycle with validated Manager configuration, source-aligned existing-session resolution, per-session mode-0600 fingerprints, bounded data-port and lease registries, protected bootstrap IPC, parent-death monitoring, and LaunchAgent rendering;
 - no Herdr payload parsing, logging, persistence, or automatic write retry.
 
 The installer downloads only a versioned macOS release archive into the user's `~/.local/bin` by default. It does not create or overwrite relay configuration, certificates, private keys, or credentials.
@@ -50,6 +51,6 @@ This checkpoint does not include:
 - App or Core changes;
 - public-network exposure.
 
-This checkpoint includes the command-line host and release packaging, but it does not establish a real Tailscale path, iPhone/Core-to-Relay connection, deployment, or end-to-end Herdr integration.
+This checkpoint includes the command-line host, release packaging, and the RSB-2 local Manager/relay-child contract/fake implementation, but it does not establish a live Broker control listener, real mb17 deployment, LaunchAgent installation, Tailscale/Core-to-Relay session-broker integration, or end-to-end Herdr integration.
 
-Rust implementation is authorized under the recorded decisions. Deployment, LAN/public enablement, and production claims remain gated by the linked verification requirements.
+Rust implementation is authorized under the recorded decisions. Broker listeners, deployment, LAN/public enablement, and production claims remain gated by the linked verification requirements.

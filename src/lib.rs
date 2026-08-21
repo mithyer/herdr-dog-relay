@@ -21,6 +21,8 @@ pub mod error;
 pub mod handshake;
 /// Authenticated Tailscale listener and bounded client admission.
 pub mod listener;
+/// User-level RSB-2 Manager, session resolver, fingerprint, lease, and child lifecycle contracts.
+pub mod manager;
 /// Validated Unix-domain socket access for the configured Herdr endpoint.
 pub mod socket;
 

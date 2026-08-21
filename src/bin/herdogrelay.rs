@@ -3,6 +3,9 @@
 use herdr_dog_relay::{
     config::{DEFAULT_CONFIG_TOML, RelayConfig},
     listener::TailscaleListener,
+    manager::{
+        DEFAULT_MANAGER_CONFIG_TOML, Manager, ManagerConfig, epoch_seconds, run_relay_child,
+    },
 };
 use std::{
     env, fmt,
@@ -15,15 +18,34 @@ const DEFAULT_CONFIG_SUFFIX: &str = ".config/herdr-dog/relay.toml";
 /// The command name shown in user-facing diagnostics.
 const COMMAND_NAME: &str = "herdogrelay";
 /// The short command-line usage text.
-const HELP_TEXT: &str = "herdogrelay - authenticated Herdr-dog byte relay\n\nUsage:\n  herdogrelay [--config PATH]\n  herdogrelay --print-default-config\n  herdogrelay --help\n  herdogrelay --version\n\nOptions:\n  -c, --config PATH       Read the validated TOML configuration from PATH.\n      --print-default-config\n                          Print the complete commented v1 TOML template.\n  -h, --help              Print this help text.\n  -V, --version           Print the CLI version.\n\nThe relay uses a user-level process and does not require sudo.\n";
+const HELP_TEXT: &str = "herdogrelay - authenticated Herdr-dog byte relay\n\nUsage:\n  herdogrelay [--config PATH]\n  herdogrelay manager [--config PATH]\n  herdogrelay relay-child --ipc PATH --session NAME --generation N --data-port PORT --parent-pid PID\n  herdogrelay --print-default-config\n  herdogrelay --print-manager-config\n  herdogrelay --print-launch-agent --config PATH\n  herdogrelay --help\n  herdogrelay --version\n\nOptions:\n  -c, --config PATH       Read the validated TOML configuration from PATH.\n      --print-default-config\n                          Print the complete commented v1 relay TOML template.\n      --print-manager-config\n                          Print the complete commented RSB-2 Manager TOML template.\n      --print-launch-agent --config PATH\n                          Print a safe user-level Manager LaunchAgent plist.\n  -h, --help              Print this help text.\n  -V, --version           Print the package version.\n\nThe relay uses a user-level process and does not require sudo.\n";
 
 /// One parsed CLI operation.
 #[derive(Debug)]
 enum CliCommand {
-    /// Start the listener using the selected configuration file.
+    /// Start the standalone listener using the selected v1 configuration file.
     Run { config_path: PathBuf },
-    /// Print the complete safe configuration template and exit.
+    /// Start the local RSB-2 Manager lifecycle host.
+    Manager { config_path: PathBuf },
+    /// Start one controlled same-binary relay child lifecycle process.
+    RelayChild {
+        /// Protected Manager bootstrap IPC path.
+        ipc_path: PathBuf,
+        /// Canonical session passed by Manager.
+        session: String,
+        /// Manager-owned child generation.
+        generation: u64,
+        /// Manager-reserved data port.
+        data_port: u16,
+        /// Manager process ID for child orphan cleanup.
+        parent_pid: u32,
+    },
+    /// Print the complete safe relay configuration template and exit.
     PrintDefaultConfig,
+    /// Print the complete safe Manager configuration template and exit.
+    PrintManagerConfig,
+    /// Print a user-level Manager LaunchAgent template and exit.
+    PrintLaunchAgent { config_path: PathBuf },
     /// Print command usage and exit.
     Help,
     /// Print the package version and exit.
@@ -71,6 +93,31 @@ async fn main() {
             print!("{DEFAULT_CONFIG_TOML}");
             Ok(())
         }
+        Ok(CliCommand::PrintManagerConfig) => {
+            print!("{DEFAULT_MANAGER_CONFIG_TOML}");
+            Ok(())
+        }
+        Ok(CliCommand::PrintLaunchAgent { config_path }) => {
+            match ManagerConfig::from_path(&config_path) {
+                Ok(config) => config
+                    .launch_agent_plist(&config_path)
+                    .map(|plist| {
+                        print!("{plist}");
+                    })
+                    .map_err(CliError::Relay),
+                Err(error) => Err(CliError::Relay(error)),
+            }
+        }
+        Ok(CliCommand::Manager { config_path }) => run_manager(&config_path).await,
+        Ok(CliCommand::RelayChild {
+            ipc_path,
+            session,
+            generation,
+            data_port,
+            parent_pid,
+        }) => run_relay_child(&ipc_path, &session, generation, data_port, parent_pid)
+            .await
+            .map_err(CliError::Relay),
         Ok(CliCommand::Run { config_path }) => run_relay(&config_path).await,
         Err(error) => Err(error),
     };
@@ -90,28 +137,120 @@ where
     I: IntoIterator<Item = S>,
     S: Into<String>,
 {
+    let arguments: Vec<String> = arguments.into_iter().map(Into::into).collect();
+    match arguments.first().map(String::as_str) {
+        Some("manager") => parse_manager_command(&arguments[1..]),
+        Some("relay-child") => parse_child_command(&arguments[1..]),
+        _ => parse_top_level_command(&arguments),
+    }
+}
+
+/// Parse the top-level standalone relay and template commands.
+fn parse_top_level_command(arguments: &[String]) -> Result<CliCommand, CliError> {
     let mut config_path = None;
-    let mut arguments = arguments.into_iter();
-    while let Some(argument) = arguments.next() {
-        match argument.into().as_str() {
+    let mut print_launch_agent = false;
+    let mut index = 0;
+    while index < arguments.len() {
+        match arguments[index].as_str() {
             "-c" | "--config" => {
                 let value = arguments
-                    .next()
+                    .get(index + 1)
                     .ok_or_else(|| CliError::Usage("--config requires a path".to_owned()))?;
-                config_path = Some(expand_home(PathBuf::from(value.into()))?);
+                config_path = Some(expand_home(PathBuf::from(value))?);
+                index += 2;
             }
             "--print-default-config" => return Ok(CliCommand::PrintDefaultConfig),
+            "--print-manager-config" => return Ok(CliCommand::PrintManagerConfig),
+            "--print-launch-agent" => {
+                print_launch_agent = true;
+                index += 1;
+            }
             "-h" | "--help" => return Ok(CliCommand::Help),
             "-V" | "--version" => return Ok(CliCommand::Version),
-            option => {
-                return Err(CliError::Usage(format!("unknown option: {option}")));
-            }
+            option => return Err(CliError::Usage(format!("unknown option: {option}"))),
         }
     }
-
+    if print_launch_agent {
+        let config_path = config_path.ok_or_else(|| {
+            CliError::Usage("--print-launch-agent requires --config PATH".to_owned())
+        })?;
+        return Ok(CliCommand::PrintLaunchAgent { config_path });
+    }
     Ok(CliCommand::Run {
         config_path: config_path.unwrap_or(default_config_path()?),
     })
+}
+
+/// Parse the Manager lifecycle command without accepting arbitrary arguments.
+fn parse_manager_command(arguments: &[String]) -> Result<CliCommand, CliError> {
+    let mut config_path = None;
+    let mut index = 0;
+    while index < arguments.len() {
+        match arguments[index].as_str() {
+            "-c" | "--config" => {
+                let value = arguments.get(index + 1).ok_or_else(|| {
+                    CliError::Usage("manager --config requires a path".to_owned())
+                })?;
+                config_path = Some(expand_home(PathBuf::from(value))?);
+                index += 2;
+            }
+            "-h" | "--help" => return Ok(CliCommand::Help),
+            option => return Err(CliError::Usage(format!("unknown manager option: {option}"))),
+        }
+    }
+    Ok(CliCommand::Manager {
+        config_path: config_path.unwrap_or(default_manager_config_path()?),
+    })
+}
+
+/// Parse the internally controlled relay-child command.
+fn parse_child_command(arguments: &[String]) -> Result<CliCommand, CliError> {
+    let mut ipc_path = None;
+    let mut session = None;
+    let mut generation = None;
+    let mut data_port = None;
+    let mut parent_pid = None;
+    let mut index = 0;
+    while index < arguments.len() {
+        let value = arguments
+            .get(index + 1)
+            .ok_or_else(|| CliError::Usage("relay-child option requires a value".to_owned()))?;
+        match arguments[index].as_str() {
+            "--ipc" => ipc_path = Some(expand_home(PathBuf::from(value))?),
+            "--session" => session = Some(value.clone()),
+            "--generation" => generation = Some(parse_number(value, "generation")?),
+            "--data-port" => data_port = Some(parse_number(value, "data-port")?),
+            "--parent-pid" => parent_pid = Some(parse_number(value, "parent-pid")?),
+            option => {
+                return Err(CliError::Usage(format!(
+                    "unknown relay-child option: {option}"
+                )));
+            }
+        }
+        index += 2;
+    }
+    Ok(CliCommand::RelayChild {
+        ipc_path: ipc_path
+            .ok_or_else(|| CliError::Usage("relay-child requires --ipc".to_owned()))?,
+        session: session
+            .ok_or_else(|| CliError::Usage("relay-child requires --session".to_owned()))?,
+        generation: generation
+            .ok_or_else(|| CliError::Usage("relay-child requires --generation".to_owned()))?,
+        data_port: data_port
+            .ok_or_else(|| CliError::Usage("relay-child requires --data-port".to_owned()))?,
+        parent_pid: parent_pid
+            .ok_or_else(|| CliError::Usage("relay-child requires --parent-pid".to_owned()))?,
+    })
+}
+
+/// Parse one bounded unsigned command-line number.
+fn parse_number<T>(value: &str, field: &str) -> Result<T, CliError>
+where
+    T: std::str::FromStr,
+{
+    value
+        .parse()
+        .map_err(|_| CliError::Usage(format!("{field} must be a valid number")))
 }
 
 /// Expands a leading `~/` using the current user's home directory without normalizing other paths.
@@ -129,6 +268,13 @@ fn expand_home(path: PathBuf) -> Result<PathBuf, CliError> {
         return home_directory().map(|home| home.join(relative));
     }
     Ok(path)
+}
+
+/// Resolves the default user-level Manager configuration path.
+///
+/// - Returns: `$HOME/.config/herdr-dog/manager/manager.toml`.
+fn default_manager_config_path() -> Result<PathBuf, CliError> {
+    home_directory().map(|home| home.join(".config/herdr-dog/manager/manager.toml"))
 }
 
 /// Resolves the default user-level configuration path.
@@ -166,6 +312,29 @@ fn current_uid() -> Result<u32, CliError> {
         .ok()
         .and_then(|value| value.trim().parse::<u32>().ok())
         .ok_or(CliError::CurrentUid)
+}
+
+/// Loads the Manager configuration and owns the local lifecycle process until shutdown.
+async fn run_manager(config_path: &Path) -> Result<(), CliError> {
+    let config = ManagerConfig::from_path(config_path).map_err(CliError::Relay)?;
+    let mut manager = Manager::open(config, current_uid()?).map_err(CliError::Relay)?;
+    eprintln!(
+        "{COMMAND_NAME}: manager ready generation={} sessions={}",
+        manager.broker_generation(),
+        manager.status().len()
+    );
+    let mut reap_interval = tokio::time::interval(manager.config().heartbeat_interval());
+    let mut shutdown = Box::pin(shutdown_signal());
+    loop {
+        tokio::select! {
+            _ = &mut shutdown => break,
+            _ = reap_interval.tick() => {
+                let now = epoch_seconds().map_err(CliError::Relay)?;
+                manager.reap(now).await.map_err(CliError::Relay)?;
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Loads the validated configuration, binds the listener, and serves until termination.
@@ -223,6 +392,54 @@ async fn shutdown_signal() {
 mod tests {
     use super::{CliCommand, parse_args};
     use std::path::PathBuf;
+
+    // TEST:relay/src/bin/herdogrelay.rs[tests::manager_subcommand_is_parsed]
+    #[test]
+    fn manager_subcommand_is_parsed() {
+        let command = parse_args(["manager", "--config", "/tmp/manager.toml"])
+            .expect("parse manager command");
+        match command {
+            CliCommand::Manager { config_path } => {
+                assert_eq!(config_path, PathBuf::from("/tmp/manager.toml"));
+            }
+            _ => panic!("expected manager command"),
+        }
+    }
+
+    // TEST:relay/src/bin/herdogrelay.rs[tests::relay_child_command_is_bounded]
+    #[test]
+    fn relay_child_command_is_bounded() {
+        let command = parse_args([
+            "relay-child",
+            "--ipc",
+            "/tmp/child.sock",
+            "--session",
+            "work",
+            "--generation",
+            "7",
+            "--data-port",
+            "18753",
+            "--parent-pid",
+            "42",
+        ])
+        .expect("parse child command");
+        match command {
+            CliCommand::RelayChild {
+                ipc_path,
+                session,
+                generation,
+                data_port,
+                parent_pid,
+            } => {
+                assert_eq!(ipc_path, PathBuf::from("/tmp/child.sock"));
+                assert_eq!(session, "work");
+                assert_eq!(generation, 7);
+                assert_eq!(data_port, 18_753);
+                assert_eq!(parent_pid, 42);
+            }
+            _ => panic!("expected relay-child command"),
+        }
+    }
 
     // TEST:relay/src/bin/herdogrelay.rs[tests::config_option_is_parsed]
     #[test]
