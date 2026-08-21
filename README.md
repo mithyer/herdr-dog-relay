@@ -1,6 +1,6 @@
 # Herdr-dog Relay
 
-Status: RSB-3 Core/Relay local Broker integration is accepted after 333 Core tests (2 ignored), 104 Relay tests, all quality gates and fresh read-only review. Selective Core/Relay checkpoint is pending. The implementation adds a bounded Manager control listener, multi-lease authority, HDBD validation and local data bridge; App/iOS changes, mb17 deployment, subscriptions, healthy `Online + Current`, actions and arbitrary passthrough remain excluded.
+Status: RSB-3 Core/Relay local Broker integration is checkpointed in Core `a7d0ddc` and Relay `93d3bd7`. It passed 333 Core tests (2 ignored), 104 Relay tests, all quality gates and fresh read-only review. The implementation adds a bounded Manager control listener, multi-lease authority, HDBD validation and local data bridge; App/iOS changes, mb17 deployment, subscriptions, healthy `Online + Current`, actions and arbitrary passthrough remain excluded.
 
 Herdr-dog Relay is a planned user-level macOS service that exposes a controlled, authenticated network endpoint for the Core process and forwards the resulting byte stream to one Herdr Unix socket on the same host.
 
