@@ -11,6 +11,8 @@ compile_error!("herdr-dog-relay currently supports Unix hosts only");
 
 /// Bounded, protocol-agnostic bidirectional byte forwarding.
 pub mod bridge;
+/// Schema-neutral Broker Control framing and session-bound data-binding gate.
+pub mod broker;
 /// Strongly typed configuration and v1 policy constants.
 pub mod config;
 /// Shared error types and the crate result alias.
