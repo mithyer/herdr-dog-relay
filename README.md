@@ -1,6 +1,6 @@
 # Herdr-dog Relay
 
-Status: RSB-2 Manager/relay-child lifecycle implementation is locally validated with 97 tests and quality gates; the fresh read-only review accepted it with no P0-P2 blockers, and its selective checkpoint is pending. R1-R3 and RSB-1 are checkpointed. No live Broker listener, mb17 deployment, or end-to-end claim is authorized from this package.
+Status: RSB-2 Manager/relay-child lifecycle is checkpointed in commit `ea78490`; 97 tests and all quality gates passed, and the fresh read-only review found no P0-P2 blockers. No live Broker listener, mb17 deployment, or end-to-end claim is authorized from this package.
 
 Herdr-dog Relay is a planned user-level macOS service that exposes a controlled, authenticated network endpoint for the Core process and forwards the resulting byte stream to one Herdr Unix socket on the same host.
 
