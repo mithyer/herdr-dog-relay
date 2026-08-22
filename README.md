@@ -20,7 +20,7 @@ The Relay authenticates Core, validates HDQM/HDQS/session authority and bridges 
 
 ## Current implementation
 
-QRM-1 Q3 is the active implementation phase. The local Relay now includes the production Quinn UDP server, HDQM/HDQS authority lifecycle, opaque Unix bridge, bounded control/lease handling, malformed-frame rejection, and verified-mode production gating. Local loopback evidence is not mb17 deployment evidence; Q4 weak-network and Q5 mb17 read-only gates remain planned. Actions, subscriptions, healthy `Online + Current` and arbitrary passthrough remain disabled.
+QRM-1 Q3 is locally accepted and checkpointed in the Relay submodule. The local Relay includes the production Quinn UDP server, HDQM/HDQS authority lifecycle, opaque Unix bridge, bounded control/lease handling, malformed-frame rejection, and verified-mode production gating. Local loopback evidence is not mb17 deployment evidence; Q4 weak-network and Q5 mb17 read-only gates remain planned. Actions, subscriptions, healthy `Online + Current` and arbitrary passthrough remain disabled.
 
 ## Checkpoint Log
 
@@ -33,9 +33,9 @@ QRM-1 Q3 is the active implementation phase. The local Relay now includes the pr
 - Next dependency: complete Q0 document normalization, then Q1 QRM implementation.
 
 [accepted](1-41) 2026-08-22 | QRM-1 Relay Q3 local implementation/review gate accepted
-- Repository state: Q3 source/tests and status documentation remain uncommitted; unrelated Relay and parent-Wiki changes are preserved.
+- Repository state: Q3 source/tests and Relay status documentation are checkpointed in this submodule; parent-Wiki changes are preserved.
 - Validation: 46 locked Relay tests, Clippy, rustfmt, rustdoc and diff checks pass; fresh review found no confirmed P0/P1/P2 source defect.
 - Scope: production Quinn server/bridge authority, bounded malformed-frame/deadline handling, redacted diagnostics and verified-mode CLI boundary.
 - Exclusions: Q4 weak-network, Q5 mb17 deployment, Q6 App transport, Herdr parsing, actions, subscriptions, healthy Current and passthrough.
-- Residual risk: Q3 selective checkpoint and Q4/Q5 external evidence remain open.
+- Residual risk: Q4/Q5 external evidence remains open and is not implied by this checkpoint.
 - Next dependency: keep Q4/Q5 planned until separately authorized and evidenced.
