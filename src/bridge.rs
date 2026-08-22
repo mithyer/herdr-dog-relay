@@ -1,7 +1,7 @@
 //! Bounded, protocol-agnostic bidirectional byte forwarding.
 
 use crate::{
-    config::{V1_BUFFER_BYTES, V1_IDLE_TIMEOUT_SECS},
+    config::{QRM_BUFFER_BYTES, QRM_IDLE_TIMEOUT_SECS},
     error::{RelayError, RelayResult},
 };
 use std::time::Duration;
@@ -21,27 +21,27 @@ pub struct BridgeLimits {
 }
 
 impl BridgeLimits {
-    /// Creates a bounded policy for tests or a future constrained deployment.
+    /// Creates a bounded policy for QRM session streams.
     ///
     /// # Arguments
     ///
-    /// * `buffer_bytes` - A non-zero buffer no larger than the v1 limit.
-    /// * `idle_timeout` - A non-zero timeout no longer than the v1 limit.
+    /// * `buffer_bytes` - A non-zero buffer no larger than the QRM limit.
+    /// * `idle_timeout` - A non-zero timeout no longer than the QRM limit.
     ///
     /// # Returns
     ///
     /// A bounded bridge policy or a redacted configuration error.
     pub fn new(buffer_bytes: usize, idle_timeout: Duration) -> RelayResult<Self> {
-        if buffer_bytes == 0 || buffer_bytes > V1_BUFFER_BYTES {
+        if buffer_bytes == 0 || buffer_bytes > QRM_BUFFER_BYTES {
             return Err(RelayError::InvalidConfiguration {
                 field: "limits.buffer_bytes",
-                reason: "must be between 1 and the v1 buffer limit",
+                reason: "must be between 1 and the QRM buffer limit",
             });
         }
-        if idle_timeout.is_zero() || idle_timeout > Duration::from_secs(V1_IDLE_TIMEOUT_SECS) {
+        if idle_timeout.is_zero() || idle_timeout > Duration::from_secs(QRM_IDLE_TIMEOUT_SECS) {
             return Err(RelayError::InvalidConfiguration {
                 field: "limits.idle_timeout_secs",
-                reason: "must be between 1 second and the v1 idle limit",
+                reason: "must be between 1 second and the QRM idle limit",
             });
         }
         Ok(Self {
@@ -50,15 +50,11 @@ impl BridgeLimits {
         })
     }
 
-    /// Returns the exact v1 bridge policy.
-    ///
-    /// # Returns
-    ///
-    /// The fixed 64 KiB, 15-minute policy from the relay contract.
+    /// Returns the exact QRM bridge policy.
     pub fn v1() -> Self {
         Self {
-            buffer_bytes: V1_BUFFER_BYTES,
-            idle_timeout: Duration::from_secs(V1_IDLE_TIMEOUT_SECS),
+            buffer_bytes: QRM_BUFFER_BYTES,
+            idle_timeout: Duration::from_secs(QRM_IDLE_TIMEOUT_SECS),
         }
     }
 
@@ -221,14 +217,14 @@ mod tests {
     };
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-    // TEST:relay/src/bridge.rs[tests::v1_limits_are_fixed]
+    // TEST:relay/src/bridge.rs[tests::qrm_limits_are_fixed]
     #[test]
-    fn v1_limits_are_fixed() {
+    fn qrm_limits_are_fixed() {
         let limits = BridgeLimits::v1();
-        assert_eq!(limits.buffer_bytes(), V1_BUFFER_BYTES);
+        assert_eq!(limits.buffer_bytes(), QRM_BUFFER_BYTES);
         assert_eq!(
             limits.idle_timeout(),
-            Duration::from_secs(V1_IDLE_TIMEOUT_SECS)
+            Duration::from_secs(QRM_IDLE_TIMEOUT_SECS)
         );
     }
 
@@ -236,9 +232,9 @@ mod tests {
     #[test]
     fn invalid_limits_are_rejected() {
         assert!(BridgeLimits::new(0, Duration::from_secs(1)).is_err());
-        assert!(BridgeLimits::new(V1_BUFFER_BYTES + 1, Duration::from_secs(1)).is_err());
+        assert!(BridgeLimits::new(QRM_BUFFER_BYTES + 1, Duration::from_secs(1)).is_err());
         assert!(BridgeLimits::new(1, Duration::ZERO).is_err());
-        assert!(BridgeLimits::new(1, Duration::from_secs(V1_IDLE_TIMEOUT_SECS + 1)).is_err());
+        assert!(BridgeLimits::new(1, Duration::from_secs(QRM_IDLE_TIMEOUT_SECS + 1)).is_err());
     }
 
     // TEST:relay/src/bridge.rs[tests::bridge_forwards_both_directions]

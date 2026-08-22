@@ -1,83 +1,33 @@
-# Herdr-dog Relay v1 complete configuration template.
-# Replace the local paths and loopback addresses with deployment-specific values
-# before enabling a remote listener. Keep all values narrow and fail closed.
+# Herdr-dog QRM-1 single-device QUIC Relay configuration.
+# Every option is explicit. All certificate/key paths are placeholders and
+# must be supplied by deployment outside the repository.
 
-[relay]
-# Herdr's source defaults are the same on macOS and Linux:
-# $XDG_CONFIG_HOME/herdr/herdr.sock when XDG_CONFIG_HOME is set, otherwise
-# $HOME/.config/herdr/herdr.sock. HERDR_SESSION selects a named session and
-# HERDR_SOCKET_PATH overrides the API socket. A debug Herdr build uses the
-# `herdr-dev` app directory; pin an absolute path when Relay and Herdr build
-# profiles differ. Use an absolute path below to pin a deployment; `auto`
-# follows the host's Herdr environment at startup.
-herdr_socket = "auto"
-
-[network]
-# Immutable v1 first candidate port shared with the App/Core discovery logic.
-# Do not change this value alone: App/Core probes the fixed v1 range and will not discover another base port.
-# A different value requires a versioned Relay/App/Core contract and a coordinated release.
-port_base = 18743
-# Immutable v1 number of consecutive candidate ports to try.
-# Do not change this value alone: App/Core uses the same attempt count during discovery.
-# A different value requires a versioned Relay/App/Core contract and a coordinated release.
-port_attempts = 10
-
-[network.tailscale]
-# Enable the Tailscale listener by default; the loopback value is safe until configured.
-enabled = true
-# Tailscale transport is encrypted by the Tailnet, so TLS is off by default.
-tls = false
-# Explicit non-wildcard local address for the Tailscale listener.
-bind_address = "127.0.0.1"
-# Exact source addresses or canonical CIDRs allowed to reach this listener.
-allowed_sources = ["127.0.0.1"]
-
-[network.lan]
-# Keep LAN exposure disabled until it has a separate security approval.
-enabled = false
-# LAN uses TLS 1.3 mutual TLS by default when it is explicitly enabled.
-tls = true
-# Safe non-wildcard placeholder address retained for complete configuration.
-bind_address = "127.0.0.1"
-# Safe loopback source placeholder retained for complete configuration.
-allowed_sources = ["127.0.0.1"]
-
-[network.public]
-# Keep public Internet exposure disabled until it has a separate security approval.
-enabled = false
-# Public transport requires TLS 1.3 mutual TLS by default when enabled.
-tls = true
-# Safe non-wildcard placeholder address retained for complete configuration.
-bind_address = "127.0.0.1"
-# Safe loopback source placeholder retained for complete configuration.
-allowed_sources = ["127.0.0.1"]
+[listener]
+# Explicit local UDP bind address. Loopback is the safe default.
+listen_address = "127.0.0.1"
+# One UDP listener per remote device. CLI --port overrides this value.
+port = 18743
 
 [security]
-# The only v1 authentication mode accepted by TLS-enabled listeners.
-authentication = "mutual_tls"
-# Absolute path to the Relay server certificate chain.
-server_cert = "/Users/<user>/.config/herdr/relay-server.pem"
-# Absolute path to the Relay server private key.
-server_key = "/Users/<user>/.config/herdr/relay-server.key"
-# Absolute path to the CA used to verify client certificates.
-trusted_client_ca = "/Users/<user>/.config/herdr/relay-client-ca.pem"
-# DNS name or IP identity expected in the Relay server certificate.
-server_name = "relay.example.invalid"
+# verified is required for production. Every mode uses QUIC TLS 1.3.
+mode = "verified"
+# Absolute path to the Relay certificate chain; never inline PEM.
+server_certificate = ""
+# Absolute path to the Relay private key; never commit or log this value.
+server_private_key = ""
+# Absolute path to the trusted Core client CA.
+trusted_client_ca = ""
 
 [limits]
-# Maximum number of concurrently connected clients across all listeners.
-max_clients = 64
-# Maximum number of concurrently connected clients on one listener.
-max_clients_per_listener = 32
-# Maximum number of unauthenticated handshakes in progress.
-max_handshakes = 16
-# Maximum seconds allowed for the TLS/Relay handshake.
-handshake_timeout_secs = 5
-# Maximum seconds allowed for one App discovery probe.
-probe_timeout_secs = 2
-# Maximum seconds without traffic before the byte bridge closes.
-idle_timeout_secs = 900
-# Maximum bytes buffered in each forwarding direction.
+# Maximum number of Core device connections.
+max_connections = 64
+# Maximum number of active Herdr session streams per connection.
+max_sessions_per_connection = 64
+# Maximum complete HDQM control frame size in bytes.
+max_control_frame_bytes = 65536
+# Maximum bytes buffered in each bridge direction.
 buffer_bytes = 65536
-# Maximum bytes retained in one diagnostic record.
-max_diagnostic_bytes = 4096
+# Maximum TLS/control/session bind duration in seconds.
+handshake_timeout_secs = 5
+# Maximum QUIC connection idle duration in seconds.
+idle_timeout_secs = 900

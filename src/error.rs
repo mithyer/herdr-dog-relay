@@ -1,120 +1,94 @@
-//! Error types used at the relay's public boundaries.
+//! Redacted error categories for the QRM-1 Relay boundary.
 
 use std::io;
 
-/// The result type returned by relay operations.
+/// Result type returned by Relay operations.
 pub type RelayResult<T> = Result<T, RelayError>;
 
-/// Redacted, bounded error categories exposed by the relay.
+/// Stable, redacted Relay errors.
 #[non_exhaustive]
 #[derive(Clone, Debug, thiserror::Error)]
 pub enum RelayError {
-    /// A configuration field failed a validation rule.
+    /// A configuration field failed validation.
     #[error("invalid configuration for {field}: {reason}")]
     InvalidConfiguration {
-        /// The stable configuration field name.
+        /// Stable configuration field name.
         field: &'static str,
-        /// The non-secret validation reason.
+        /// Non-secret validation reason.
         reason: &'static str,
     },
-    /// The configuration file could not be read.
+    /// Configuration file could not be read.
     #[error("configuration could not be read")]
     ConfigurationRead,
-    /// The configuration file was not valid TOML.
+    /// Configuration syntax was invalid.
     #[error("configuration syntax is invalid")]
     ConfigurationSyntax,
     /// A bounded I/O operation failed.
     #[error("I/O operation failed: {operation} ({kind:?})")]
     Io {
-        /// The non-secret operation category.
+        /// Stable operation category.
         operation: &'static str,
-        /// The operating-system error category without its free-form message.
+        /// Sanitized operating-system error kind.
         kind: io::ErrorKind,
     },
-    /// The configured Unix socket failed an identity or permission check.
+    /// Unix socket identity validation failed.
     #[error("Unix socket identity check failed: {operation} ({reason})")]
     SocketIdentity {
-        /// The stable operation category.
+        /// Stable validation operation.
         operation: &'static str,
-        /// The non-secret identity failure reason.
+        /// Stable validation reason.
         reason: &'static str,
     },
-    /// Listener startup was rejected by a stable policy boundary.
+    /// A listener could not start under its bounded policy.
     #[error("relay listener startup failed: {reason}")]
     ListenerStartup {
-        /// The non-secret startup reason.
+        /// Stable startup reason.
         reason: &'static str,
     },
-    /// Every v1 candidate port was occupied.
-    #[error("all v1 relay ports are occupied")]
-    PortRangeExhausted,
-    /// An enabled listener address could not be bound.
-    #[error("relay listener address is unavailable")]
-    ListenerAddressUnavailable,
-    /// The accepted peer source was not in the listener allowlist.
-    #[error("relay peer source is not allowed")]
-    SourceNotAllowed,
-    /// The global or per-listener client quota was exhausted.
-    #[error("relay client limit reached")]
-    ClientLimit,
-    /// The concurrent TLS/Relay handshake quota was exhausted.
-    #[error("relay handshake limit reached")]
-    HandshakeLimit,
-    /// The TLS certificate, key, or trust-anchor references are invalid.
+    /// A TLS certificate, key or trust configuration failed.
     #[error("TLS configuration failed: {reason}")]
     TlsConfiguration {
-        /// The non-secret TLS configuration reason.
+        /// Stable non-secret TLS failure reason.
         reason: &'static str,
     },
-    /// The peer failed mandatory TLS client authentication.
-    #[error("TLS client authentication failed")]
-    TlsAuthentication,
-    /// The peer failed the fixed Relay handshake.
-    #[error("Relay handshake failed")]
-    RelayHandshake,
-    /// The TLS and Relay handshake deadline elapsed.
-    #[error("Relay handshake timed out")]
-    RelayHandshakeTimeout,
-    /// The configured milestone does not support this enabled listener class.
-    #[error("listener class is not supported in this milestone")]
-    UnsupportedListenerClass,
-    /// The configured Herdr socket could not be opened within the bounded deadline.
+    /// A QUIC/TLS/HDQM handshake failed.
+    #[error("QUIC handshake failed: {reason}")]
+    QuicHandshake {
+        /// Stable handshake reason.
+        reason: &'static str,
+    },
+    /// A peer failed certificate or client identity validation.
+    #[error("QUIC peer authentication failed")]
+    QuicAuthentication,
+    /// A bounded QRM frame failed protocol validation.
+    #[error("QRM protocol error: {reason}")]
+    QuicProtocol {
+        /// Stable protocol reason.
+        reason: &'static str,
+    },
+    /// A session authority did not match the current connection.
+    #[error("session authority was rejected")]
+    SessionAuthority,
+    /// A configured Herdr Unix socket was unavailable.
     #[error("Herdr Unix socket is unavailable")]
     UpstreamUnavailable,
-    /// A bounded manager state or configuration operation failed.
-    #[error("manager operation failed: {reason}")]
-    Manager {
-        /// The stable non-secret manager failure reason.
-        reason: &'static str,
-    },
-    /// A controlled relay-child lifecycle operation failed.
-    #[error("relay-child lifecycle failed: {reason}")]
-    ChildLifecycle {
-        /// The stable non-secret lifecycle failure reason.
-        reason: &'static str,
-    },
-    /// A manager lease token was absent, expired, or owned by another session.
-    #[error("manager lease is invalid")]
-    InvalidLease,
-    /// A manager fingerprint failed its fixed representation boundary.
-    #[error("manager fingerprint is invalid")]
-    InvalidFingerprint,
-    /// The bridge exceeded its bounded whole-stream idle timeout.
+    /// The bridge reached its bounded idle timeout.
     #[error("byte bridge idle timeout")]
     BridgeIdleTimeout,
+    /// The connection/session quota was exhausted.
+    #[error("relay resource limit reached")]
+    ResourceLimit,
 }
 
 impl RelayError {
-    /// Creates a redacted I/O error with a stable operation category.
+    /// Builds a redacted I/O error without retaining free-form OS text.
     ///
-    /// # Arguments
-    ///
-    /// * `operation` - A static non-secret operation label.
-    /// * `source` - The operating-system error returned by the operation.
+    /// # Parameters
+    /// * `operation` - Stable non-secret operation label.
+    /// * `source` - Operating-system error to classify.
     ///
     /// # Returns
-    ///
-    /// The corresponding relay error.
+    /// A sanitized I/O error.
     pub fn io(operation: &'static str, source: io::Error) -> Self {
         Self::Io {
             operation,
@@ -128,27 +102,12 @@ mod tests {
     use super::RelayError;
     use std::{error::Error, io};
 
-    // TEST:relay/src/error.rs[tests::errors_do_not_embed_raw_configuration]
+    // TEST:relay/src/error.rs[tests::io_errors_are_redacted]
     #[test]
-    fn errors_do_not_embed_raw_configuration() {
-        let error = RelayError::InvalidConfiguration {
-            field: "security.server_cert",
-            reason: "path is required",
-        };
-        let rendered = error.to_string();
-        assert!(!rendered.contains("BEGIN PRIVATE KEY"));
-        assert!(rendered.contains("security.server_cert"));
-    }
-
-    // TEST:relay/src/error.rs[tests::io_errors_drop_free_form_source_text]
-    #[test]
-    fn io_errors_drop_free_form_source_text() {
-        let error = RelayError::io(
-            "opening client CA",
-            io::Error::other("BEGIN PRIVATE KEY: secret"),
-        );
-        assert!(!error.to_string().contains("BEGIN PRIVATE KEY"));
-        assert!(!format!("{error:?}").contains("BEGIN PRIVATE KEY"));
+    fn io_errors_are_redacted() {
+        let error = RelayError::io("opening QUIC identity", io::Error::other("private key"));
+        assert!(!error.to_string().contains("private key"));
+        assert!(!format!("{error:?}").contains("private key"));
         assert!(error.source().is_none());
     }
 }

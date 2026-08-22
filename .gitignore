@@ -20,6 +20,4 @@ target
 #  option (not recommended) you can uncomment the following to ignore the entire idea folder.
 #.idea/
 
-# Parent Wiki instructions and design documents are intentionally local-only.
-AGENTS.md
-docs/
+# Parent Wiki instructions and design documents are tracked as QRM plan inputs.
