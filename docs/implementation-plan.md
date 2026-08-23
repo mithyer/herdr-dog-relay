@@ -175,4 +175,12 @@ Block QRM-1 when TLS is absent, invalid authority reaches Herdr, one session see
 - Scope: remove or rewrite active Relay legacy listener/config/export/test references while preserving the QRM QUIC listener, SessionRegistry, opaque bridge and historical checkpoints.
 - Exclusions: no legacy fallback, new protocol behavior, Herdr parsing, App-Core changes, deployment changes, writes, subscriptions, healthy Current, actions or passthrough.
 - Residual risk: active caller inventory, CLI/config fallout, deployment documentation and final Q7 review remain open.
-- Next dependency: capture the read-only baseline and complete the Relay legacy active-entrypoint inventory before implementation cleanup.
+- Next dependency: implement Q7 cleanup from the recorded active-entrypoint inventory.
+
+[active](1-186) 2026-08-23 | QRM-1 Relay Q7 read-only baseline captured
+- Repository state: Relay `5714abf`, parent `00b7b86`, Core `f2867d5`, App-iOS `fc9cf7d`, Herdr `d6dae883`; no Relay Q7 source change has been made and generated helpers remain excluded.
+- Validation: Relay 46 passed, Core/FFI quality, iOS target checks, simulator builds, formatting, Clippy, rustdoc, fuzz and diff checks passed; no implementation source changed.
+- Scope: active Relay caller/config/export/test inventory before direct legacy cleanup.
+- Inventory findings: tracked Relay source contains no legacy Broker/HDBR/HDBD/HDRL/TCP implementation; `src/config.rs` retains only a stale network-class rejection test/config probe for Q7 removal or rewrite.
+- Exclusions/residual risk: QRM QUIC listener, SessionRegistry, TLS/ALPN and opaque bridge remain unchanged; config/test cleanup and final review remain open.
+- Next dependency: implement Q7 cleanup from the recorded active-entrypoint inventory.

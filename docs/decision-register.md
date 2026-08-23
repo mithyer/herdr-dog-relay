@@ -113,4 +113,12 @@ Q1 requires codec, fake authority and three-session tests. Q2 requires quinn TLS
 - Scope: remove or rewrite active legacy Relay listener/config/export/test references while preserving QRM QUIC, TLS/ALPN, stream authority and opaque-byte boundaries.
 - Exclusions: no protocol expansion, Herdr parsing, App-Core changes, deployment changes, writes, subscriptions, healthy Current, actions, passthrough or fallback.
 - Residual risk: active caller inventory, stale decision references and final Q7 review remain open.
-- Next dependency: capture the read-only baseline and complete the Relay decision-linked legacy inventory before implementation cleanup.
+- Next dependency: implement Q7 cleanup from the recorded active-entrypoint inventory.
+
+[active](1-124) 2026-08-23 | QRM-1 Relay Q7 read-only baseline captured
+- Repository state: Relay `5714abf`, parent `00b7b86`, Core `f2867d5`, App-iOS `fc9cf7d`, Herdr `d6dae883`; no Relay Q7 source change has been made and generated helpers remain excluded.
+- Validation: Relay 46 passed, Core/FFI quality, iOS target checks, simulator builds, formatting, Clippy, rustdoc, fuzz and diff checks passed; no implementation source changed.
+- Scope: decision-linked active caller/config/export/test inventory before removing stale Relay transport surfaces.
+- Inventory findings: tracked Relay source has no legacy Broker/HDBR/HDBD/HDRL/TCP implementation; only the stale network-class config rejection test remains in `src/config.rs`.
+- Exclusions/residual risk: QRM TLS/ALPN, generic UDP listener and session authority decisions remain unchanged; cleanup and final review remain open.
+- Next dependency: implement Q7 cleanup from the recorded active-entrypoint inventory.
