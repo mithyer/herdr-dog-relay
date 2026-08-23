@@ -161,10 +161,10 @@ Block QRM-1 when TLS is absent, invalid authority reaches Herdr, one session see
 - Scope: preserve the opaque QUIC/session-stream authority while App consumes only typed Core results.
 - Exclusions: Relay implementation changes, App-Core wire/endpoint changes, App-to-Relay access, raw Herdr bytes, writes, subscriptions, healthy Current, actions and passthrough.
 - Residual risk: Core/App-iOS target/FFI/Keychain/reconnect evidence, Q6 review and Q7 cleanup remain open.
-[validated](1-170) 2026-08-23 | QRM-1 Relay Q6 App/embedded Core integration validated; Relay unchanged
-- Repository state: Relay Q5 deployment/status documentation is checkpointed at `e2b694b`; no Relay Q6 source change was added; Q6 App/Core changes remain uncommitted.
+[checkpointed](1-170) 2026-08-23 | QRM-1 Relay Q6 App/embedded Core integration checkpointed; Relay unchanged
+- Repository state: Relay Q6 status checkpoint and previous Q5 deployment checkpoint are committed; no Relay Q6 source change was added; parent gitlink/status synchronization is complete at the parent layer.
 - Validation: Core/FFI quality gates, iOS builds, hosted XCTest and fresh post-fix review passed with no P0-P2.
 - Scope: preserve the opaque QUIC/session-stream authority while App consumes only typed Core results.
 - Exclusions: Relay implementation changes, App-Core wire/endpoint changes, App-to-Relay access, raw Herdr bytes, writes, subscriptions, healthy Current, actions and passthrough.
-- Residual risk: Keychain provisioning, real native/device evidence, cancellation propagation, Q7 cleanup and selective checkpoint remain open.
-- Next dependency: selective Q6 checkpoint; keep Relay unchanged.
+- Residual risk: Keychain provisioning, real native/device evidence, cancellation propagation, Q7 cleanup and long-term PKI/service lifecycle remain open.
+- Next dependency: keep Q7 planned; keep Relay unchanged.
