@@ -12,7 +12,7 @@ dateCreated: 2026-08-22T00:10:00+08:00
 
 ## Current status
 
-Status: `active` for QRM-1; Q4 weak-network validation is checkpointed as a Core-owned test-only phase and Q5 mb17 evidence remains planned. The implementation directly replaces the previous TCP, listener-class, Broker, HDRL/HDBD, per-session data-port and relay-child entry points. The Relay remains an opaque byte bridge and never parses Herdr protocol.
+Status: `active` for QRM-1; Q4 weak-network validation is checkpointed as a Core-owned test-only phase and Q5 mb17 read-only preflight is active. The implementation directly replaces the previous TCP, listener-class, Broker, HDRL/HDBD, per-session data-port and relay-child entry points. The Relay remains an opaque byte bridge and never parses Herdr protocol.
 
 ## Architecture
 
@@ -63,7 +63,7 @@ src/bin/herdogrelay.rs   one-port CLI host
 | Q2 | Quinn UDP server, TLS/mTLS, ALPN, HDQM and HDQS streams | accepted | loopback TLS, stream isolation, stale heartbeat and capacity rejection |
 | Q3 | Unix socket bridge, deadlines, EOF and redacted cleanup | accepted | socket replacement, bounded buffers and lifecycle tests |
 | Q4 | weak-network injection and reconnect | checkpointed | stream isolation, new epochs/handles and memory bounds |
-| Q5 | mb17 one-port/two-session read-only evidence | planned | typed ping/snapshot only |
+| Q5 | mb17 one-port/two-session read-only evidence | active | typed ping/snapshot only |
 | Q6 | hidden App transport consumer | planned | typed App boundary and Keychain identity |
 | Q7 | remove remaining conflicting files and checkpoint | planned | current QRM-only source/config/docs |
 
@@ -138,3 +138,11 @@ Block QRM-1 when TLS is absent, invalid authority reaches Herdr, one session see
 - Exclusions: Q5 mb17, Q6 App transport, Herdr parsing, actions, subscriptions, healthy Current, passthrough and deployment claims.
 - Residual risk: P3 no-replay assertion hardening and real deployment evidence remain open.
 - Next dependency: keep Q5 planned until its own deployment/evidence gate is activated.
+
+[active](1-148) 2026-08-23 | QRM-1 Relay Q5 mb17 read-only deployment preflight active
+- Repository state: Relay Q4 implementation/status documentation is checkpointed; Herdr master is `d6dae883` and generated schema helpers remain excluded.
+- Validation: local Relay QRM gates pass; protocol 20/schema 1 and the v0.8.2 schema digest are unchanged, while upstream subscription sequencing is outside Q5.
+- Scope: one QRM Relay process, one UDP listener, verified QUIC TLS 1.3/mTLS material, two Herdr session streams and opaque byte-forwarding readiness.
+- Exclusions: old TCP/Broker/HDRL/HDBR/HDBD runtime, per-session ports/children, Herdr parsing, writes, subscriptions, healthy Current, actions and passthrough.
+- Residual risk: mb17 artifact/configuration, certificate material, UDP reachability and socket identity remain unverified.
+- Next dependency: complete non-destructive mb17 preflight before live Relay replacement or reads.

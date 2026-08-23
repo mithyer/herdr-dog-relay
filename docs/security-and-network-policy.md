@@ -12,7 +12,7 @@ dateCreated: 2026-08-22T00:10:00+08:00
 
 ## Current status
 
-Status: `active` for QRM-1; Q4 weak-network validation is checkpointed and Q5 external security evidence remains planned. There is one generic UDP listener policy; network class is not a protocol concept.
+Status: `active` for QRM-1; Q4 weak-network validation is checkpointed and Q5 external security/deployment preflight is active. There is one generic UDP listener policy; network class is not a protocol concept.
 
 ## Required security
 
@@ -54,3 +54,11 @@ QRM tests must cover wrong certificate, missing client identity, wrong ALPN, mal
 - Exclusions: plaintext, network classes, arbitrary commands, Herdr parsing and Q5 deployment.
 - Residual risk: P3 no-replay hardening, certificate provisioning and mb17 evidence remain open.
 - Next dependency: keep Q5 external security evidence planned.
+
+[active](1-64) 2026-08-23 | QRM-1 Relay Q5 external security preflight active
+- Repository state: Relay Q4 security checkpoint is committed; Herdr master is `d6dae883` and generated schema helpers remain excluded.
+- Validation: TLS 1.3, ALPN, identity, authority, redaction and bounded cleanup gates remain local-pass evidence; upstream subscription sequencing does not alter the Q5 read-only path.
+- Scope: verify mb17 certificate/CA references, peer identity, UDP endpoint, two session socket identities and no-forward-before-bind prerequisites.
+- Exclusions: plaintext, network classes, credential disclosure, Herdr parsing, writes, subscriptions, healthy Current, actions and arbitrary commands.
+- Residual risk: production TLS material, endpoint reachability and deployed session isolation remain open.
+- Next dependency: complete non-destructive security preflight before starting the QRM Relay process.

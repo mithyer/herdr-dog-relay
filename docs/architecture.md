@@ -12,7 +12,7 @@ dateCreated: 2026-08-22T00:10:00+08:00
 
 ## Current status
 
-Status: `active` for QRM-1; Q4 weak-network validation is checkpointed as a test-only package and Q5 mb17 evidence remains planned. One `herdogrelay` process binds one UDP port, default `18743`, and accepts one QUIC TLS 1.3 connection per Core device. One control stream and one bidirectional stream per Herdr session share that connection.
+Status: `active` for QRM-1; Q4 weak-network validation is checkpointed as a test-only package and Q5 mb17 read-only evidence is active for preflight. One `herdogrelay` process binds one UDP port, default `18743`, and accepts one QUIC TLS 1.3 connection per Core device. One control stream and one bidirectional stream per Herdr session share that connection.
 
 ## Ownership
 
@@ -58,3 +58,11 @@ Relay owns QUIC authentication, bounded HDQM/HDQS validation, session fingerprin
 - Exclusions: Q5 mb17, Herdr parsing, actions, subscriptions, healthy Current, passthrough and deployment claims.
 - Residual risk: P3 no-replay assertion hardening and deployed evidence remain open.
 - Next dependency: keep Q5 planned until real mb17 evidence is separately activated.
+
+[active](1-68) 2026-08-23 | QRM-1 Relay Q5 architecture preflight active
+- Repository state: Relay Q4 architecture checkpoint is committed; Herdr master is `d6dae883`; generated schema helpers remain excluded.
+- Validation: the one-process/one-port/one-connection architecture and TLS/authority boundaries remain unchanged; upstream subscription sequencing is outside Q5.
+- Scope: validate deployed QUIC listener identity, two isolated session streams and Core-owned typed read attribution.
+- Exclusions: legacy transport, Herdr parsing, writes, subscriptions, healthy Current, actions, passthrough and automatic retries.
+- Residual risk: mb17 network path, TLS identity, session socket identity and failure isolation remain open.
+- Next dependency: complete non-destructive preflight before deployment replacement.

@@ -12,7 +12,7 @@ dateCreated: 2026-08-22T00:10:00+08:00
 
 ## Current status
 
-Status: `active` for QRM-1; Q4 weak-network validation is checkpointed and deployed endpoint evidence remains planned.
+Status: `active` for QRM-1; Q4 weak-network validation is checkpointed and Q5 mb17 endpoint preflight is active.
 
 ## Contract
 
@@ -50,5 +50,12 @@ Configuration tests reject zero/invalid ports, unknown fields, plaintext mode, m
 - Validation: fixed endpoint/no-fallback policy remains tested; Core/Relay quality gates and the Luna max review correction loop pass.
 - Scope: UDP endpoint behavior under deterministic disturbance and reconnect.
 - Exclusions: port ranges, network classes, Broker discovery and per-session data ports.
-- Residual risk: deployed UDP reachability and Q5 mb17 evidence remain open.
 - Next dependency: keep Q5 endpoint validation planned.
+
+[active](1-61) 2026-08-23 | QRM-1 Relay Q5 mb17 endpoint preflight active
+- Repository state: endpoint policy and Q4 status checkpoints are committed; Herdr master is `d6dae883`; generated schema helpers remain excluded.
+- Validation: fixed UDP 18743 endpoint/no-fallback policy remains tested; Q5 has not yet modified the remote listener.
+- Scope: non-destructive inspection of mb17 bind address, UDP port, process owner, listener state and endpoint reachability prerequisites.
+- Exclusions: port ranges, discovery, random fallback, per-session ports, credential mutation, Herdr parsing and live forwarding before TLS/authority checks.
+- Residual risk: remote QRM artifact, verified TLS identity and UDP path remain unverified.
+- Next dependency: complete endpoint preflight before any remote Relay replacement or live probe.

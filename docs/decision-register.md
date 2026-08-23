@@ -12,7 +12,7 @@ dateCreated: 2026-08-22T00:10:00+08:00
 
 ## Current status
 
-Status: `active` for QRM-1; Q4 weak-network validation is checkpointed and Q5 mb17 evidence remains planned. This register replaces the previous listener-class, TCP, Broker and per-session data-port decisions.
+Status: `active` for QRM-1; Q4 weak-network validation is checkpointed and Q5 mb17 read-only deployment preflight is active. This register replaces the previous listener-class, TCP, Broker and per-session data-port decisions.
 
 ## Decisions
 
@@ -90,3 +90,11 @@ Q1 requires codec, fake authority and three-session tests. Q2 requires quinn TLS
 - Exclusions: Q5 mb17, App transport, Herdr parsing, actions, subscriptions, healthy Current and passthrough.
 - Residual risk: P3 no-replay assertion hardening and real deployment evidence remain open.
 - Next dependency: keep Q5 planned until the real two-session deployment gate is explicitly activated.
+
+[active](1-100) 2026-08-23 | QRM-1 Relay Q5 deployment/security preflight active
+- Repository state: Relay Q4 decision/status checkpoints are committed; Herdr master is `d6dae883`; generated schema helpers remain excluded.
+- Validation: local TLS/authority/redaction gates pass; protocol 20/schema 1 and schema digest are unchanged, and upstream subscription sequencing is outside Q5.
+- Scope: verify mb17 artifact/configuration, one UDP endpoint, verified TLS 1.3/mTLS, two session sockets and no-forward-before-bind readiness.
+- Exclusions: plaintext, legacy TCP/Broker/HDRL/HDBR/HDBD, per-session ports/children, Herdr parsing, writes, subscriptions, healthy Current, actions and passthrough.
+- Residual risk: certificate provisioning, endpoint reachability, session identity and deployed isolation evidence remain open.
+- Next dependency: complete non-destructive preflight before starting the QRM Relay process.

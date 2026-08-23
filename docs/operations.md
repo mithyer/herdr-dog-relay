@@ -12,7 +12,7 @@ dateCreated: 2026-08-22T00:10:00+08:00
 
 ## Current status
 
-Status: `active` for QRM-1; Q4 weak-network validation is checkpointed as test-only and Q5 mb17 evidence remains planned. `herdogrelay` is one user-level process per remote device. The process owns one UDP listener and multiple session streams.
+Status: `active` for QRM-1; Q4 weak-network validation is checkpointed as test-only and Q5 mb17 deployment preflight is active. `herdogrelay` is one user-level process per remote device. The process owns one UDP listener and multiple session streams.
 
 ## Configuration
 
@@ -57,3 +57,11 @@ Run Relay locked tests, Clippy, rustfmt, rustdoc, diff checks, loopback three-se
 - Exclusions: Q5 deployment, payload logging, arbitrary commands, Herdr parsing, actions, subscriptions and healthy Current.
 - Residual risk: P3 no-replay hardening and certificate/mb17 deployment evidence remain open.
 - Next dependency: keep Q5 planned until deployment validation is separately activated.
+
+[active](1-67) 2026-08-23 | QRM-1 Relay Q5 mb17 operations preflight active
+- Repository state: Relay Q4 operations checkpoint is committed; Herdr master is `d6dae883` and generated schema helpers remain excluded.
+- Validation: one-process/one-port and bounded inspection rules remain recorded; Q5 is limited to non-destructive deployment preflight before any live forwarding.
+- Scope: inspect process owner, artifact/configuration hashes, UDP listener, TLS identity references, Herdr socket identity and two-session readiness.
+- Exclusions: payload logging, credential disclosure/mutation, arbitrary commands, Herdr parsing, writes, subscriptions, healthy Current, actions and passthrough.
+- Residual risk: remote QRM binary, certificate material, UDP path and session registration remain unverified.
+- Next dependency: complete preflight and stop on any preservation, identity or reachability failure.
