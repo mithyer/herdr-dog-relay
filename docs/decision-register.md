@@ -187,3 +187,11 @@ Q1 requires codec, fake authority and three-session tests. Q2 requires quinn TLS
 - Exclusions: Root signing key/runtime private material, Herdr writes, subscriptions, healthy Current, actions, passthrough, automatic retry, protected production storage, issuance, updater and Windows support.
 - Residual risk: P3 fake-parity items and production Relay enrollment/update behavior remain deferred; selective Relay checkpointing is still required.
 - Next dependency: selectively checkpoint Relay, then continue App-iOS/parent checkpointing before P2.
+
+[checkpointed](1-197) 2026-08-24 | QRM-PROD-1 Relay P1 checkpointed at `e038a32`
+- Repository state: Relay enrollment implementation/status scope is committed at `e038a32`; Relay worktree is clean; parent Wiki gitlink/status synchronization remains pending.
+- Validation: Relay 55 passed with Clippy warnings denied, rustfmt, rustdoc and diff checks passed.
+- Scope: Relay P1 PKI/enrollment origin, allowlist/revocation generation, stable-latest update worker and service decisions represented by bounded contracts/fakes.
+- Exclusions: Root signing key/runtime private material, Herdr writes, subscriptions, healthy Current, actions, passthrough, automatic retry, protected production storage, issuance, updater and Windows support.
+- Residual risk: P3 fake-parity items and production Relay enrollment/update behavior remain deferred; App-iOS/parent checkpoint steps are still required.
+- Next dependency: checkpoint App-iOS, then parent gitlink/status in order.

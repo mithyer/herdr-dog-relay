@@ -245,3 +245,11 @@ Block QRM-PROD-1 when normal QRM lacks TLS/active allowlist enforcement, enrollm
 - Exclusions: real TLS/ALPN serving, protected material loading, remote updater, service installation, mb17 deployment, Herdr parsing, writes, subscriptions, healthy Current, actions, passthrough and automatic retry.
 - Residual risk: P3 fake-parity items and production certificate issuance, persistence, supervision and updater behavior remain deferred; selective Relay checkpointing is still required.
 - Next dependency: selectively checkpoint Relay, then continue App-iOS/parent checkpointing before P2.
+
+[checkpointed](1-255) 2026-08-24 | QRM-PROD-1 Relay P1 checkpointed at `e038a32`
+- Repository state: Relay implementation and status scope is committed at `e038a32`; Relay worktree is clean; parent Wiki gitlink/status synchronization remains pending.
+- Validation: Relay 55 passed with Clippy warnings denied, rustfmt, rustdoc and diff checks passed.
+- Scope: Relay enrollment/allowlist/revocation/update/service contracts, deterministic CA/CSR/worker fakes, redaction tests, decode-only `relay.update` and fail-closed dispatch.
+- Exclusions: production TLS/ALPN serving, protected material loading, remote updater, service installation, mb17 deployment, Herdr parsing, writes, subscriptions, healthy Current, actions, passthrough and automatic retry.
+- Residual risk: production certificate issuance, persistence, supervision and updater behavior remain deferred; App-iOS/parent checkpoint steps are still required.
+- Next dependency: checkpoint App-iOS, then parent gitlink/status in order.
