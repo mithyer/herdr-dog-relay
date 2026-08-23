@@ -97,3 +97,11 @@ QRM tests must cover wrong certificate, missing client identity, wrong ALPN, mal
 - Exclusions: live P6 enrollment/deployment cutover, Herdr parsing, writes, subscriptions, healthy Current, actions, passthrough and automatic retry.
 - Residual risk: P3 live client/closure evidence and P4-P6 deployment evidence remain open; checkpointing is required.
 - Next dependency: selectively checkpoint Relay, then synchronize parent status.
+
+[checkpointed](1-107) 2026-08-24 | QRM-PROD-1 Relay security checkpointed at `51134bb`
+- Repository state: Relay P2 security/source changes are committed at `51134bb`; Relay worktree is clean; parent status closure remains pending.
+- Validation: Relay 69 passed with locked Clippy, rustfmt, rustdoc and diff gates; final review found no P0-P2 findings.
+- Scope: mTLS/ALPN separation, Core enrollment anchor/challenge, protected material, allowlist/revocation, archive safety and supervision boundaries.
+- Exclusions: live P6 enrollment/deployment cutover, Herdr parsing, writes, subscriptions, healthy Current, actions, passthrough and automatic retry.
+- Residual risk: P3 live client/closure and P4-P6 deployment evidence remain open.
+- Next dependency: synchronize parent status and gitlinks.

@@ -101,3 +101,11 @@ Relay owns QUIC authentication, bounded HDQM/HDQS validation, session fingerprin
 - Exclusions: live P6 cutover, production deployment, Herdr parsing, writes, subscriptions, healthy Current, actions, passthrough and automatic retry.
 - Residual risk: P3 live enrollment/closure and P4-P6 service/deployment evidence remain open; checkpointing is required.
 - Next dependency: selectively checkpoint Relay, then synchronize parent status.
+
+[checkpointed](1-111) 2026-08-24 | QRM-PROD-1 Relay architecture checkpointed at `51134bb`
+- Repository state: Relay P2 architecture/source/docs are committed at `51134bb`; Relay worktree is clean; parent status closure remains pending.
+- Validation: Relay 69 passed with locked Clippy, rustfmt, rustdoc and diff gates; final review found no P0-P2 findings.
+- Scope: one-device/one-port/one-connection QRM with normal/enrollment ALPN, protected allowlist, transient PKI, fixed updater and supervision seams.
+- Exclusions: live P6 cutover, production deployment, Herdr parsing, writes, subscriptions, healthy Current, actions, passthrough and automatic retry.
+- Residual risk: P3 live enrollment/closure and P4-P6 service/deployment evidence remain open.
+- Next dependency: synchronize parent status and gitlinks.

@@ -92,3 +92,11 @@ Configuration tests reject zero/invalid ports, unknown fields, plaintext mode, m
 - Exclusions: no port range/discovery/fallback, per-session ports, live P6 deployment, Herdr parsing, writes, subscriptions, healthy Current, actions, passthrough or automatic retry.
 - Residual risk: P3 live ALPN/mTLS/allowlist evidence and P4-P6 supervision/deployment remain open; checkpointing is required.
 - Next dependency: selectively checkpoint Relay, then synchronize parent status.
+
+[checkpointed](1-102) 2026-08-24 | QRM-PROD-1 Relay endpoint checkpointed at `51134bb`
+- Repository state: Relay P2 endpoint/config/source changes are committed at `51134bb`; Relay worktree is clean; parent status closure remains pending.
+- Validation: Relay 69 passed with locked Clippy, rustfmt, rustdoc and diff gates; final review found no P0-P2 findings.
+- Scope: one UDP listener with normal/enrollment ALPN, active allowlist admission and fixed updater/supervision endpoint configuration.
+- Exclusions: no port range/discovery/fallback, per-session ports, live P6 deployment, Herdr parsing, writes, subscriptions, healthy Current, actions, passthrough or automatic retry.
+- Residual risk: P3 live ALPN/mTLS/allowlist and P4-P6 supervision/deployment evidence remain open.
+- Next dependency: synchronize parent status and gitlinks.

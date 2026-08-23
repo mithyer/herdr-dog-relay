@@ -219,3 +219,11 @@ Q1 requires codec, fake authority and three-session tests. Q2 requires quinn TLS
 - Exclusions: live P6 GOAWAY/drain/restart/readiness/rebind, Root signing key, production issuance/deployment, Herdr writes, subscriptions, healthy Current, actions, passthrough and automatic retry.
 - Residual risk: P3 live boundary coverage and P4-P6 real issuance/service/deployment evidence remain open; selective checkpointing is required.
 - Next dependency: selectively checkpoint Relay, then App-iOS and parent in order.
+
+[checkpointed](1-229) 2026-08-24 | QRM-PROD-1 Relay P2 checkpointed at `51134bb`
+- Repository state: Relay P2 implementation, docs, workflow and deployment templates are committed at `51134bb`; Relay worktree is clean; App-iOS/parent checkpoint closure remains pending.
+- Validation: Relay 69 passed with locked Clippy, rustfmt, rustdoc and diff gates; Core 312/2 ignored and Core quality gates passed.
+- Scope: Relay PKI/enrollment origin, allowlist/revocation generation, stable-latest updater and supervision decisions represented by bounded production seams.
+- Exclusions: live P6 GOAWAY/drain/restart/readiness/rebind, Root signing key, production issuance/deployment, Herdr writes, subscriptions, healthy Current, actions, passthrough and automatic retry.
+- Residual risk: P3 live boundary coverage and P4-P6 real service/deployment evidence remain open.
+- Next dependency: checkpoint App-iOS, then parent status in order.

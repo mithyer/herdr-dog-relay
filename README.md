@@ -116,3 +116,11 @@ QRM-PROD-1 P2 is active and implemented locally but not checkpointed. The curren
 - Exclusions: live P6 drain/restart/readiness/rebind, production deployment, Herdr parsing, writes, subscriptions, healthy Current, actions, passthrough and automatic retry.
 - Residual risk: P3 live boundary coverage and P4-P6 real service/deployment evidence remain open; checkpointing is required.
 - Next dependency: selectively checkpoint Relay, then synchronize parent status.
+
+[checkpointed](1-126) 2026-08-24 | QRM-PROD-1 Relay P2 checkpointed at `51134bb`
+- Repository state: Relay P2 implementation/docs/workflow/templates are committed at `51134bb`; Relay worktree is clean; parent status closure remains pending.
+- Validation: Relay 69 passed with locked Clippy, rustfmt, rustdoc and diff gates; final review found no P0-P2 findings.
+- Scope: protected material, Core-anchor enrollment, allowlist, transient PKI, stable-latest updater/revoke and supervision templates.
+- Exclusions: live P6 cutover, production deployment, Herdr parsing, writes, subscriptions, healthy Current, actions, passthrough and automatic retry.
+- Residual risk: P3 live boundary and P4-P6 service/deployment evidence remain open.
+- Next dependency: synchronize parent status and gitlinks.

@@ -97,3 +97,11 @@ Run Relay locked tests, Clippy, rustfmt, rustdoc, diff checks, loopback three-se
 - Exclusions: live P6 service installation/drain/restart/readiness/rebind, production deployment, Herdr parsing, writes, subscriptions, healthy Current, actions, passthrough and automatic retry.
 - Residual risk: P3 live lifecycle evidence and P4-P6 service/deployment preservation remain open; checkpointing is required.
 - Next dependency: selectively checkpoint Relay, then synchronize parent status.
+
+[checkpointed](1-107) 2026-08-24 | QRM-PROD-1 Relay operations checkpointed at `51134bb`
+- Repository state: Relay P2 operations/source/templates are committed at `51134bb`; Relay worktree is clean; parent status closure remains pending.
+- Validation: Relay 69 passed with locked Clippy, rustfmt, rustdoc and diff gates; final review found no P0-P2 findings.
+- Scope: protected configuration, enrollment/allowlist operations, stable-latest replacement/revoke and user-level supervision templates.
+- Exclusions: live P6 service installation/drain/restart/readiness/rebind, production deployment, Herdr parsing, writes, subscriptions, healthy Current, actions, passthrough and automatic retry.
+- Residual risk: P3 live lifecycle and P4-P6 service/deployment preservation remain open.
+- Next dependency: synchronize parent status and gitlinks.

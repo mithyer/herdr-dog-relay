@@ -307,3 +307,11 @@ Block QRM-PROD-1 when normal QRM lacks TLS/active allowlist enforcement, enrollm
 - Exclusions: live P6 GOAWAY/drain/restart/readiness/rebind, production issuance/deployment, Herdr parsing, writes, subscriptions, healthy Current, actions, passthrough and automatic retry.
 - Residual risk: P3 live enrollment/quota/closure test coverage and P4-P6 service/deployment evidence remain open; selective checkpointing is required.
 - Next dependency: selectively checkpoint Relay, then App-iOS and parent in order.
+
+[checkpointed](1-317) 2026-08-24 | QRM-PROD-1 Relay P2 checkpointed at `51134bb`
+- Repository state: Relay P2 implementation, docs, workflow and deployment templates are committed at `51134bb`; Relay worktree is clean; App-iOS/parent checkpoint closure remains pending.
+- Validation: Relay 69 passed with locked Clippy, rustfmt, rustdoc and diff gates; Core 312/2 ignored and Core quality gates passed.
+- Scope: protected material, Core-anchor enrollment ALPN, allowlist/revocation, transient PKI, stable-latest updater/revoke and supervision templates.
+- Exclusions: live P6 GOAWAY/drain/restart/readiness/rebind, production deployment, Herdr parsing, writes, subscriptions, healthy Current, actions, passthrough and automatic retry.
+- Residual risk: P3 live boundary coverage and P4-P6 real service/deployment evidence remain open.
+- Next dependency: checkpoint App-iOS, then parent status in order.
