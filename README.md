@@ -2,7 +2,7 @@
 title: Herdr-dog Relay
 description: Single-device single-port QUIC TLS 1.3 opaque byte Relay.
 published: true
-date: 2026-08-22T00:10:00+08:00
+date: 2026-08-23T11:25:00+08:00
 tags: herdr-dog, relay, quic
 editor: markdown
 dateCreated: 2026-08-22T00:10:00+08:00
@@ -12,7 +12,7 @@ dateCreated: 2026-08-22T00:10:00+08:00
 
 ## Current status
 
-QRM-1 Q3 is locally accepted and checkpointed at the implementation/review gate. Q4 weak-network validation is checkpointed as a Core-owned test-only package; the Relay target is one user-level `herdogrelay` process, one UDP listener defaulting to `18743`, one QUIC TLS 1.3 connection per Core device and one session stream per Herdr session. Q5 mb17 read-only preflight is active; no deployment or capability claim is made.
+QRM-1 Q3 is locally accepted and checkpointed at the implementation/review gate. Q4 weak-network validation is checkpointed as a Core-owned test-only package; the Relay target is one user-level `herdogrelay` process, one UDP listener defaulting to `18743`, one QUIC TLS 1.3 connection per Core device and one session stream per Herdr session. Q5 mb17 one-port/two-session read-only evidence is validated; final review/checkpoint and long-term service provisioning remain open.
 
 ## Boundary
 
@@ -20,7 +20,7 @@ The Relay authenticates Core, validates HDQM/HDQS/session authority and bridges 
 
 ## Current implementation
 
-QRM-1 Q3 is locally accepted and checkpointed in the Relay submodule. The local Relay includes the production Quinn UDP server, HDQM/HDQS authority lifecycle, opaque Unix bridge, bounded control/lease handling, malformed-frame rejection, and verified-mode production gating. Q4 is checkpointed as a Core-owned test-only weak-network package; local loopback evidence is not mb17 deployment evidence, and Q5 mb17 read-only preflight is active. Actions, subscriptions, healthy `Online + Current` and arbitrary passthrough remain disabled.
+QRM-1 Q3 is locally accepted and checkpointed in the Relay submodule. The local Relay includes the production Quinn UDP server, HDQM/HDQS authority lifecycle, opaque Unix bridge, bounded control/lease handling, malformed-frame rejection, and verified-mode production gating. Q4 is checkpointed as a Core-owned test-only weak-network package; Q5 mb17 one-port/two-session read-only evidence is validated through the deployed x86_64 Relay, while local evidence remains distinct from long-term production service claims. Actions, subscriptions, healthy `Online + Current` and arbitrary passthrough remain disabled.
 
 ## Checkpoint Log
 
@@ -67,5 +67,12 @@ QRM-1 Q3 is locally accepted and checkpointed in the Relay submodule. The local 
 - Validation: QRM QUIC server/configuration gates are local-only; upstream protocol 20/schema 1 and schema digest are unchanged, and subscription sequencing changes do not affect the Q5 read-only path.
 - Scope: inspect mb17 Relay artifact/configuration, verified TLS 1.3 identity, one UDP listener and at least two session sockets without forwarding Herdr bytes yet.
 - Exclusions: legacy TCP/Broker fallback, credential changes, Herdr parsing in Relay, writes, subscriptions, healthy Current, actions and passthrough.
-- Residual risk: remote binary readiness, TLS material, UDP reachability, session registration and cleanup/rollback remain open.
 - Next dependency: complete the non-destructive preflight before replacing or starting the QRM Relay process.
+
+[validated](1-78) 2026-08-23 | QRM-1 Relay Q5 mb17 deployment validated
+- Repository state: Relay Q4 documentation checkpoint is committed; QRM x86_64 binary was built from the current Relay source and deployed outside the repository; old binary/config backup is retained on mb17.
+- Validation: verified TLS 1.3/ALPN config loaded, temporary UDP bind passed, final UDP `100.64.0.6:18743` is live, old TCP listener is closed, and Core's two-session/failure-isolation targets passed.
+- Scope: one Relay process/device, one UDP listener, two isolated Herdr session streams and opaque forwarding.
+- Exclusions: legacy TCP/Broker/HDRL/HDBR/HDBD, per-session ports/children, Herdr parsing, writes, subscriptions, healthy Current, actions, passthrough and automatic retries.
+- Residual risk: no LaunchAgent, certificate rotation/PKI provenance and final selective checkpoint remain open.
+- Next dependency: complete post-fix Core review/revalidation and checkpoint the deployment evidence.

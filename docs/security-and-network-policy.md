@@ -2,7 +2,7 @@
 title: Herdr-dog Relay Security and Network Policy
 description: Uniform QUIC TLS 1.3 identity and bounded session security policy.
 published: true
-date: 2026-08-22T00:10:00+08:00
+date: 2026-08-23T11:25:00+08:00
 tags: herdr-dog, relay, security, quic, plan
 editor: markdown
 dateCreated: 2026-08-22T00:10:00+08:00
@@ -12,7 +12,7 @@ dateCreated: 2026-08-22T00:10:00+08:00
 
 ## Current status
 
-Status: `active` for QRM-1; Q4 weak-network validation is checkpointed and Q5 external security/deployment preflight is active. There is one generic UDP listener policy; network class is not a protocol concept.
+Status: `active` for QRM-1; Q4 weak-network validation is checkpointed and Q5 mb17 external security/deployment evidence is `validated`. There is one generic UDP listener policy; network class is not a protocol concept.
 
 ## Required security
 
@@ -60,5 +60,12 @@ QRM tests must cover wrong certificate, missing client identity, wrong ALPN, mal
 - Validation: TLS 1.3, ALPN, identity, authority, redaction and bounded cleanup gates remain local-pass evidence; upstream subscription sequencing does not alter the Q5 read-only path.
 - Scope: verify mb17 certificate/CA references, peer identity, UDP endpoint, two session socket identities and no-forward-before-bind prerequisites.
 - Exclusions: plaintext, network classes, credential disclosure, Herdr parsing, writes, subscriptions, healthy Current, actions and arbitrary commands.
-- Residual risk: production TLS material, endpoint reachability and deployed session isolation remain open.
 - Next dependency: complete non-destructive security preflight before starting the QRM Relay process.
+
+[validated](1-71) 2026-08-23 | QRM-1 Relay Q5 mb17 external security evidence validated
+- Repository state: verified TLS 1.3/mTLS certificate and CA material is outside the repository; server key is mode `0600`; old Relay/config backup is retained.
+- Validation: temporary and final UDP bind, ALPN, client authentication, socket mode/identity, old TCP closure and Core typed read/failure-isolation evidence passed.
+- Scope: generic device endpoint, peer identity, HDQM/HDQS authority and no-forward-before-bind boundary.
+- Exclusions: plaintext, network classes, credential disclosure, Herdr parsing, writes, subscriptions, healthy Current, actions and arbitrary commands.
+- Residual risk: PKI lifecycle, LaunchAgent supervision and final review/checkpoint remain open.
+- Next dependency: complete post-fix review and synchronize the Q5 security checkpoint.

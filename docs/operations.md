@@ -2,7 +2,7 @@
 title: Herdr-dog Relay Operations
 description: User-level operation and verification rules for the single-port QUIC Relay.
 published: true
-date: 2026-08-22T00:10:00+08:00
+date: 2026-08-23T11:25:00+08:00
 tags: herdr-dog, relay, operations, quic, plan
 editor: markdown
 dateCreated: 2026-08-22T00:10:00+08:00
@@ -12,7 +12,7 @@ dateCreated: 2026-08-22T00:10:00+08:00
 
 ## Current status
 
-Status: `active` for QRM-1; Q4 weak-network validation is checkpointed as test-only and Q5 mb17 deployment preflight is active. `herdogrelay` is one user-level process per remote device. The process owns one UDP listener and multiple session streams.
+Status: `active` for QRM-1; Q4 weak-network validation is checkpointed as test-only and Q5 mb17 one-port/two-session deployment/read-only evidence is `validated`. `herdogrelay` is one user-level process per remote device. The process owns one UDP listener and multiple session streams; service supervision remains separate.
 
 ## Configuration
 
@@ -63,5 +63,12 @@ Run Relay locked tests, Clippy, rustfmt, rustdoc, diff checks, loopback three-se
 - Validation: one-process/one-port and bounded inspection rules remain recorded; Q5 is limited to non-destructive deployment preflight before any live forwarding.
 - Scope: inspect process owner, artifact/configuration hashes, UDP listener, TLS identity references, Herdr socket identity and two-session readiness.
 - Exclusions: payload logging, credential disclosure/mutation, arbitrary commands, Herdr parsing, writes, subscriptions, healthy Current, actions and passthrough.
-- Residual risk: remote QRM binary, certificate material, UDP path and session registration remain unverified.
 - Next dependency: complete preflight and stop on any preservation, identity or reachability failure.
+
+[validated](1-74) 2026-08-23 | QRM-1 Relay Q5 mb17 operations validated
+- Repository state: the x86_64 QRM binary, verified TLS config and external material are deployed outside the repository; the old binary/config backup and explicit rollback path are retained on mb17.
+- Validation: old TCP Relay stopped, QRM UDP `100.64.0.6:18743` live, default/`qrm-work` sockets mode `0600`, Core typed protocol-20 reads and stopped-session isolation passed.
+- Scope: user-level one-process/one-port operation, bounded inspection and read-only evidence.
+- Exclusions: payload logging, credential disclosure/mutation, arbitrary commands, Herdr parsing, writes, subscriptions, healthy Current, actions and passthrough.
+- Residual risk: no LaunchAgent, PKI rotation and final checkpoint remain open.
+- Next dependency: record post-fix test outputs and checkpoint Q5 selectively.

@@ -2,7 +2,7 @@
 title: Herdr-dog Relay QUIC Decision Register
 description: QRM-1 Relay port, TLS, ALPN, stream, resource and security decisions.
 published: true
-date: 2026-08-22T00:10:00+08:00
+date: 2026-08-23T11:25:00+08:00
 tags: herdr-dog, relay, quic, decisions, plan
 editor: markdown
 dateCreated: 2026-08-22T00:10:00+08:00
@@ -12,7 +12,7 @@ dateCreated: 2026-08-22T00:10:00+08:00
 
 ## Current status
 
-Status: `active` for QRM-1; Q4 weak-network validation is checkpointed and Q5 mb17 read-only deployment preflight is active. This register replaces the previous listener-class, TCP, Broker and per-session data-port decisions.
+Status: `active` for QRM-1; Q4 weak-network validation is checkpointed and Q5 mb17 one-port/two-session read-only deployment evidence is `validated`. This register replaces the previous listener-class, TCP, Broker and per-session data-port decisions; final Q5 review/checkpoint remains open.
 
 ## Decisions
 
@@ -98,3 +98,11 @@ Q1 requires codec, fake authority and three-session tests. Q2 requires quinn TLS
 - Exclusions: plaintext, legacy TCP/Broker/HDRL/HDBR/HDBD, per-session ports/children, Herdr parsing, writes, subscriptions, healthy Current, actions and passthrough.
 - Residual risk: certificate provisioning, endpoint reachability, session identity and deployed isolation evidence remain open.
 - Next dependency: complete non-destructive preflight before starting the QRM Relay process.
+
+[validated](1-108) 2026-08-23 | QRM-1 Relay Q5 deployment/security evidence validated
+- Repository state: QRM x86_64 Relay and verified mTLS paths are deployed outside the repository; old binary/config backup is retained and Herdr configuration/credentials were preserved.
+- Validation: temporary and final UDP bind, TLS 1.3/ALPN, old TCP closure, two session sockets and Core typed read/failure-isolation evidence passed.
+- Scope: one generic device listener, one process, one connection and per-session authority.
+- Exclusions: plaintext, network classes, legacy TCP/Broker/HDRL/HDBR/HDBD, per-session ports/children, Herdr parsing, writes, subscriptions, healthy Current, actions and passthrough.
+- Residual risk: production PKI lifecycle, LaunchAgent/supervision and final selective checkpoint remain open.
+- Next dependency: rerun post-fix Core evidence and checkpoint the Q5 security record.

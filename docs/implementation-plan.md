@@ -2,7 +2,7 @@
 title: Herdr-dog Relay QUIC Implementation Plan
 description: QRM-1 single UDP listener, QUIC TLS 1.3, control/session streams and Unix byte bridge.
 published: true
-date: 2026-08-22T00:10:00+08:00
+date: 2026-08-23T11:25:00+08:00
 tags: herdr-dog, relay, quic, rust, plan
 editor: markdown
 dateCreated: 2026-08-22T00:10:00+08:00
@@ -12,7 +12,7 @@ dateCreated: 2026-08-22T00:10:00+08:00
 
 ## Current status
 
-Status: `active` for QRM-1; Q4 weak-network validation is checkpointed as a Core-owned test-only phase and Q5 mb17 read-only preflight is active. The implementation directly replaces the previous TCP, listener-class, Broker, HDRL/HDBD, per-session data-port and relay-child entry points. The Relay remains an opaque byte bridge and never parses Herdr protocol.
+Status: `active` for QRM-1; Q4 weak-network validation is checkpointed as a Core-owned test-only phase and Q5 mb17 one-port/two-session read-only evidence is `validated`. The implementation directly replaces the previous TCP, listener-class, Broker, HDRL/HDBD, per-session data-port and relay-child entry points. The Relay remains an opaque byte bridge and never parses Herdr protocol; final Q5 review/checkpoint and service provisioning remain open.
 
 ## Architecture
 
@@ -63,7 +63,7 @@ src/bin/herdogrelay.rs   one-port CLI host
 | Q2 | Quinn UDP server, TLS/mTLS, ALPN, HDQM and HDQS streams | accepted | loopback TLS, stream isolation, stale heartbeat and capacity rejection |
 | Q3 | Unix socket bridge, deadlines, EOF and redacted cleanup | accepted | socket replacement, bounded buffers and lifecycle tests |
 | Q4 | weak-network injection and reconnect | checkpointed | stream isolation, new epochs/handles and memory bounds |
-| Q5 | mb17 one-port/two-session read-only evidence | active | typed ping/snapshot only |
+| Q5 | mb17 one-port/two-session read-only evidence | validated | typed ping/snapshot and socket-failure isolation |
 | Q6 | hidden App transport consumer | planned | typed App boundary and Keychain identity |
 | Q7 | remove remaining conflicting files and checkpoint | planned | current QRM-only source/config/docs |
 
@@ -146,3 +146,11 @@ Block QRM-1 when TLS is absent, invalid authority reaches Herdr, one session see
 - Exclusions: old TCP/Broker/HDRL/HDBR/HDBD runtime, per-session ports/children, Herdr parsing, writes, subscriptions, healthy Current, actions and passthrough.
 - Residual risk: mb17 artifact/configuration, certificate material, UDP reachability and socket identity remain unverified.
 - Next dependency: complete non-destructive mb17 preflight before live Relay replacement or reads.
+
+[validated](1-156) 2026-08-23 | QRM-1 Relay Q5 mb17 read-only deployment validated
+- Repository state: Relay Q4 implementation/status documentation is checkpointed; QRM x86_64 artifact and TLS material are deployed outside the repository, and old binary/config backup is retained on mb17.
+- Validation: verified TLS 1.3/ALPN temporary bind and final UDP `100.64.0.6:18743` passed; old TCP listener closed; Core two-session protocol-20 and exact socket-failure isolation targets passed.
+- Scope: one Relay process/device, one UDP listener, two isolated session streams and opaque forwarding.
+- Exclusions: old TCP/Broker/HDRL/HDBR/HDBD, per-session ports/children, Herdr parsing, writes, subscriptions, healthy Current, actions, passthrough and automatic retries.
+- Residual risk: final review/checkpoint, supervision and PKI lifecycle remain open.
+- Next dependency: checkpoint the deployment evidence after post-fix Core review/revalidation.

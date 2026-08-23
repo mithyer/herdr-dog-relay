@@ -2,7 +2,7 @@
 title: Herdr-dog Relay Endpoint and Port Plan
 description: Fixed single UDP endpoint and explicit configuration rules for QRM-1.
 published: true
-date: 2026-08-22T00:10:00+08:00
+date: 2026-08-23T11:25:00+08:00
 tags: herdr-dog, relay, quic, port, plan
 editor: markdown
 dateCreated: 2026-08-22T00:10:00+08:00
@@ -12,7 +12,7 @@ dateCreated: 2026-08-22T00:10:00+08:00
 
 ## Current status
 
-Status: `active` for QRM-1; Q4 weak-network validation is checkpointed and Q5 mb17 endpoint preflight is active.
+Status: `active` for QRM-1; Q4 weak-network validation is checkpointed and Q5 mb17 one-port/two-session endpoint/read-only evidence is `validated`.
 
 ## Contract
 
@@ -57,5 +57,12 @@ Configuration tests reject zero/invalid ports, unknown fields, plaintext mode, m
 - Validation: fixed UDP 18743 endpoint/no-fallback policy remains tested; Q5 has not yet modified the remote listener.
 - Scope: non-destructive inspection of mb17 bind address, UDP port, process owner, listener state and endpoint reachability prerequisites.
 - Exclusions: port ranges, discovery, random fallback, per-session ports, credential mutation, Herdr parsing and live forwarding before TLS/authority checks.
-- Residual risk: remote QRM artifact, verified TLS identity and UDP path remain unverified.
 - Next dependency: complete endpoint preflight before any remote Relay replacement or live probe.
+
+[validated](1-68) 2026-08-23 | QRM-1 Relay Q5 mb17 endpoint validated
+- Repository state: QRM Relay is deployed outside the repository with one explicit UDP endpoint; the old TCP listener and old runtime path are closed, with rollback backup retained.
+- Validation: final listener is `100.64.0.6:18743/UDP`; no range scan or fallback occurred; Core protocol-20 two-session read and socket-failure isolation passed.
+- Scope: fixed endpoint, verified QUIC TLS 1.3/ALPN and one process/device.
+- Exclusions: port ranges, discovery, random fallback, per-session ports, credential mutation, Herdr parsing and live writes.
+- Residual risk: endpoint persistence/supervision and final checkpoint remain open.
+- Next dependency: finish post-fix review and checkpoint the deployment evidence.
