@@ -12,7 +12,7 @@ dateCreated: 2026-08-22T00:10:00+08:00
 
 ## Current status
 
-Status: `active` for QRM-1; Q4 weak-network validation is checkpointed as a Core-owned test-only phase and Q5 mb17 one-port/two-session read-only evidence is `validated`. The implementation directly replaces the previous TCP, listener-class, Broker, HDRL/HDBD, per-session data-port and relay-child entry points. The Relay remains an opaque byte bridge and never parses Herdr protocol; final Q5 review/checkpoint and service provisioning remain open.
+Status: `checkpointed` for the QRM-1 Relay scope. Q4 weak-network validation, Q5 mb17 one-port/two-session read-only evidence and Q6 App/embedded Core integration status are checkpointed; Q6 adds no Relay source. The implementation directly replaces the previous TCP, listener-class, Broker, HDRL/HDBD, per-session data-port and relay-child entry points. The Relay remains an opaque byte bridge and never parses Herdr protocol; service provisioning, Keychain lifecycle, Q7 cleanup and QRM overall acceptance remain open.
 
 ## Architecture
 
@@ -64,7 +64,7 @@ src/bin/herdogrelay.rs   one-port CLI host
 | Q3 | Unix socket bridge, deadlines, EOF and redacted cleanup | accepted | socket replacement, bounded buffers and lifecycle tests |
 | Q4 | weak-network injection and reconnect | checkpointed | stream isolation, new epochs/handles and memory bounds |
 | Q5 | mb17 one-port/two-session read-only evidence | checkpointed | typed ping/snapshot and socket-failure isolation |
-| Q6 | hidden App transport consumer | validated | no Relay source change; Core/App-iOS target baseline and typed boundary; selective checkpoint pending |
+| Q6 | hidden App transport consumer | checkpointed | no Relay source change; Core/App-iOS target baseline and typed boundary |
 | Q7 | remove remaining conflicting files and checkpoint | planned | current QRM-only source/config/docs |
 
 ## Verification commands
