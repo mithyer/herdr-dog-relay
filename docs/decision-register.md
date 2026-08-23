@@ -195,3 +195,11 @@ Q1 requires codec, fake authority and three-session tests. Q2 requires quinn TLS
 - Exclusions: Root signing key/runtime private material, Herdr writes, subscriptions, healthy Current, actions, passthrough, automatic retry, protected production storage, issuance, updater and Windows support.
 - Residual risk: P3 fake-parity items and production Relay enrollment/update behavior remain deferred; App-iOS/parent checkpoint steps are still required.
 - Next dependency: checkpoint App-iOS, then parent gitlink/status in order.
+
+[active](1-205) 2026-08-24 | QRM-PROD-1 P2 Relay deployment lifecycle is active
+- Repository state: P1 Relay checkpoint `e038a32`/`86e174b`, Core `dcbc3cd`/`4ba0852`, App-iOS `8b956ab`/`5d2b1c3`, parent `40390b6`/`4490417`; P2 activation is uncommitted and no deployment change is made.
+- Validation: P1 Relay 55-test quality/review/checkpoint gates passed; QRM-1 opaque Herdr bridge and fail-closed security boundaries remain preserved.
+- Scope: Relay PKI/enrollment origin, allowlist/revocation generation, stable-latest updater and supervision decisions, with implementation evidence required before P3.
+- Exclusions: Root signing key/runtime private material, real certificate issuance, mb17 deployment, Herdr writes, subscriptions, healthy Current, actions, passthrough and automatic retry.
+- Residual risk: P2 must preserve quota isolation, Core-origin/challenge binding, rollback and redacted authority diagnostics.
+- Next dependency: complete P2 activation review/status synchronization before Relay source implementation.

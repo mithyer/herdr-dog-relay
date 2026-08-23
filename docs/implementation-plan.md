@@ -253,3 +253,11 @@ Block QRM-PROD-1 when normal QRM lacks TLS/active allowlist enforcement, enrollm
 - Exclusions: production TLS/ALPN serving, protected material loading, remote updater, service installation, mb17 deployment, Herdr parsing, writes, subscriptions, healthy Current, actions, passthrough and automatic retry.
 - Residual risk: production certificate issuance, persistence, supervision and updater behavior remain deferred; App-iOS/parent checkpoint steps are still required.
 - Next dependency: checkpoint App-iOS, then parent gitlink/status in order.
+
+[active](1-263) 2026-08-24 | QRM-PROD-1 P2 Relay deployment lifecycle is active
+- Repository state: P1 Relay checkpoint `e038a32`/`86e174b`, Core `dcbc3cd`/`4ba0852`, App-iOS `8b956ab`/`5d2b1c3`, parent `40390b6`/`4490417`; P2 activation is uncommitted and no deployment change is made.
+- Validation: P1 Relay 55-test quality/review/checkpoint gates passed; QRM-1 opaque Herdr bridge and fail-closed security boundaries remain preserved.
+- Scope: protected-file TLS/Intermediate material, same-port enrollment ALPN, allowlist/revocation generation, stable-latest update worker, safe extraction/rollback, LaunchAgent/systemd templates and local lifecycle tests.
+- Exclusions: real mb17 deployment, certificate issuance against production PKI, Herdr parsing/writes, subscriptions, healthy Current, actions, passthrough and automatic retry.
+- Residual risk: P2 must make enrollment/normal-QRM quotas independent, require Core origin/challenge, keep revocation connection-scoped and prevent unsafe archive/command behavior.
+- Next dependency: complete P2 activation review/status synchronization before Relay source implementation.
