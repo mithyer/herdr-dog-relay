@@ -12,7 +12,7 @@ dateCreated: 2026-08-22T00:10:00+08:00
 
 ## Current status
 
-Status: `active` for QRM-1; Q4 weak-network validation is checkpointed and Q5 mb17 one-port/two-session read-only deployment evidence is `validated`. This register replaces the previous listener-class, TCP, Broker and per-session data-port decisions; final Q5 review/checkpoint remains open.
+Status: `active` for QRM-1 Q7 Legacy Cleanup. Q4 weak-network validation, Q5 mb17 one-port/two-session read-only deployment evidence and Q6 App/embedded Core integration status are checkpointed. This register preserves the QRM replacement decisions and now governs cleanup of active legacy listener/config/export/test references; no protocol or capability expansion is part of Q7.
 
 ## Decisions
 
@@ -105,4 +105,12 @@ Q1 requires codec, fake authority and three-session tests. Q2 requires quinn TLS
 - Scope: one generic device listener, one process, one connection and per-session authority.
 - Exclusions: plaintext, network classes, legacy TCP/Broker/HDRL/HDBR/HDBD, per-session ports/children, Herdr parsing, writes, subscriptions, healthy Current, actions and passthrough.
 - Residual risk: production PKI lifecycle, LaunchAgent/supervision and final selective checkpoint remain open.
-- Next dependency: rerun post-fix Core evidence and checkpoint the Q5 security record.
+- Next dependency: capture a read-only Q7 baseline and inventory active legacy references before implementation cleanup.
+
+[active](1-116) 2026-08-23 | QRM-1 Relay Q7 Legacy Cleanup activated
+- Repository state: Relay Q6 status is checkpointed at `c4abc7f`; no Relay Q7 source change is authorized or added; Herdr generated helpers remain excluded.
+- Validation: Q6 cross-repository quality, build and review gates passed; this Q7 activation is documentation-only.
+- Scope: remove or rewrite active legacy Relay listener/config/export/test references while preserving QRM QUIC, TLS/ALPN, stream authority and opaque-byte boundaries.
+- Exclusions: no protocol expansion, Herdr parsing, App-Core changes, deployment changes, writes, subscriptions, healthy Current, actions, passthrough or fallback.
+- Residual risk: active caller inventory, stale decision references and final Q7 review remain open.
+- Next dependency: capture the read-only baseline and complete the Relay decision-linked legacy inventory before implementation cleanup.

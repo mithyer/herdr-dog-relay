@@ -12,7 +12,7 @@ dateCreated: 2026-08-22T00:10:00+08:00
 
 ## Current status
 
-Status: `checkpointed` for the QRM-1 Relay scope. Q4 weak-network validation, Q5 mb17 one-port/two-session read-only evidence and Q6 App/embedded Core integration status are checkpointed; Q6 adds no Relay source. The implementation directly replaces the previous TCP, listener-class, Broker, HDRL/HDBD, per-session data-port and relay-child entry points. The Relay remains an opaque byte bridge and never parses Herdr protocol; service provisioning, Keychain lifecycle, Q7 cleanup and QRM overall acceptance remain open.
+Status: `active` for QRM-1 Q7 Legacy Cleanup. Q4 weak-network validation, Q5 mb17 one-port/two-session read-only evidence and Q6 App/embedded Core integration status are checkpointed; Q7 adds no Relay source behavior until its baseline inventory is complete. The implementation directly replaces the previous TCP, listener-class, Broker, HDRL/HDBD, per-session data-port and relay-child entry points. The Relay remains an opaque byte bridge and never parses Herdr protocol; service provisioning, Keychain lifecycle and QRM overall acceptance remain open.
 
 ## Architecture
 
@@ -65,7 +65,7 @@ src/bin/herdogrelay.rs   one-port CLI host
 | Q4 | weak-network injection and reconnect | checkpointed | stream isolation, new epochs/handles and memory bounds |
 | Q5 | mb17 one-port/two-session read-only evidence | checkpointed | typed ping/snapshot and socket-failure isolation |
 | Q6 | hidden App transport consumer | checkpointed | no Relay source change; Core/App-iOS target baseline and typed boundary |
-| Q7 | remove remaining conflicting files and checkpoint | planned | current QRM-only source/config/docs |
+| Q7 | remove remaining conflicting files and checkpoint | active | current QRM-only source/config/docs after baseline, cleanup, quality and review gates |
 
 ## Verification commands
 
@@ -167,4 +167,12 @@ Block QRM-1 when TLS is absent, invalid authority reaches Herdr, one session see
 - Scope: preserve the opaque QUIC/session-stream authority while App consumes only typed Core results.
 - Exclusions: Relay implementation changes, App-Core wire/endpoint changes, App-to-Relay access, raw Herdr bytes, writes, subscriptions, healthy Current, actions and passthrough.
 - Residual risk: Keychain provisioning, real native/device evidence, cancellation propagation, Q7 cleanup and long-term PKI/service lifecycle remain open.
-- Next dependency: keep Q7 planned; keep Relay unchanged.
+- Next dependency: capture a read-only Q7 baseline and inventory active legacy references before implementation cleanup.
+
+[active](1-178) 2026-08-23 | QRM-1 Relay Q7 Legacy Cleanup activated
+- Repository state: Relay Q6 status is checkpointed at `c4abc7f`; no Relay Q7 source change is authorized or added; Herdr generated helpers remain excluded.
+- Validation: Q6 Core/FFI quality gates, iOS builds, hosted XCTest and fresh review passed; this Q7 activation is documentation-only.
+- Scope: remove or rewrite active Relay legacy listener/config/export/test references while preserving the QRM QUIC listener, SessionRegistry, opaque bridge and historical checkpoints.
+- Exclusions: no legacy fallback, new protocol behavior, Herdr parsing, App-Core changes, deployment changes, writes, subscriptions, healthy Current, actions or passthrough.
+- Residual risk: active caller inventory, CLI/config fallout, deployment documentation and final Q7 review remain open.
+- Next dependency: capture the read-only baseline and complete the Relay legacy active-entrypoint inventory before implementation cleanup.
