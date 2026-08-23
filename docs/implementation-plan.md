@@ -95,7 +95,7 @@ src/bin/herdogrelay.rs   one-port CLI host, revoke and stable-latest update
 | Q4 | weak-network injection and reconnect | checkpointed | stream isolation, new epochs/handles and memory bounds |
 | Q5 | mb17 one-port/two-session read-only evidence | checkpointed | typed ping/snapshot and socket-failure isolation |
 | Q6 | hidden App transport consumer | checkpointed | no Relay source change; Core/App-iOS target baseline and typed boundary |
-| QRM-PROD-1 | protected-file PKI, enrollment ALPN, App allowlist/admin, stable-latest updater, LaunchAgent/systemd templates | implemented | 69 Relay tests, Core wire parity, review/fix/revalidation, then selective checkpoint; P6 live drain/restart/deployment remains later |
+| QRM-PROD-1 | protected-file PKI, enrollment ALPN, App allowlist/admin, stable-latest updater, LaunchAgent/systemd templates | active | P2 checkpointed; P3 Core/App typed path; P4-P6 live issuance, service and deployment evidence later |
 
 ## QRM-PROD-1 Relay boundary
 
@@ -315,3 +315,11 @@ Block QRM-PROD-1 when normal QRM lacks TLS/active allowlist enforcement, enrollm
 - Exclusions: live P6 GOAWAY/drain/restart/readiness/rebind, production deployment, Herdr parsing, writes, subscriptions, healthy Current, actions, passthrough and automatic retry.
 - Residual risk: P3 live boundary coverage and P4-P6 real service/deployment evidence remain open.
 - Next dependency: checkpoint App-iOS, then parent status in order.
+
+[active](1-325) 2026-08-24 | QRM-PROD-1 P3 typed Core/App integration is active
+- Repository state: Relay P2 implementation/status `51134bb`/`6176552` is checkpointed; P3 changes are Core/App-owned and Relay source remains unchanged; activation docs are uncommitted.
+- Validation: Relay P2 69-test quality/review/checkpoint gates passed; no P3 Relay transport or deployment behavior is authorized.
+- Scope: preserve Relay's opaque enrollment/update boundary while Core/App add typed authorization and identity/update routing.
+- Exclusions: no Relay source, live issuance/deployment, Herdr parsing, writes, subscriptions, healthy Current, actions, passthrough or automatic retry.
+- Residual risk: P3 typed Core/App integration and P4-P6 real evidence remain open.
+- Next dependency: complete P3 activation review/status synchronization before Core/App source implementation.
