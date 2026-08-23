@@ -64,7 +64,7 @@ src/bin/herdogrelay.rs   one-port CLI host
 | Q3 | Unix socket bridge, deadlines, EOF and redacted cleanup | accepted | socket replacement, bounded buffers and lifecycle tests |
 | Q4 | weak-network injection and reconnect | checkpointed | stream isolation, new epochs/handles and memory bounds |
 | Q5 | mb17 one-port/two-session read-only evidence | checkpointed | typed ping/snapshot and socket-failure isolation |
-| Q6 | hidden App transport consumer | active | no Relay source change; Core/App-iOS target baseline and typed boundary |
+| Q6 | hidden App transport consumer | validated | no Relay source change; Core/App-iOS target baseline and typed boundary; selective checkpoint pending |
 | Q7 | remove remaining conflicting files and checkpoint | planned | current QRM-only source/config/docs |
 
 ## Verification commands
@@ -161,4 +161,10 @@ Block QRM-1 when TLS is absent, invalid authority reaches Herdr, one session see
 - Scope: preserve the opaque QUIC/session-stream authority while App consumes only typed Core results.
 - Exclusions: Relay implementation changes, App-Core wire/endpoint changes, App-to-Relay access, raw Herdr bytes, writes, subscriptions, healthy Current, actions and passthrough.
 - Residual risk: Core/App-iOS target/FFI/Keychain/reconnect evidence, Q6 review and Q7 cleanup remain open.
-- Next dependency: keep Relay unchanged until a separately scoped package requires a Relay change.
+[validated](1-170) 2026-08-23 | QRM-1 Relay Q6 App/embedded Core integration validated; Relay unchanged
+- Repository state: Relay Q5 deployment/status documentation is checkpointed at `e2b694b`; no Relay Q6 source change was added; Q6 App/Core changes remain uncommitted.
+- Validation: Core/FFI quality gates, iOS builds, hosted XCTest and fresh post-fix review passed with no P0-P2.
+- Scope: preserve the opaque QUIC/session-stream authority while App consumes only typed Core results.
+- Exclusions: Relay implementation changes, App-Core wire/endpoint changes, App-to-Relay access, raw Herdr bytes, writes, subscriptions, healthy Current, actions and passthrough.
+- Residual risk: Keychain provisioning, real native/device evidence, cancellation propagation, Q7 cleanup and selective checkpoint remain open.
+- Next dependency: selective Q6 checkpoint; keep Relay unchanged.
