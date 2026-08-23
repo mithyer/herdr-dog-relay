@@ -323,3 +323,27 @@ Block QRM-PROD-1 when normal QRM lacks TLS/active allowlist enforcement, enrollm
 - Exclusions: no Relay source, live issuance/deployment, Herdr parsing, writes, subscriptions, healthy Current, actions, passthrough or automatic retry.
 - Residual risk: P3 typed Core/App integration and P4-P6 real evidence remain open.
 - Next dependency: complete P3 activation review/status synchronization before Core/App source implementation.
+
+[implemented](1-333) 2026-08-24 | QRM-PROD-1 P3 typed Core/App implementation completed locally
+- Repository state: Relay P2 checkpoint/status `51134bb`/`6176552` remains clean; P3 Core/App source is uncommitted elsewhere; Relay source is unchanged.
+- Validation: Relay 69-test quality/review/checkpoint gates remain passed; Core 315/2 ignored and App hosted 45/3 skipped gates pass, including bounded DER assembly.
+- Scope: Relay preserves opaque protected enrollment/update boundary while Core/App implement typed authorization and identity/update routing.
+- Exclusions: no P3 Relay source, live issuance/deployment, Herdr parsing/writes, subscriptions, healthy Current, actions, passthrough or automatic retry.
+- Residual risk: App Keychain happy-path entitlement evidence remains for P4; fresh P3 review/fix/revalidation and P4-P6 live evidence remain open.
+- Next dependency: complete fresh P3 implementation review, apply fixes, revalidate, then selectively checkpoint Core/App-iOS and parent.
+
+[validated](1-341) 2026-08-24 | QRM-PROD-1 P3 typed Core/App integration validated locally after review
+- Repository state: Relay P2 implementation/status remain checkpointed; only P3 Relay status documentation is uncommitted; Core/App-iOS P3 sources remain uncommitted separately.
+- Validation: Relay 69-test quality/review/checkpoint gates remain passed; Core 315 passed/2 ignored and App hosted XCTest 45 executed: 42 passed/3 skipped, including bounded PKCS#10 DER assembly; associated quality gates passed.
+- Scope: Relay remains opaque and unchanged while Core/App-iOS own typed enrollment and identity/update boundaries.
+- Exclusions: no Relay source, live certificate issuance, deployment, Herdr writes, subscriptions, healthy Current, actions, passthrough or automatic retry.
+- Residual risk: Keychain entitlement skips and P4-P6 live enrollment/service/deployment evidence remain open.
+- Next dependency: selectively checkpoint Core, Relay status/docs, App-iOS and parent in the required order; no acceptance or deployment claim before checkpointing.
+
+[checkpointed](1-349) 2026-08-24 | QRM-PROD-1 P3 Relay status checkpointed; no Relay source changes
+- Repository state: Relay P2 implementation/status remain checkpointed at `51134bb`/`6176552`; P3 adds no Relay source, deployment or certificate behavior; this status/documentation checkpoint is the only Relay change.
+- Validation: Relay 69-test quality/review/checkpoint gates remain passed; Core 315 passed/2 ignored and App hosted XCTest 45 executed: 42 passed/3 skipped; associated quality gates passed.
+- Scope: Relay remains opaque and unchanged while Core/App-iOS own typed enrollment and identity/update boundaries.
+- Exclusions: no Relay source, live certificate issuance, deployment, Herdr writes, subscriptions, healthy Current, actions, passthrough or automatic retry.
+- Residual risk: Keychain entitlement skips and P4-P6 live enrollment/service/deployment evidence remain open.
+- Next dependency: checkpoint App-iOS implementation/status, then append the parent Wiki checkpoint without staging Herdr or unrelated content.
