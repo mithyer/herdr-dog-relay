@@ -12,7 +12,7 @@ dateCreated: 2026-08-22T00:10:00+08:00
 
 ## Current status
 
-Status: `active` for QRM-1 Q7 Legacy Cleanup. Q4 weak-network validation, Q5 mb17 one-port/two-session read-only deployment evidence and Q6 App/embedded Core integration status are checkpointed. This register preserves the QRM replacement decisions and now governs cleanup of active legacy listener/config/export/test references; no protocol or capability expansion is part of Q7.
+Status: `checkpointed` for QRM-1 Q7 Legacy Cleanup at Relay commit `a2dd9dc`. Q4 weak-network validation, Q5 mb17 one-port/two-session read-only deployment evidence and Q6 App/embedded Core integration status are checkpointed. This register preserves the QRM replacement decisions; Q7 removed the active legacy listener/config/export/test surface without protocol or capability expansion. QRM overall acceptance, service provisioning and PKI lifecycle remain open.
 
 ## Decisions
 
@@ -130,3 +130,11 @@ Q1 requires codec, fake authority and three-session tests. Q2 requires quinn TLS
 - Exclusions: no legacy fallback, protocol expansion, Herdr parsing, App-Core changes, deployment, writes, subscriptions, healthy Current, actions or passthrough.
 - Residual risk: Relay PKI/service supervision, real native/device evidence and QRM overall acceptance remain open.
 - Next dependency: checkpoint Core first, then Relay, App-iOS and the parent Wiki in the required order.
+
+[checkpointed](1-140) 2026-08-23 | QRM-1 Relay Q7 legacy cleanup checkpointed
+- Repository state: Relay implementation and status are committed at `a2dd9dc`; deployment artifacts, Herdr generated content and unrelated Relay work remain excluded.
+- Validation: 46 locked tests passed with Clippy warnings denied, rustfmt, rustdoc and diff checks; fresh dual review found no P0-P2.
+- Scope: generic QRM UDP/TLS/ALPN, SessionRegistry and opaque bridge remain active; the stale network-class test is replaced by explicit unknown-table rejection and no legacy runtime path remains.
+- Exclusions: no legacy fallback, protocol expansion, Herdr parsing, App-Core changes, deployment, writes, subscriptions, healthy Current, actions or passthrough.
+- Residual risk: Relay PKI/service supervision, real native/device evidence and QRM overall acceptance remain open.
+- Next dependency: complete the ordered App-iOS and parent Wiki checkpoints.

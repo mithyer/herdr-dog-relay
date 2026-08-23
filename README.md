@@ -12,7 +12,7 @@ dateCreated: 2026-08-22T00:10:00+08:00
 
 ## Current status
 
-QRM-1 Q5 mb17 one-port/two-session read-only evidence and the Q6 App/embedded Core integration checkpoint are complete. Q7 Legacy Cleanup is the active phase for removing stale pre-QRM configuration and test entrypoints; the Relay source already exposes only the generic single-port QUIC TLS 1.3 server and opaque Unix bridge. Long-term service provisioning and PKI lifecycle remain open.
+QRM-1 Q5 mb17 one-port/two-session read-only evidence and the Q6 App/embedded Core integration checkpoint are complete. Q7 Legacy Cleanup is checkpointed in Relay at `a2dd9dc`: stale pre-QRM configuration/test entrypoints are removed or rewritten, and the Relay source exposes only the generic single-port QUIC TLS 1.3 server and opaque Unix bridge. Long-term service provisioning, PKI lifecycle and QRM overall acceptance remain open.
 
 ## Boundary
 
@@ -20,7 +20,7 @@ The Relay authenticates Core, validates HDQM/HDQS/session authority and bridges 
 
 ## Current implementation
 
-QRM-1 Q5 mb17 one-port/two-session read-only evidence is checkpointed through the deployed x86_64 Relay. Q7 removes the last stale network-class test and keeps the generic QRM listener/configuration boundary; the current Relay source has no legacy TCP, Broker or class-specific runtime path. Actions, subscriptions, healthy `Online + Current` and arbitrary passthrough remain disabled.
+QRM-1 Q5 mb17 one-port/two-session read-only evidence is checkpointed through the deployed x86_64 Relay. Q7 is checkpointed at `a2dd9dc`; the current Relay source has no legacy TCP, Broker or class-specific runtime path, and `legacy_network_tables_are_rejected` preserves the generic fail-closed config boundary. Actions, subscriptions, healthy `Online + Current` and arbitrary passthrough remain disabled.
 
 ## Checkpoint Log
 
@@ -84,3 +84,11 @@ QRM-1 Q5 mb17 one-port/two-session read-only evidence is checkpointed through th
 - Exclusions: no legacy TCP/Broker fallback, Herdr parsing, App transport, deployment, writes, subscriptions, healthy Current, actions or passthrough.
 - Residual risk: long-term supervision, PKI rotation, real native/device evidence and QRM overall acceptance remain open.
 - Next dependency: selectively checkpoint Core, then Relay, App-iOS and the parent Wiki.
+
+[checkpointed](1-94) 2026-08-23 | QRM-1 Relay Q7 legacy cleanup checkpointed
+- Repository state: Relay implementation/status commit `a2dd9dc` is committed; deployment artifacts and Herdr generated content remain excluded.
+- Validation: 46 locked tests passed with Clippy warnings denied, rustfmt, rustdoc and diff checks; Core/App gates and fresh dual review found no P0-P2.
+- Scope: one generic UDP/QUIC TLS listener, SessionRegistry and opaque bridge remain active; stale network-class validation is replaced by explicit unknown-table rejection.
+- Exclusions: no legacy TCP/Broker fallback, Herdr parsing, App transport, deployment, writes, subscriptions, healthy Current, actions or passthrough.
+- Residual risk: long-term supervision, PKI rotation, real native/device evidence and QRM overall acceptance remain open.
+- Next dependency: complete the ordered App-iOS and parent Wiki checkpoints.

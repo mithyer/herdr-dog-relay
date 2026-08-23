@@ -12,7 +12,7 @@ dateCreated: 2026-08-22T00:10:00+08:00
 
 ## Current status
 
-Status: `active` for QRM-1 Q7 Legacy Cleanup. Q4 weak-network validation, Q5 mb17 one-port/two-session read-only evidence and Q6 App/embedded Core integration status are checkpointed; Q7 adds no Relay source behavior until its baseline inventory is complete. The implementation directly replaces the previous TCP, listener-class, Broker, HDRL/HDBD, per-session data-port and relay-child entry points. The Relay remains an opaque byte bridge and never parses Herdr protocol; service provisioning, Keychain lifecycle and QRM overall acceptance remain open.
+Status: `checkpointed` for QRM-1 Q7 Legacy Cleanup at Relay commit `a2dd9dc`. Q4 weak-network validation, Q5 mb17 one-port/two-session read-only evidence and Q6 App/embedded Core integration are checkpointed. Q7 removed active legacy configuration/test references without adding Relay behavior. The implementation directly replaces previous TCP, listener-class, Broker, HDRL/HDBD, per-session data-port and relay-child entry points; service provisioning, Keychain lifecycle and QRM overall acceptance remain open.
 
 ## Architecture
 
@@ -192,3 +192,11 @@ Block QRM-1 when TLS is absent, invalid authority reaches Herdr, one session see
 - Exclusions: no legacy fallback, new protocol behavior, Herdr parsing, App-Core changes, deployment changes, writes, subscriptions, healthy Current, actions or passthrough.
 - Residual risk: long-term supervision/PKI, real native/device evidence, empty build-artifact directories and QRM overall acceptance remain open.
 - Next dependency: checkpoint Core, then Relay and App-iOS, and finally synchronize parent status/gitlinks.
+
+[checkpointed](1-202) 2026-08-23 | QRM-1 Relay Q7 legacy cleanup checkpointed
+- Repository state: Relay implementation and status are committed at `a2dd9dc`; deployment artifacts, Herdr generated content and unrelated Relay work remain excluded.
+- Validation: 46 locked tests passed with Clippy warnings denied, rustfmt, rustdoc and diff checks; fresh dual review found no P0-P2.
+- Scope: retained the generic single-port QUIC TLS 1.3 listener, HDQM/HDQS SessionRegistry and opaque Unix bridge; replaced stale network-class validation with explicit unknown-table rejection.
+- Exclusions: no legacy fallback, new protocol behavior, Herdr parsing, App-Core changes, deployment changes, writes, subscriptions, healthy Current, actions or passthrough.
+- Residual risk: long-term supervision/PKI, real native/device evidence, empty build-artifact directories and QRM overall acceptance remain open.
+- Next dependency: complete the ordered App-iOS and parent Wiki checkpoints.
