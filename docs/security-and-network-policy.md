@@ -2,7 +2,7 @@
 title: Herdr-dog Relay Security and Network Policy
 description: Uniform QUIC TLS 1.3 identity and bounded session security policy.
 published: true
-date: 2026-08-23T11:25:00+08:00
+date: 2026-08-24T01:43:10+08:00
 tags: herdr-dog, relay, security, quic, plan
 editor: markdown
 dateCreated: 2026-08-22T00:10:00+08:00
@@ -12,17 +12,21 @@ dateCreated: 2026-08-22T00:10:00+08:00
 
 ## Current status
 
-Status: `active` for QRM-1; Q4 weak-network validation is checkpointed and Q5 mb17 external security/deployment evidence is `validated`. There is one generic UDP listener policy; network class is not a protocol concept.
+Status: `active` for QRM-PROD-1 P2. QRM-1 Q4/Q5 security evidence remains checkpointed. P2 adds protected-file material validation, same-port enrollment origin/challenge checks, active allowlist/revocation generation fencing, fixed-source updater safety and user-level supervision templates; live deployment evidence remains open.
 
 ## Required security
 
 - QUIC TLS 1.3 is always enabled;
 - production validates Relay server certificate, Core client certificate and trusted CA;
 - development may use an explicitly test-only unverified mode, never plaintext;
-- ALPN `herdr-dog-relay-quic/1` is mandatory;
+- ALPN `herdr-dog-relay-quic/1` is mandatory for normal QRM and `herdr-dog-relay-enroll/1` is a separate terminal enrollment namespace;
+- production normal QRM validates Relay server certificate, Core client certificate and active App allowlist fingerprint;
+- enrollment additionally binds the authenticated Core identity, Relay single-use challenge, bounded CSR and generation;
+- protected certificate, Intermediate-key and allowlist files require owner/mode/path validation and atomic replacement;
+- updater archives require fixed-source checksum validation and safe regular-file extraction;
+- plaintext UDP is forbidden;
 - listener address and UDP port are explicit; default port is `18743`;
-- connection/session/control-frame/buffer/timeout limits are bounded;
-- Unix socket owner, mode, type, parent and replacement identity are checked;
+- connection/session/control-frame/buffer/timeout/enrollment limits are bounded;
 - HDQS authority must be accepted before any Herdr byte;
 - tokens, fingerprints, certificates, private keys and payloads are not logged or persisted in repository artifacts;
 - malformed control protocol closes the physical connection; session authority failure closes only the session stream.
@@ -69,3 +73,27 @@ QRM tests must cover wrong certificate, missing client identity, wrong ALPN, mal
 - Exclusions: plaintext, network classes, credential disclosure, Herdr parsing, writes, subscriptions, healthy Current, actions and arbitrary commands.
 - Residual risk: PKI lifecycle, LaunchAgent supervision and final review/checkpoint remain open.
 - Next dependency: complete post-fix review and synchronize the Q5 security checkpoint.
+
+[active](1-83) 2026-08-24 | QRM-PROD-1 P2 Relay security implementation active
+- Repository state: P1 Relay checkpoint is preserved; P2 security/source changes are uncommitted and mb17 is untouched.
+- Validation: local Relay 66-test, Clippy, rustfmt, rustdoc and diff gates pass; production deployment is not claimed.
+- Scope: mTLS/ALPN separation, Core-origin/challenge binding, protected material, allowlist/revocation, archive safety and supervision boundaries.
+- Exclusions: no production certificate provisioning, live enrollment/deployment, Herdr parsing, writes, subscriptions, healthy Current, actions, passthrough or automatic retry.
+- Residual risk: live client-certificate/allowlist admission, connection closure after revoke, updater cutover and mb17 evidence remain open.
+- Next dependency: complete fresh P2 review/fix/revalidation before selective Relay checkpointing.
+
+[implemented](1-91) 2026-08-24 | QRM-PROD-1 P2 Relay security implementation completed
+- Repository state: P2 Relay security/source changes are uncommitted; P1 checkpoints remain preserved and mb17/Herdr are untouched.
+- Validation: 69 Relay tests, Clippy, rustfmt, rustdoc, locked checks and diff checks pass locally.
+- Scope: mTLS/ALPN separation, Core enrollment anchor/challenge, protected material, allowlist/revocation, archive safety and supervision boundaries.
+- Exclusions: live P6 enrollment/deployment cutover, Herdr parsing, writes, subscriptions, healthy Current, actions, passthrough and automatic retry.
+- Residual risk: fresh P2 review/fix/revalidation and live client/mb17 evidence remain open.
+- Next dependency: complete fresh P2 review, apply fixes, then selectively checkpoint Relay.
+
+[accepted](1-99) 2026-08-24 | QRM-PROD-1 P2 Relay security local implementation accepted
+- Repository state: P2 Relay security/source changes remain uncommitted; P1 checkpoints and Herdr/mb17 exclusions are preserved.
+- Validation/review: Relay 69 passed with locked Clippy, rustfmt, rustdoc and diff gates; final fresh dual review found no P0-P2 findings.
+- Scope: mTLS/ALPN separation, Core enrollment anchor/challenge, protected material, allowlist/revocation, archive safety and supervision boundaries.
+- Exclusions: live P6 enrollment/deployment cutover, Herdr parsing, writes, subscriptions, healthy Current, actions, passthrough and automatic retry.
+- Residual risk: P3 live client/closure evidence and P4-P6 deployment evidence remain open; checkpointing is required.
+- Next dependency: selectively checkpoint Relay, then synchronize parent status.

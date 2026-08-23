@@ -84,6 +84,11 @@ impl Fingerprint {
         }
         Ok(Self(bytes))
     }
+
+    /// Return the fixed public fingerprint bytes for a wire response.
+    pub const fn to_bytes(self) -> [u8; AUTHORITY_BYTES] {
+        self.0
+    }
 }
 
 impl fmt::Debug for Fingerprint {
@@ -449,6 +454,32 @@ impl fmt::Debug for CertificateMetadata {
 }
 
 impl CertificateMetadata {
+    /// Constructs public certificate metadata after a real or fake issuer succeeds.
+    pub fn new(
+        app_id: AppId,
+        fingerprint: Fingerprint,
+        serial: u64,
+        allowlist_generation: u64,
+        not_before_epoch_seconds: u64,
+        not_after_epoch_seconds: u64,
+    ) -> Result<Self, EnrollmentError> {
+        if serial == 0
+            || allowlist_generation == 0
+            || not_before_epoch_seconds == 0
+            || not_after_epoch_seconds <= not_before_epoch_seconds
+        {
+            return Err(EnrollmentError::InvalidMetadata);
+        }
+        Ok(Self {
+            app_id,
+            fingerprint,
+            serial,
+            allowlist_generation,
+            not_before_epoch_seconds,
+            not_after_epoch_seconds,
+        })
+    }
+
     /// Return the enrolled App identity.
     pub fn app_id(&self) -> &AppId {
         &self.app_id
@@ -469,7 +500,12 @@ impl CertificateMetadata {
         self.allowlist_generation
     }
 
-    /// Return the validity end epoch second.
+    /// Return the certificate validity start epoch second.
+    pub const fn not_before_epoch_seconds(&self) -> u64 {
+        self.not_before_epoch_seconds
+    }
+
+    /// Return the certificate validity end epoch second.
     pub const fn not_after_epoch_seconds(&self) -> u64 {
         self.not_after_epoch_seconds
     }
@@ -631,7 +667,8 @@ impl fmt::Display for EnrollmentError {
 impl std::error::Error for EnrollmentError {}
 
 /// In-memory allowlist with atomic generation/revocation semantics.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AllowlistRegistry {
     /// Current generation invalidating revoked connections.
     generation: u64,
@@ -750,6 +787,19 @@ impl AllowlistRegistry {
     /// Return one entry for deterministic tests and local reconciliation.
     pub fn entry(&self, app_id: &AppId) -> Option<&AllowlistEntry> {
         self.entries.get(app_id)
+    }
+
+    /// Return all non-secret entries for persistence and bounded local inspection.
+    pub fn entries(&self) -> impl Iterator<Item = &AllowlistEntry> {
+        self.entries.values()
+    }
+
+    /// Validate a deserialized registry before it can authorize normal QRM.
+    pub fn validate_persisted(&self) -> Result<(), EnrollmentError> {
+        if self.generation == 0 || self.entries.values().any(|entry| entry.generation() == 0) {
+            return Err(EnrollmentError::AllowlistPersistence);
+        }
+        Ok(())
     }
 }
 

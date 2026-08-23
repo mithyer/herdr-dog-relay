@@ -11,7 +11,6 @@ use std::{
     net::SocketAddr,
     path::{Path, PathBuf},
     pin::Pin,
-    process::Command,
     sync::Arc,
     task::{Context, Poll},
     time::{Duration, Instant},
@@ -27,19 +26,36 @@ use tokio::{
 };
 
 use crate::{
+    allowlist::PersistentAllowlist,
     bridge::{self, BridgeLimits},
     config::{QRM_HANDSHAKE_TIMEOUT_SECS, RelayConfig, SecurityMode},
+    enrollment::{
+        AppId, CoreAuthorization, CsrDigest, CsrMetadata, EnrollmentChallenge,
+        EnrollmentSubmission, Fingerprint, STABLE_LATEST_SELECTOR,
+    },
+    enrollment_wire::{
+        EnrollmentChallengePayload, EnrollmentFrame, EnrollmentFrameKind, EnrollmentIssuedPayload,
+        EnrollmentRejectedPayload, EnrollmentSubmitPayload, EnrollmentWireError,
+        read_frame as read_enrollment_frame, write_frame as write_enrollment_frame,
+    },
     error::{RelayError, RelayResult},
+    material::{MAX_PUBLIC_MATERIAL_BYTES, ProtectedFileKind, current_uid, read_protected_file},
+    pki::{current_epoch_seconds, issue_certificate},
     quic_wire::{
         DeviceHelloAck, HdqmFrame, HdqmKind, HdqsBinding, HdqsReason, HdqsResponse, SessionOpenAck,
         SessionOpenRequest, SessionPrepareAck, SessionPrepareRequest,
     },
     session_registry::SessionRegistry,
     socket::UnixSocketConnector,
+    updater::FixedSourceUpdater,
 };
 
 /// ALPN selected by every QRM-1 Relay connection.
 pub const QRM_RELAY_ALPN: &[u8] = b"herdr-dog-relay-quic/1";
+/// ALPN selected by the terminal App enrollment path.
+pub const QRM_ENROLLMENT_ALPN: &[u8] = b"herdr-dog-relay-enroll/1";
+/// Maximum retained single-use enrollment authorizations per Relay process.
+pub const QRM_MAX_CONSUMED_ENROLLMENT_AUTHORIZATIONS: usize = 4096;
 /// Maximum time allowed for the initial control stream and session bind.
 pub const QRM_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(QRM_HANDSHAKE_TIMEOUT_SECS);
 
@@ -125,6 +141,16 @@ pub struct QuicRelayServer {
     endpoint: Option<quinn::Endpoint>,
     /// Global connection quota.
     connections: Arc<Semaphore>,
+    /// Independent bounded TLS handshakes before ALPN dispatch.
+    pre_auth_handshakes: Arc<Semaphore>,
+    /// Independent pre-authentication enrollment budget.
+    enrollment_handshakes: Arc<Semaphore>,
+    /// Independent post-ALPN enrollment connection budget.
+    enrollment_connections: Arc<Semaphore>,
+    /// In-memory single-use Core authorization IDs invalidated on process restart.
+    consumed_enrollment_authorizations: Arc<Mutex<BTreeMap<[u8; 16], u64>>>,
+    /// Optional protected App allowlist used by production admission.
+    allowlist: Option<Arc<Mutex<PersistentAllowlist>>>,
     /// Optional test-only socket override for deterministic Unix bridge tests.
     socket_override: Option<PathBuf>,
 }
@@ -152,7 +178,7 @@ impl QuicRelayServer {
     /// A server owner that has not opened a UDP socket.
     // TEST:relay/src/quic_server.rs[tests::server_accepts_only_valid_generation]
     pub fn new(config: RelayConfig, relay_generation: u64) -> RelayResult<Self> {
-        Self::new_inner(config, relay_generation, None, None, [1; 32])
+        Self::new_inner(config, relay_generation, None, None, None, [1; 32])
     }
 
     /// Binds one UDP QUIC endpoint with verified TLS 1.3 mutual authentication.
@@ -248,15 +274,32 @@ impl QuicRelayServer {
                 }
                 incoming = endpoint.accept() => {
                     let Some(incoming) = incoming else { return Ok(()); };
-                    let Some(permit) = try_acquire(&server.connections) else {
+                    let Some(handshake_permit) = try_acquire(&server.pre_auth_handshakes) else {
                         incoming.refuse();
                         continue;
                     };
                     let owner = Arc::clone(&server);
                     tasks.spawn(async move {
-                        let _permit = permit;
-                        if let Ok(Ok(connection)) = timeout(owner.handshake_timeout(), incoming).await
-                            && let Err(error) = owner.serve_connection(connection).await
+                        let connection = match timeout(owner.handshake_timeout(), incoming).await {
+                            Ok(Ok(connection)) => connection,
+                            _ => return,
+                        };
+                        drop(handshake_permit);
+                        let is_enrollment = negotiated_alpn(&connection)
+                            .map(|protocol| protocol == QRM_ENROLLMENT_ALPN)
+                            .unwrap_or(false);
+                        let connection_permit = if is_enrollment {
+                            None
+                        } else {
+                            let Some(permit) = try_acquire(&owner.connections) else {
+                                connection.close(0u32.into(), b"connection quota");
+                                return;
+                            };
+                            Some(permit)
+                        };
+                        if let Err(error) = owner
+                            .serve_connection(connection, connection_permit)
+                            .await
                         {
                             eprintln!("herdogrelay: connection closed: {error}");
                         }
@@ -277,11 +320,21 @@ impl QuicRelayServer {
         let endpoint = quinn::Endpoint::server(server_config, address)
             .map_err(|error| RelayError::io("binding QRM UDP listener", error))?;
         let relay_identity = load_relay_identity(&config)?;
+        let allowlist = if config.enrollment().enabled() {
+            let uid = current_uid()?;
+            Some(Arc::new(Mutex::new(PersistentAllowlist::open(
+                config.enrollment().allowlist_path(),
+                uid,
+            )?)))
+        } else {
+            None
+        };
         Self::new_inner(
             config,
             relay_generation,
             Some(endpoint),
             socket_override,
+            allowlist,
             relay_identity,
         )
     }
@@ -292,6 +345,7 @@ impl QuicRelayServer {
         relay_generation: u64,
         endpoint: Option<quinn::Endpoint>,
         socket_override: Option<PathBuf>,
+        allowlist: Option<Arc<Mutex<PersistentAllowlist>>>,
         relay_identity: [u8; 32],
     ) -> RelayResult<Self> {
         if relay_generation == 0 {
@@ -302,16 +356,30 @@ impl QuicRelayServer {
         config.validate()?;
         Ok(Self {
             connections: Arc::new(Semaphore::new(config.limits().max_connections())),
+            pre_auth_handshakes: Arc::new(Semaphore::new(
+                config
+                    .limits()
+                    .max_connections()
+                    .saturating_add(config.enrollment().max_handshakes()),
+            )),
+            enrollment_handshakes: Arc::new(Semaphore::new(config.enrollment().max_handshakes())),
+            enrollment_connections: Arc::new(Semaphore::new(config.enrollment().max_connections())),
             config,
             relay_generation,
             relay_identity,
             endpoint,
+            consumed_enrollment_authorizations: Arc::new(Mutex::new(BTreeMap::new())),
+            allowlist,
             socket_override,
         })
     }
 
     /// Wraps one connection so every terminal control error explicitly closes QUIC.
-    async fn serve_connection(&self, connection: quinn::Connection) -> RelayResult<()> {
+    async fn serve_connection(
+        &self,
+        connection: quinn::Connection,
+        _connection_permit: Option<OwnedSemaphorePermit>,
+    ) -> RelayResult<()> {
         let result = self.serve_connection_inner(connection.clone()).await;
         if result.is_err() {
             connection.close(0u32.into(), b"protocol failure");
@@ -321,6 +389,46 @@ impl QuicRelayServer {
 
     /// Handles one authenticated connection and owns its control/session tasks.
     async fn serve_connection_inner(&self, connection: quinn::Connection) -> RelayResult<()> {
+        let protocol = negotiated_alpn(&connection)?;
+        let peer_fingerprint = if self.config.security().mode() == SecurityMode::Verified {
+            Some(peer_certificate_fingerprint(&connection)?)
+        } else {
+            None
+        };
+        if protocol == QRM_ENROLLMENT_ALPN {
+            if !self.config.enrollment().enabled() {
+                return Err(RelayError::QuicProtocol {
+                    reason: "enrollment ALPN is disabled",
+                });
+            }
+            if !peer_certificate_matches_anchor(
+                &connection,
+                self.config.security().trusted_core_enrollment_ca(),
+            )? {
+                return Err(RelayError::QuicAuthentication);
+            }
+            let connection_for_close = connection.clone();
+            let result = self
+                .serve_enrollment_connection(
+                    connection,
+                    peer_fingerprint.ok_or(RelayError::QuicAuthentication)?,
+                )
+                .await;
+            if result.is_ok() {
+                connection_for_close.close(0u32.into(), b"enrollment terminal");
+            }
+            return result;
+        }
+        if protocol != QRM_RELAY_ALPN {
+            return Err(RelayError::QuicProtocol {
+                reason: "unsupported QRM ALPN",
+            });
+        }
+        if let (Some(allowlist), Some(fingerprint)) = (&self.allowlist, peer_fingerprint)
+            && !allowlist.lock().await.allows_qrm(fingerprint)
+        {
+            return Err(RelayError::QuicAuthentication);
+        }
         let connection_epoch = rand::random::<u64>().max(1);
         let registry = Arc::new(Mutex::new(self.new_connection(connection_epoch)?));
         let session_controls: SessionTaskControls = Arc::new(Mutex::new(BTreeMap::new()));
@@ -384,7 +492,15 @@ impl QuicRelayServer {
                             return Err(error);
                         }
                     };
-                    let keep_open = match self.handle_control(frame, &mut control_send, &registry, &session_controls).await {
+                    let keep_open = match self
+                        .handle_control(
+                            frame,
+                            &mut control_send,
+                            &registry,
+                            &session_controls,
+                            peer_fingerprint,
+                        )
+                        .await {
                         Ok(keep_open) => keep_open,
                         Err(error) => {
                             session_tasks.abort_all();
@@ -449,7 +565,15 @@ impl QuicRelayServer {
         send: &mut quinn::SendStream,
         registry: &Arc<Mutex<SessionRegistry>>,
         session_controls: &SessionTaskControls,
+        peer_fingerprint: Option<Fingerprint>,
     ) -> RelayResult<bool> {
+        if let (Some(allowlist), Some(fingerprint)) = (&self.allowlist, peer_fingerprint) {
+            let mut allowlist = allowlist.lock().await;
+            allowlist.reload()?;
+            if !allowlist.allows_qrm(fingerprint) {
+                return Err(RelayError::QuicAuthentication);
+            }
+        }
         match frame.kind {
             HdqmKind::SessionPrepare => {
                 let request = SessionPrepareRequest::decode(&frame.payload).map_err(|_| {
@@ -655,6 +779,86 @@ impl QuicRelayServer {
                 )
                 .await?;
             }
+            HdqmKind::RelayUpdate => {
+                if !self.config.update().enabled() {
+                    return Err(RelayError::QuicProtocol {
+                        reason: "Relay update is disabled",
+                    });
+                }
+                if frame.payload.as_slice() != STABLE_LATEST_SELECTOR.as_bytes() {
+                    send_control_frame(
+                        send,
+                        HdqmFrame {
+                            kind: HdqmKind::RelayUpdateRejected,
+                            request_id: frame.request_id,
+                            payload: vec![1],
+                        },
+                    )
+                    .await?;
+                    return Ok(true);
+                }
+                let authorized = if let (Some(allowlist), Some(fingerprint)) =
+                    (&self.allowlist, peer_fingerprint)
+                {
+                    let mut allowlist = allowlist.lock().await;
+                    allowlist.reload()?;
+                    allowlist.authorize_update(fingerprint).is_ok()
+                } else {
+                    false
+                };
+                if !authorized {
+                    send_control_frame(
+                        send,
+                        HdqmFrame {
+                            kind: HdqmKind::RelayUpdateRejected,
+                            request_id: frame.request_id,
+                            payload: vec![2],
+                        },
+                    )
+                    .await?;
+                    return Ok(true);
+                }
+                send_control_frame(
+                    send,
+                    HdqmFrame {
+                        kind: HdqmKind::RelayUpdateAccepted,
+                        request_id: frame.request_id,
+                        payload: vec![1],
+                    },
+                )
+                .await?;
+                let update_config = self.config.clone();
+                let result = tokio::task::spawn_blocking(move || {
+                    perform_stable_latest_update(update_config)
+                })
+                .await
+                .map_err(|_| RelayError::Update {
+                    operation: "running stable-latest update",
+                    reason: "update worker task failed",
+                })?;
+                if result.is_err() {
+                    send_control_frame(
+                        send,
+                        HdqmFrame {
+                            kind: HdqmKind::RelayUpdateStatus,
+                            request_id: frame.request_id,
+                            payload: vec![2],
+                        },
+                    )
+                    .await?;
+                    return Ok(true);
+                }
+                send_control_frame(
+                    send,
+                    HdqmFrame {
+                        kind: HdqmKind::RelayUpdateStatus,
+                        request_id: frame.request_id,
+                        payload: vec![1],
+                    },
+                )
+                .await?;
+                return Ok(false);
+            }
             HdqmKind::GoAway => return Ok(false),
             HdqmKind::DeviceHello
             | HdqmKind::DeviceHelloAck
@@ -662,7 +866,9 @@ impl QuicRelayServer {
             | HdqmKind::SessionOpened
             | HdqmKind::SessionClosed
             | HdqmKind::ErrorResponse
-            | HdqmKind::RelayUpdate => {
+            | HdqmKind::RelayUpdateAccepted
+            | HdqmKind::RelayUpdateRejected
+            | HdqmKind::RelayUpdateStatus => {
                 return Err(RelayError::QuicProtocol {
                     reason: "unexpected control frame kind",
                 });
@@ -671,7 +877,236 @@ impl QuicRelayServer {
         Ok(true)
     }
 
-    /// Finalize one exact session task and release its registry/control ownership.
+    /// Handles one authenticated, terminal enrollment connection before any QRM frame is accepted.
+    async fn serve_enrollment_connection(
+        &self,
+        connection: quinn::Connection,
+        core_identity: Fingerprint,
+    ) -> RelayResult<()> {
+        let _handshake_permit =
+            try_acquire(&self.enrollment_handshakes).ok_or(RelayError::ResourceLimit)?;
+        let _connection_permit =
+            try_acquire(&self.enrollment_connections).ok_or(RelayError::ResourceLimit)?;
+        let (mut send, mut recv) = timeout(self.handshake_timeout(), connection.accept_bi())
+            .await
+            .map_err(|_| RelayError::QuicHandshake {
+                reason: "enrollment control stream timeout",
+            })?
+            .map_err(|_| RelayError::QuicHandshake {
+                reason: "enrollment control stream unavailable",
+            })?;
+        let mut challenge = rand::random::<[u8; 32]>();
+        if challenge == [0; 32] {
+            challenge[0] = 1;
+        }
+        let now = current_epoch_seconds().map_err(|_| RelayError::QuicHandshake {
+            reason: "enrollment clock unavailable",
+        })?;
+        let expires_at = now
+            .checked_add(self.config.enrollment().challenge_ttl_secs())
+            .ok_or(RelayError::QuicHandshake {
+                reason: "enrollment challenge expiry overflow",
+            })?;
+        let challenge_frame = EnrollmentFrame::json(
+            EnrollmentFrameKind::Challenge,
+            &EnrollmentChallengePayload {
+                challenge,
+                expires_at_epoch_seconds: expires_at,
+            },
+            self.config.enrollment().max_request_bytes(),
+        )
+        .map_err(map_enrollment_wire_error)?;
+        timeout(
+            self.handshake_timeout(),
+            write_enrollment_frame(
+                &mut send,
+                &challenge_frame,
+                self.config.enrollment().max_request_bytes(),
+            ),
+        )
+        .await
+        .map_err(|_| RelayError::QuicHandshake {
+            reason: "enrollment challenge write timeout",
+        })?
+        .map_err(map_enrollment_wire_error)?;
+        let frame = match timeout(
+            Duration::from_secs(self.config.enrollment().connection_lifetime_secs()),
+            read_enrollment_frame(&mut recv, self.config.enrollment().max_request_bytes()),
+        )
+        .await
+        {
+            Ok(Ok(frame)) => frame,
+            Ok(Err(error)) => return self.reject_enrollment(&mut send, error).await,
+            Err(_) => {
+                return self
+                    .reject_enrollment(&mut send, EnrollmentWireError::ResourceLimit)
+                    .await;
+            }
+        };
+        let submission: EnrollmentSubmitPayload =
+            match frame.parse_json(EnrollmentFrameKind::Submit) {
+                Ok(payload) => payload,
+                Err(error) => return self.reject_enrollment(&mut send, error).await,
+            };
+        let submission_now = current_epoch_seconds().map_err(|_| RelayError::QuicHandshake {
+            reason: "enrollment clock unavailable",
+        })?;
+        if submission.csr.len() > self.config.enrollment().max_csr_bytes()
+            || submission.challenge != challenge
+            || submission_now > expires_at
+            || submission.expires_at_epoch_seconds < submission_now
+            || submission.core_identity != core_identity.to_bytes()
+        {
+            return self
+                .reject_enrollment(&mut send, EnrollmentWireError::AuthorizationRejected)
+                .await;
+        }
+        let app_id = match AppId::new(submission.app_id.clone()) {
+            Ok(app_id) => app_id,
+            Err(error) => return self.reject_enrollment(&mut send, error.into()).await,
+        };
+        let csr = match CsrMetadata::from_bytes(app_id.clone(), &submission.csr) {
+            Ok(csr) => csr,
+            Err(error) => return self.reject_enrollment(&mut send, error.into()).await,
+        };
+        let challenge_value = match EnrollmentChallenge::from_bytes(submission.challenge) {
+            Ok(challenge) => challenge,
+            Err(error) => return self.reject_enrollment(&mut send, error.into()).await,
+        };
+        let core_fingerprint = match Fingerprint::from_bytes(submission.core_identity) {
+            Ok(fingerprint) => fingerprint,
+            Err(error) => return self.reject_enrollment(&mut send, error.into()).await,
+        };
+        let code_proof = match CsrDigest::from_bytes(submission.code_proof) {
+            Ok(proof) => proof,
+            Err(error) => return self.reject_enrollment(&mut send, error.into()).await,
+        };
+        let authorization = match CoreAuthorization::new(
+            core_fingerprint,
+            submission.authorization_id,
+            submission.pairing_id,
+            submission.target_id,
+            app_id.clone(),
+            challenge_value,
+            csr.digest(),
+            code_proof,
+            submission.configuration_generation,
+            submission.expires_at_epoch_seconds,
+        ) {
+            Ok(authorization) => authorization,
+            Err(error) => return self.reject_enrollment(&mut send, error.into()).await,
+        };
+        if EnrollmentSubmission::new(authorization, csr).is_err() {
+            return self
+                .reject_enrollment(&mut send, EnrollmentWireError::AuthorizationRejected)
+                .await;
+        }
+        let Some(allowlist) = &self.allowlist else {
+            return self
+                .reject_enrollment(&mut send, EnrollmentWireError::PersistenceFailed)
+                .await;
+        };
+        {
+            let mut consumed = self.consumed_enrollment_authorizations.lock().await;
+            consumed.retain(|_, expiry| *expiry >= submission_now);
+            if consumed.len() >= QRM_MAX_CONSUMED_ENROLLMENT_AUTHORIZATIONS {
+                return self
+                    .reject_enrollment(&mut send, EnrollmentWireError::ResourceLimit)
+                    .await;
+            }
+            if consumed
+                .insert(
+                    submission.authorization_id,
+                    submission.expires_at_epoch_seconds,
+                )
+                .is_some()
+            {
+                return self
+                    .reject_enrollment(&mut send, EnrollmentWireError::AuthorizationRejected)
+                    .await;
+            }
+        }
+        let expected_uid = current_uid().map_err(|_| RelayError::QuicAuthentication)?;
+        let next_generation = allowlist.lock().await.generation().checked_add(1).ok_or(
+            RelayError::ListenerStartup {
+                reason: "allowlist generation overflow",
+            },
+        )?;
+        let issued = match issue_certificate(
+            self.config.security(),
+            expected_uid,
+            app_id.clone(),
+            &submission.csr,
+            next_generation,
+        ) {
+            Ok(issued) => issued,
+            Err(error) => return self.reject_enrollment(&mut send, error.into()).await,
+        };
+        let metadata = match issued.metadata(app_id, next_generation) {
+            Ok(metadata) => metadata,
+            Err(error) => return self.reject_enrollment(&mut send, error.into()).await,
+        };
+        let fingerprint = metadata.fingerprint().to_bytes();
+        let not_after = metadata.not_after_epoch_seconds();
+        if allowlist.lock().await.enroll(metadata).is_err() {
+            return self
+                .reject_enrollment(&mut send, EnrollmentWireError::PersistenceFailed)
+                .await;
+        }
+        let response = EnrollmentFrame::json(
+            EnrollmentFrameKind::Issued,
+            &EnrollmentIssuedPayload {
+                certificate_chain: issued.certificate_chain(),
+                fingerprint,
+                allowlist_generation: next_generation,
+                not_after_epoch_seconds: not_after,
+            },
+            self.config.enrollment().max_request_bytes(),
+        )
+        .map_err(map_enrollment_wire_error)?;
+        timeout(
+            self.handshake_timeout(),
+            write_enrollment_frame(
+                &mut send,
+                &response,
+                self.config.enrollment().max_request_bytes(),
+            ),
+        )
+        .await
+        .map_err(|_| RelayError::QuicHandshake {
+            reason: "enrollment response write timeout",
+        })?
+        .map_err(map_enrollment_wire_error)?;
+        send.finish().map_err(|_| RelayError::QuicProtocol {
+            reason: "finishing enrollment connection",
+        })?;
+        connection.close(0u32.into(), b"enrollment complete");
+        Ok(())
+    }
+
+    /// Sends one sanitized terminal enrollment rejection and closes the stream.
+    async fn reject_enrollment(
+        &self,
+        send: &mut quinn::SendStream,
+        error: EnrollmentWireError,
+    ) -> RelayResult<()> {
+        let frame = EnrollmentFrame::json(
+            EnrollmentFrameKind::Rejected,
+            &EnrollmentRejectedPayload { code: error as u16 },
+            self.config.enrollment().max_request_bytes(),
+        )
+        .map_err(map_enrollment_wire_error)?;
+        let _ = timeout(
+            self.handshake_timeout(),
+            write_enrollment_frame(send, &frame, self.config.enrollment().max_request_bytes()),
+        )
+        .await;
+        send.finish().map_err(|_| RelayError::QuicProtocol {
+            reason: "finishing enrollment rejection",
+        })?;
+        Ok(())
+    }
+
     async fn finish_session_control(
         &self,
         registry: &Arc<Mutex<SessionRegistry>>,
@@ -929,8 +1364,67 @@ impl QuicRelayServer {
             relay_identity: self.relay_identity,
             endpoint: None,
             connections: Arc::clone(&self.connections),
+            pre_auth_handshakes: Arc::clone(&self.pre_auth_handshakes),
+            enrollment_handshakes: Arc::clone(&self.enrollment_handshakes),
+            enrollment_connections: Arc::clone(&self.enrollment_connections),
+            consumed_enrollment_authorizations: Arc::clone(
+                &self.consumed_enrollment_authorizations,
+            ),
+            allowlist: self.allowlist.clone(),
             socket_override: self.socket_override.clone(),
         }
+    }
+}
+
+/// Performs one fixed-source update without invoking a shell or accepting peer arguments.
+fn perform_stable_latest_update(config: RelayConfig) -> RelayResult<()> {
+    let updater = FixedSourceUpdater::new(config.update().clone())?;
+    let _lock = updater.acquire_lock()?;
+    let os = match std::env::consts::OS {
+        "macos" => "macos",
+        "linux" => "linux",
+        _ => {
+            return Err(RelayError::Update {
+                operation: "running stable-latest update",
+                reason: "unsupported operating system",
+            });
+        }
+    };
+    let arch = match std::env::consts::ARCH {
+        "aarch64" => "arm64",
+        "x86_64" => "x86_64",
+        _ => {
+            return Err(RelayError::Update {
+                operation: "running stable-latest update",
+                reason: "unsupported architecture",
+            });
+        }
+    };
+    let (archive, checksums) = updater.download_latest(os, arch)?;
+    updater.verify_checksum(&archive, &checksums)?;
+    let staged = updater.extract_verified(&archive)?;
+    let installed = std::env::current_exe().map_err(|_| RelayError::Update {
+        operation: "running stable-latest update",
+        reason: "current executable path is unavailable",
+    })?;
+    let backup = installed.with_extension("previous");
+    updater.replace_binary(&staged, &installed, &backup)
+}
+
+fn map_enrollment_wire_error(error: EnrollmentWireError) -> RelayError {
+    match error {
+        EnrollmentWireError::FrameTooLarge => RelayError::QuicProtocol {
+            reason: "enrollment frame exceeds bound",
+        },
+        EnrollmentWireError::ResourceLimit => RelayError::ResourceLimit,
+        EnrollmentWireError::InvalidOrder => RelayError::QuicProtocol {
+            reason: "enrollment operation order is invalid",
+        },
+        EnrollmentWireError::AuthorizationRejected => RelayError::QuicAuthentication,
+        EnrollmentWireError::PersistenceFailed => RelayError::ConfigurationRead,
+        EnrollmentWireError::InvalidFrame => RelayError::QuicProtocol {
+            reason: "enrollment frame is invalid",
+        },
     }
 }
 
@@ -1039,7 +1533,97 @@ fn try_acquire(semaphore: &Arc<Semaphore>) -> Option<OwnedSemaphorePermit> {
     semaphore.clone().try_acquire_owned().ok()
 }
 
-/// Loads the configured TLS certificate chain and private key into a QUIC server config.
+/// Returns the negotiated ALPN without accepting unrecognized protocol namespaces.
+fn negotiated_alpn(connection: &quinn::Connection) -> RelayResult<Vec<u8>> {
+    let data = connection
+        .handshake_data()
+        .ok_or(RelayError::QuicHandshake {
+            reason: "QUIC handshake data unavailable",
+        })?;
+    let data = data
+        .downcast::<quinn::crypto::rustls::HandshakeData>()
+        .map_err(|_| RelayError::QuicHandshake {
+            reason: "QUIC handshake data type is invalid",
+        })?;
+    data.protocol.ok_or(RelayError::QuicHandshake {
+        reason: "QUIC ALPN was not negotiated",
+    })
+}
+
+/// Computes the leaf certificate fingerprint used by the persistent App allowlist.
+fn peer_certificate_fingerprint(connection: &quinn::Connection) -> RelayResult<Fingerprint> {
+    let identity = connection
+        .peer_identity()
+        .ok_or(RelayError::QuicAuthentication)?;
+    let certificates = identity
+        .downcast::<Vec<rustls::pki_types::CertificateDer<'static>>>()
+        .map_err(|_| RelayError::QuicAuthentication)?;
+    let leaf = certificates.first().ok_or(RelayError::QuicAuthentication)?;
+    let digest = Sha256::digest(leaf.as_ref());
+    Fingerprint::from_bytes(digest.into()).map_err(|_| RelayError::QuicAuthentication)
+}
+
+/// Verifies that the presented client chain contains the dedicated Core enrollment anchor.
+fn peer_certificate_matches_anchor(
+    connection: &quinn::Connection,
+    anchor_path: &Path,
+) -> RelayResult<bool> {
+    let anchor_bytes = read_protected_file(
+        anchor_path,
+        current_uid()?,
+        ProtectedFileKind::Public,
+        MAX_PUBLIC_MATERIAL_BYTES,
+    )?;
+    let anchors = load_certificates_from_bytes(&anchor_bytes)?;
+    let identity = connection
+        .peer_identity()
+        .ok_or(RelayError::QuicAuthentication)?;
+    let certificates = identity
+        .downcast::<Vec<rustls::pki_types::CertificateDer<'static>>>()
+        .map_err(|_| RelayError::QuicAuthentication)?;
+    Ok(certificate_chain_matches_anchor(&certificates, &anchors))
+}
+
+/// Requires the presented leaf's actual issuer to match and verify against the Core anchor.
+fn certificate_chain_matches_anchor(
+    certificates: &[rustls::pki_types::CertificateDer<'static>],
+    anchors: &[rustls::pki_types::CertificateDer<'static>],
+) -> bool {
+    let Some(leaf) = certificates.first() else {
+        return false;
+    };
+    let Ok((_, leaf_certificate)) = x509_parser::parse_x509_certificate(leaf.as_ref()) else {
+        return false;
+    };
+    certificates.iter().skip(1).any(|issuer| {
+        let Ok((_, issuer_certificate)) = x509_parser::parse_x509_certificate(issuer.as_ref())
+        else {
+            return false;
+        };
+        if leaf_certificate.tbs_certificate.issuer != issuer_certificate.subject
+            || leaf_certificate
+                .verify_signature(Some(issuer_certificate.public_key()))
+                .is_err()
+        {
+            return false;
+        }
+        anchors
+            .iter()
+            .any(|anchor| Sha256::digest(issuer.as_ref()) == Sha256::digest(anchor.as_ref()))
+    })
+}
+
+/// Parses a bounded PEM certificate chain from already protected bytes.
+fn load_certificates_from_bytes(
+    bytes: &[u8],
+) -> RelayResult<Vec<rustls::pki_types::CertificateDer<'static>>> {
+    rustls_pemfile::certs(&mut std::io::BufReader::new(bytes))
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|_| RelayError::TlsConfiguration {
+            reason: "trusted Core enrollment CA is invalid",
+        })
+}
+
 fn build_server_config(config: &RelayConfig) -> RelayResult<quinn::ServerConfig> {
     let certs = load_certificates(config.security().server_certificate())?;
     let key = load_private_key(config.security().server_private_key())?;
@@ -1051,7 +1635,18 @@ fn build_server_config(config: &RelayConfig) -> RelayResult<quinn::ServerConfig>
         })?;
     let mut tls = match config.security().mode() {
         SecurityMode::Verified => {
-            let roots = load_client_roots(config.security().trusted_client_ca())?;
+            let mut roots = load_client_roots(config.security().trusted_client_ca())?;
+            if config.enrollment().enabled() {
+                for certificate in
+                    load_certificates(config.security().trusted_core_enrollment_ca())?
+                {
+                    roots
+                        .add(certificate)
+                        .map_err(|_| RelayError::TlsConfiguration {
+                            reason: "trusted Core enrollment CA is invalid",
+                        })?;
+                }
+            }
             let verifier = rustls::server::WebPkiClientVerifier::builder(Arc::new(roots))
                 .build()
                 .map_err(|_| RelayError::TlsConfiguration {
@@ -1071,7 +1666,11 @@ fn build_server_config(config: &RelayConfig) -> RelayResult<quinn::ServerConfig>
                 reason: "development certificate configuration failed",
             })?,
     };
-    tls.alpn_protocols = vec![QRM_RELAY_ALPN.to_vec()];
+    tls.alpn_protocols = if config.enrollment().enabled() {
+        vec![QRM_RELAY_ALPN.to_vec(), QRM_ENROLLMENT_ALPN.to_vec()]
+    } else {
+        vec![QRM_RELAY_ALPN.to_vec()]
+    };
     let crypto = quinn::crypto::rustls::QuicServerConfig::try_from(tls).map_err(|_| {
         RelayError::TlsConfiguration {
             reason: "QUIC TLS adapter construction failed",
@@ -1159,30 +1758,6 @@ fn load_client_roots(path: &Path) -> RelayResult<rustls::RootCertStore> {
         });
     }
     Ok(roots)
-}
-
-/// Resolves the current Unix UID for the socket identity policy without unsafe syscalls.
-fn current_uid() -> RelayResult<u32> {
-    let output = Command::new("/usr/bin/id")
-        .arg("-u")
-        .output()
-        .map_err(|_| RelayError::SocketIdentity {
-            operation: "checking current user",
-            reason: "uid lookup failed",
-        })?;
-    if !output.status.success() {
-        return Err(RelayError::SocketIdentity {
-            operation: "checking current user",
-            reason: "uid lookup failed",
-        });
-    }
-    String::from_utf8(output.stdout)
-        .ok()
-        .and_then(|value| value.trim().parse::<u32>().ok())
-        .ok_or(RelayError::SocketIdentity {
-            operation: "checking current user",
-            reason: "uid lookup failed",
-        })
 }
 
 #[cfg(test)]
@@ -2122,7 +2697,23 @@ idle_timeout_secs = 900
         fs::remove_dir_all(root).expect("cleanup");
     }
 
-    // TEST:relay/src/quic_server.rs[tests::verified_mode_rejects_missing_client_certificate]
+    // TEST:relay/src/quic_server.rs[tests::enrollment_anchor_rejects_chain_stuffing]
+    #[test]
+    fn enrollment_anchor_rejects_chain_stuffing() {
+        let app = rcgen::generate_simple_self_signed(vec!["app".to_owned()]).expect("app");
+        let core_anchor =
+            rcgen::generate_simple_self_signed(vec!["core".to_owned()]).expect("core");
+        let certificates = vec![
+            CertificateDer::from(app.cert.der().to_vec()),
+            CertificateDer::from(core_anchor.cert.der().to_vec()),
+        ];
+        let anchors = vec![CertificateDer::from(core_anchor.cert.der().to_vec())];
+        assert!(!super::certificate_chain_matches_anchor(
+            &certificates,
+            &anchors
+        ));
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn verified_mode_rejects_missing_client_certificate() {
         let nonce = SystemTime::now()

@@ -27,6 +27,26 @@ pub const QRM_MAX_SESSIONS_PER_CONNECTION: usize = 64;
 pub const QRM_HANDSHAKE_TIMEOUT_SECS: u64 = 5;
 /// The bounded QUIC idle timeout.
 pub const QRM_IDLE_TIMEOUT_SECS: u64 = 900;
+/// The maximum bounded enrollment request frame.
+pub const QRM_MAX_ENROLLMENT_REQUEST_BYTES: usize = 65_536;
+/// The maximum raw CSR size accepted during enrollment.
+pub const QRM_MAX_ENROLLMENT_CSR_BYTES: usize = 16_384;
+/// The maximum concurrent pre-authenticated enrollment handshakes.
+pub const QRM_MAX_ENROLLMENT_HANDSHAKES: usize = 16;
+/// The maximum concurrent enrollment connections.
+pub const QRM_MAX_ENROLLMENT_CONNECTIONS: usize = 8;
+/// The maximum enrollment connection lifetime in seconds.
+pub const QRM_MAX_ENROLLMENT_LIFETIME_SECS: u64 = 30;
+/// The maximum enrollment challenge lifetime in seconds.
+pub const QRM_MAX_ENROLLMENT_CHALLENGE_TTL_SECS: u64 = 300;
+/// The maximum downloaded updater archive size.
+pub const QRM_MAX_UPDATE_ARCHIVE_BYTES: u64 = 64 * 1024 * 1024;
+/// The maximum extracted updater tree size.
+pub const QRM_MAX_UPDATE_EXTRACTED_BYTES: u64 = 128 * 1024 * 1024;
+/// The maximum extracted updater entry count.
+pub const QRM_MAX_UPDATE_ENTRIES: usize = 32;
+/// The maximum allowed decompression ratio.
+pub const QRM_MAX_UPDATE_COMPRESSION_RATIO: u64 = 100;
 
 /// TLS policy selected by a configuration file.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -101,6 +121,18 @@ pub struct SecurityConfig {
     server_private_key: PathBuf,
     /// Absolute path to the trusted Core client CA.
     trusted_client_ca: PathBuf,
+    /// Absolute path to the trusted Core client CA used by enrollment.
+    #[serde(default)]
+    trusted_core_enrollment_ca: PathBuf,
+    /// Absolute path to the device Intermediate CA certificate chain.
+    #[serde(default)]
+    device_intermediate_certificate: PathBuf,
+    /// Absolute path to the device Intermediate CA private key.
+    #[serde(default)]
+    device_intermediate_private_key: PathBuf,
+    /// Absolute path to the public Root CA chain returned to enrolled Apps.
+    #[serde(default)]
+    public_root_certificate: PathBuf,
 }
 
 impl SecurityConfig {
@@ -117,6 +149,26 @@ impl SecurityConfig {
     /// Returns the configured private-key path.
     pub fn server_private_key(&self) -> &Path {
         &self.server_private_key
+    }
+
+    /// Returns the trusted Core enrollment CA path.
+    pub fn trusted_core_enrollment_ca(&self) -> &Path {
+        &self.trusted_core_enrollment_ca
+    }
+
+    /// Returns the configured device Intermediate CA certificate path.
+    pub fn device_intermediate_certificate(&self) -> &Path {
+        &self.device_intermediate_certificate
+    }
+
+    /// Returns the configured device Intermediate CA private-key path.
+    pub fn device_intermediate_private_key(&self) -> &Path {
+        &self.device_intermediate_private_key
+    }
+
+    /// Returns the configured public Root CA certificate path.
+    pub fn public_root_certificate(&self) -> &Path {
+        &self.public_root_certificate
     }
 
     /// Returns the configured client CA path.
@@ -208,6 +260,239 @@ impl ResourceLimits {
     }
 }
 
+/// Bounded same-port enrollment settings.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct EnrollmentConfig {
+    /// Enables production enrollment handling on the enrollment ALPN.
+    enabled: bool,
+    /// Absolute path to the protected non-secret App allowlist.
+    allowlist_path: PathBuf,
+    /// Maximum pre-authenticated enrollment handshakes.
+    max_handshakes: usize,
+    /// Maximum enrollment connections after TLS/ALPN selection.
+    max_connections: usize,
+    /// Maximum complete enrollment request frame.
+    max_request_bytes: usize,
+    /// Maximum raw CSR bytes retained transiently.
+    max_csr_bytes: usize,
+    /// Maximum lifetime of one enrollment connection.
+    connection_lifetime_secs: u64,
+    /// Maximum lifetime of one Relay challenge.
+    challenge_ttl_secs: u64,
+}
+
+impl Default for EnrollmentConfig {
+    /// Returns the fail-closed configuration used by legacy test fixtures.
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            allowlist_path: PathBuf::new(),
+            max_handshakes: QRM_MAX_ENROLLMENT_HANDSHAKES,
+            max_connections: QRM_MAX_ENROLLMENT_CONNECTIONS,
+            max_request_bytes: QRM_MAX_ENROLLMENT_REQUEST_BYTES,
+            max_csr_bytes: QRM_MAX_ENROLLMENT_CSR_BYTES,
+            connection_lifetime_secs: QRM_MAX_ENROLLMENT_LIFETIME_SECS,
+            challenge_ttl_secs: QRM_MAX_ENROLLMENT_CHALLENGE_TTL_SECS,
+        }
+    }
+}
+
+impl EnrollmentConfig {
+    /// Validates all bounded enrollment settings before listener binding.
+    pub fn validate(&self) -> RelayResult<()> {
+        if !self.enabled {
+            return Ok(());
+        }
+        validate_absolute_path("enrollment.allowlist_path", &self.allowlist_path)?;
+        if self.max_handshakes == 0 || self.max_handshakes > QRM_MAX_ENROLLMENT_HANDSHAKES {
+            return Err(RelayError::InvalidConfiguration {
+                field: "enrollment.max_handshakes",
+                reason: "exceeds the fixed enrollment handshake bound",
+            });
+        }
+        if self.max_connections == 0 || self.max_connections > QRM_MAX_ENROLLMENT_CONNECTIONS {
+            return Err(RelayError::InvalidConfiguration {
+                field: "enrollment.max_connections",
+                reason: "exceeds the fixed enrollment connection bound",
+            });
+        }
+        if self.max_request_bytes != QRM_MAX_ENROLLMENT_REQUEST_BYTES
+            || self.max_csr_bytes == 0
+            || self.max_csr_bytes > QRM_MAX_ENROLLMENT_CSR_BYTES
+            || self.connection_lifetime_secs == 0
+            || self.connection_lifetime_secs > QRM_MAX_ENROLLMENT_LIFETIME_SECS
+            || self.challenge_ttl_secs == 0
+            || self.challenge_ttl_secs > QRM_MAX_ENROLLMENT_CHALLENGE_TTL_SECS
+        {
+            return Err(RelayError::InvalidConfiguration {
+                field: "enrollment.max_request_bytes",
+                reason: "enrollment bounds exceed the fixed QRM limits",
+            });
+        }
+        Ok(())
+    }
+
+    /// Returns whether the production enrollment path is enabled.
+    pub const fn enabled(&self) -> bool {
+        self.enabled
+    }
+
+    /// Returns the protected allowlist path.
+    pub fn allowlist_path(&self) -> &Path {
+        &self.allowlist_path
+    }
+
+    /// Returns the pre-authentication semaphore bound.
+    pub const fn max_handshakes(&self) -> usize {
+        self.max_handshakes
+    }
+
+    /// Returns the post-ALPN enrollment connection bound.
+    pub const fn max_connections(&self) -> usize {
+        self.max_connections
+    }
+
+    /// Returns the complete enrollment frame bound.
+    pub const fn max_request_bytes(&self) -> usize {
+        self.max_request_bytes
+    }
+
+    /// Returns the transient CSR byte bound.
+    pub const fn max_csr_bytes(&self) -> usize {
+        self.max_csr_bytes
+    }
+
+    /// Returns the enrollment connection lifetime.
+    pub const fn connection_lifetime_secs(&self) -> u64 {
+        self.connection_lifetime_secs
+    }
+
+    /// Returns the challenge lifetime.
+    pub const fn challenge_ttl_secs(&self) -> u64 {
+        self.challenge_ttl_secs
+    }
+}
+
+/// Fixed-source stable-latest updater settings.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct UpdateConfig {
+    /// Enables the local update worker and its fixed-source control surface.
+    enabled: bool,
+    /// Fixed GitHub owner/repository; arbitrary origins are rejected.
+    repository: String,
+    /// Fixed release selector accepted by the worker.
+    channel: String,
+    /// Protected staging directory outside the install directory.
+    staging_directory: PathBuf,
+    /// Maximum downloaded archive bytes.
+    max_archive_bytes: u64,
+    /// Maximum extracted tree bytes.
+    max_extracted_bytes: u64,
+    /// Maximum extracted entry count.
+    max_entries: usize,
+    /// Maximum archive decompression ratio.
+    max_compression_ratio: u64,
+}
+
+impl Default for UpdateConfig {
+    /// Returns the fail-closed updater defaults used by test fixtures.
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            repository: "mithyer/herdr-dog-relay".to_owned(),
+            channel: "stable-latest".to_owned(),
+            staging_directory: PathBuf::new(),
+            max_archive_bytes: QRM_MAX_UPDATE_ARCHIVE_BYTES,
+            max_extracted_bytes: QRM_MAX_UPDATE_EXTRACTED_BYTES,
+            max_entries: QRM_MAX_UPDATE_ENTRIES,
+            max_compression_ratio: QRM_MAX_UPDATE_COMPRESSION_RATIO,
+        }
+    }
+}
+
+impl UpdateConfig {
+    /// Validates fixed-source updater policy before it can be exposed.
+    pub fn validate(&self) -> RelayResult<()> {
+        if !self.enabled {
+            return Ok(());
+        }
+        if self.repository != "mithyer/herdr-dog-relay" || self.channel != "stable-latest" {
+            return Err(RelayError::InvalidConfiguration {
+                field: "update.repository",
+                reason: "only the fixed stable-latest source is supported",
+            });
+        }
+        validate_absolute_path("update.staging_directory", &self.staging_directory)?;
+        if self.max_archive_bytes == 0
+            || self.max_archive_bytes > QRM_MAX_UPDATE_ARCHIVE_BYTES
+            || self.max_extracted_bytes == 0
+            || self.max_extracted_bytes > QRM_MAX_UPDATE_EXTRACTED_BYTES
+            || self.max_entries == 0
+            || self.max_entries > QRM_MAX_UPDATE_ENTRIES
+            || self.max_compression_ratio == 0
+            || self.max_compression_ratio > QRM_MAX_UPDATE_COMPRESSION_RATIO
+        {
+            return Err(RelayError::InvalidConfiguration {
+                field: "update.max_archive_bytes",
+                reason: "updater limits exceed the fixed QRM bounds",
+            });
+        }
+        Ok(())
+    }
+
+    /// Returns whether the fixed-source updater is enabled.
+    pub const fn enabled(&self) -> bool {
+        self.enabled
+    }
+
+    /// Returns the fixed GitHub repository.
+    pub fn repository(&self) -> &str {
+        &self.repository
+    }
+
+    /// Returns the only accepted update channel.
+    pub fn channel(&self) -> &str {
+        &self.channel
+    }
+
+    /// Returns the protected updater staging directory.
+    pub fn staging_directory(&self) -> &Path {
+        &self.staging_directory
+    }
+
+    /// Returns the maximum archive size.
+    pub const fn max_archive_bytes(&self) -> u64 {
+        self.max_archive_bytes
+    }
+
+    /// Returns the maximum extracted tree size.
+    pub const fn max_extracted_bytes(&self) -> u64 {
+        self.max_extracted_bytes
+    }
+
+    /// Returns the maximum extracted entry count.
+    pub const fn max_entries(&self) -> usize {
+        self.max_entries
+    }
+
+    /// Returns the maximum decompression ratio.
+    pub const fn max_compression_ratio(&self) -> u64 {
+        self.max_compression_ratio
+    }
+
+    /// Builds an enabled updater policy for in-crate safety tests.
+    #[cfg(test)]
+    pub(crate) fn from_toml_for_test(staging_directory: PathBuf) -> Self {
+        Self {
+            enabled: true,
+            staging_directory,
+            ..Self::default()
+        }
+    }
+}
+
 /// Validated QRM-1 Relay configuration.
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -218,6 +503,12 @@ pub struct RelayConfig {
     security: SecurityConfig,
     /// Bounded listener/session resource settings.
     limits: ResourceLimits,
+    /// Same-port enrollment settings.
+    #[serde(default)]
+    enrollment: EnrollmentConfig,
+    /// Fixed-source stable-latest updater settings.
+    #[serde(default)]
+    update: UpdateConfig,
 }
 
 impl RelayConfig {
@@ -238,6 +529,8 @@ impl RelayConfig {
     pub fn validate(&self) -> RelayResult<()> {
         self.listener.socket_addr()?;
         self.limits.validate()?;
+        self.enrollment.validate()?;
+        self.update.validate()?;
         if self.security.mode == SecurityMode::Verified {
             validate_absolute_path(
                 "security.server_certificate",
@@ -251,6 +544,24 @@ impl RelayConfig {
                 "security.trusted_client_ca",
                 &self.security.trusted_client_ca,
             )?;
+            if self.enrollment.enabled {
+                validate_absolute_path(
+                    "security.trusted_core_enrollment_ca",
+                    &self.security.trusted_core_enrollment_ca,
+                )?;
+                validate_absolute_path(
+                    "security.device_intermediate_certificate",
+                    &self.security.device_intermediate_certificate,
+                )?;
+                validate_absolute_path(
+                    "security.device_intermediate_private_key",
+                    &self.security.device_intermediate_private_key,
+                )?;
+                validate_absolute_path(
+                    "security.public_root_certificate",
+                    &self.security.public_root_certificate,
+                )?;
+            }
         }
         Ok(())
     }
@@ -282,9 +593,19 @@ impl RelayConfig {
     pub const fn security(&self) -> &SecurityConfig {
         &self.security
     }
-    /// Returns the validated resource limits.
+    /// Returns the validated resource settings.
     pub const fn limits(&self) -> &ResourceLimits {
         &self.limits
+    }
+
+    /// Returns the bounded enrollment settings.
+    pub const fn enrollment(&self) -> &EnrollmentConfig {
+        &self.enrollment
+    }
+
+    /// Returns the fixed-source updater settings.
+    pub const fn update(&self) -> &UpdateConfig {
+        &self.update
     }
 }
 

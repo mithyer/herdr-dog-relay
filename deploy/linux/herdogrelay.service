@@ -1,0 +1,16 @@
+[Unit]
+Description=Herdr-dog QUIC Relay
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+ExecStart=%h/.local/bin/herdogrelay --config %h/.config/herdr-dog/relay.toml
+Restart=on-failure
+RestartSec=30s
+StartLimitIntervalSec=300
+StartLimitBurst=5
+UMask=0077
+NoNewPrivileges=yes
+
+[Install]
+WantedBy=default.target

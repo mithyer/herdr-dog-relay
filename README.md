@@ -2,7 +2,7 @@
 title: Herdr-dog Relay
 description: Single-device single-port QUIC TLS 1.3 opaque byte Relay.
 published: true
-date: 2026-08-23T11:25:00+08:00
+date: 2026-08-24T01:43:10+08:00
 tags: herdr-dog, relay, quic
 editor: markdown
 dateCreated: 2026-08-22T00:10:00+08:00
@@ -12,7 +12,7 @@ dateCreated: 2026-08-22T00:10:00+08:00
 
 ## Current status
 
-QRM-1 Q5 mb17 one-port/two-session read-only evidence and the Q6 App/embedded Core integration checkpoint are complete. Q7 Legacy Cleanup is checkpointed in Relay at `a2dd9dc`: stale pre-QRM configuration/test entrypoints are removed or rewritten, and the Relay source exposes only the generic single-port QUIC TLS 1.3 server and opaque Unix bridge. Long-term service provisioning, PKI lifecycle and QRM overall acceptance remain open.
+QRM-1 Q5 mb17 one-port/two-session read-only evidence and Q6 App/embedded Core integration are checkpointed. Q7 Legacy Cleanup is checkpointed in Relay at `a2dd9dc`. QRM-PROD-1 P2 is now the active parent-owned Relay implementation stage: protected-file material validation, same-port enrollment framing/ALPN, persistent allowlist/revocation, stable-latest archive safety, and user-level supervision templates are implemented locally and remain uncheckpointed. No certificate issuance/deployment, Herdr payload parsing, writes, subscriptions, healthy `Online + Current`, actions, passthrough or automatic retry is claimed.
 
 ## Boundary
 
@@ -20,7 +20,7 @@ The Relay authenticates Core, validates HDQM/HDQS/session authority and bridges 
 
 ## Current implementation
 
-QRM-1 Q5 mb17 one-port/two-session read-only evidence is checkpointed through the deployed x86_64 Relay. Q7 is checkpointed at `a2dd9dc`; the current Relay source has no legacy TCP, Broker or class-specific runtime path, and `legacy_network_tables_are_rejected` preserves the generic fail-closed config boundary. Actions, subscriptions, healthy `Online + Current` and arbitrary passthrough remain disabled.
+QRM-PROD-1 P2 is active and implemented locally but not checkpointed. The current Relay source adds bounded protected-file, allowlist, enrollment-wire, transient PKI, updater and supervision seams around the existing QRM QUIC bridge; the 66-test local gate passes. Production certificate material, live enrollment, remote update, service installation and mb17 deployment remain later evidence gates.
 
 ## Checkpoint Log
 
@@ -92,3 +92,27 @@ QRM-1 Q5 mb17 one-port/two-session read-only evidence is checkpointed through th
 - Exclusions: no legacy TCP/Broker fallback, Herdr parsing, App transport, deployment, writes, subscriptions, healthy Current, actions or passthrough.
 - Residual risk: long-term supervision, PKI rotation, real native/device evidence and QRM overall acceptance remain open.
 - Next dependency: complete the ordered App-iOS and parent Wiki checkpoints.
+
+[active](1-102) 2026-08-24 | QRM-PROD-1 P2 Relay implementation active
+- Repository state: P1 checkpoints are preserved; P2 Relay source/config/workflow/template changes are uncommitted and mb17 is untouched.
+- Validation: 66 Relay tests, Clippy with warnings denied, rustfmt, rustdoc and diff checks pass locally.
+- Scope: protected material/allowlist, enrollment ALPN wire boundary, transient CSR issuance, stable-latest updater safety, CLI revoke/update and supervision templates.
+- Exclusions: no live deployment, production PKI provisioning, Herdr parsing, writes, subscriptions, healthy Current, actions, passthrough or automatic retry.
+- Residual risk: full live enrollment/normal-QRM mTLS admission, updater restart/drain, cross-platform service execution and mb17 evidence remain open.
+- Next dependency: complete the P2 implementation review/fix/revalidation gate before selective Relay checkpointing.
+
+[implemented](1-110) 2026-08-24 | QRM-PROD-1 P2 Relay local implementation completed
+- Repository state: P2 Relay source/config/workflow/template changes are uncommitted; P1 checkpoints remain preserved and mb17/Herdr are untouched.
+- Validation: 69 Relay tests, Clippy, rustfmt, rustdoc, locked checks and diff checks pass locally.
+- Scope: protected material/allowlist, enrollment ALPN, transient PKI, stable-latest updater/revoke CLI and supervision templates.
+- Exclusions: live P6 drain/restart/readiness/rebind, production deployment, Herdr parsing, writes, subscriptions, healthy Current, actions, passthrough and automatic retry.
+- Residual risk: fresh P2 review/fix/revalidation and real service/deployment evidence remain open.
+- Next dependency: complete fresh P2 implementation review, apply fixes, then selectively checkpoint Relay.
+
+[accepted](1-118) 2026-08-24 | QRM-PROD-1 P2 Relay local implementation accepted
+- Repository state: P2 Relay source/config/workflow/template changes remain uncommitted; P1 checkpoints and Herdr/mb17 exclusions are preserved.
+- Validation/review: Relay 69 passed with locked Clippy, rustfmt, rustdoc and diff gates; final fresh dual review found no P0-P2 findings.
+- Scope: protected material/allowlist, Core-anchor enrollment ALPN, transient PKI, stable-latest updater/revoke and supervision templates.
+- Exclusions: live P6 drain/restart/readiness/rebind, production deployment, Herdr parsing, writes, subscriptions, healthy Current, actions, passthrough and automatic retry.
+- Residual risk: P3 live boundary coverage and P4-P6 real service/deployment evidence remain open; checkpointing is required.
+- Next dependency: selectively checkpoint Relay, then synchronize parent status.

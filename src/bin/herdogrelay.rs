@@ -10,7 +10,7 @@ use std::{env, fmt, path::PathBuf};
 /// Command name used in diagnostics.
 const COMMAND_NAME: &str = "herdogrelay";
 /// Safe command-line usage text.
-const HELP_TEXT: &str = "herdogrelay - single-device QUIC TLS 1.3 Relay\n\nUsage:\n  herdogrelay [--config PATH] [--port PORT]\n  herdogrelay --print-default-config\n  herdogrelay --help\n  herdogrelay --version\n";
+const HELP_TEXT: &str = "herdogrelay - single-device QUIC TLS 1.3 Relay\n\nUsage:\n  herdogrelay [--config PATH] [--port PORT]\n  herdogrelay update --config PATH\n  herdogrelay revoke --config PATH --app-id APP_ID\n  herdogrelay --print-default-config\n  herdogrelay --help\n  herdogrelay --version\n";
 
 /// One bounded CLI operation.
 #[derive(Debug, Eq, PartialEq)]
@@ -19,6 +19,13 @@ enum CliCommand {
     Run {
         config_path: PathBuf,
         port: Option<u16>,
+    },
+    /// Performs one explicit stable-latest local update.
+    Update { config_path: PathBuf },
+    /// Revokes one App from the protected local allowlist.
+    Revoke {
+        config_path: PathBuf,
+        app_id: String,
     },
     /// Prints the complete safe configuration template.
     PrintDefaultConfig,
@@ -66,6 +73,11 @@ async fn main() {
             Ok(())
         }
         Ok(CliCommand::Run { config_path, port }) => run(config_path, port).await,
+        Ok(CliCommand::Update { config_path }) => update(config_path).await,
+        Ok(CliCommand::Revoke {
+            config_path,
+            app_id,
+        }) => revoke(config_path, app_id),
         Err(error) => Err(error),
     };
     if let Err(error) = result {
@@ -81,6 +93,12 @@ where
     S: Into<String>,
 {
     let arguments: Vec<String> = arguments.into_iter().map(Into::into).collect();
+    if matches!(
+        arguments.first().map(String::as_str),
+        Some("update" | "revoke")
+    ) {
+        return parse_control_command(&arguments);
+    }
     if arguments
         .iter()
         .any(|argument| argument == "--help" || argument == "-h")
@@ -131,6 +149,111 @@ where
         config_path: config_path.unwrap_or_else(|| PathBuf::from(".config/herdr-dog/relay.toml")),
         port,
     })
+}
+
+/// Parses the bounded local update and revoke commands.
+fn parse_control_command(arguments: &[String]) -> Result<CliCommand, CliError> {
+    let command = arguments.first().map(String::as_str).unwrap_or_default();
+    let mut config_path = PathBuf::from(".config/herdr-dog/relay.toml");
+    let mut app_id = None;
+    let mut index = 1;
+    while index < arguments.len() {
+        match arguments[index].as_str() {
+            "--config" | "-c" => {
+                let value = arguments
+                    .get(index + 1)
+                    .ok_or_else(|| CliError::Usage("--config requires a path".to_owned()))?;
+                config_path = PathBuf::from(value);
+                index += 2;
+            }
+            "--app-id" if command == "revoke" => {
+                let value = arguments
+                    .get(index + 1)
+                    .ok_or_else(|| CliError::Usage("--app-id requires a value".to_owned()))?;
+                app_id = Some(value.clone());
+                index += 2;
+            }
+            option => return Err(CliError::Usage(format!("unknown option: {option}"))),
+        }
+    }
+    match command {
+        "update" if app_id.is_none() => Ok(CliCommand::Update { config_path }),
+        "revoke" => Ok(CliCommand::Revoke {
+            config_path,
+            app_id: app_id.ok_or_else(|| CliError::Usage("revoke requires --app-id".to_owned()))?,
+        }),
+        _ => Err(CliError::Usage(
+            "unsupported local control command".to_owned(),
+        )),
+    }
+}
+
+/// Executes one fixed-source stable-latest update and leaves restart to the supervisor/operator.
+async fn update(config_path: PathBuf) -> Result<(), CliError> {
+    let config = RelayConfig::from_path(&config_path).map_err(CliError::Relay)?;
+    require_verified_security(&config)?;
+    let updater = herdr_dog_relay::updater::FixedSourceUpdater::new(config.update().clone())
+        .map_err(CliError::Relay)?;
+    let _update_lock = updater.acquire_lock().map_err(CliError::Relay)?;
+    let os = match std::env::consts::OS {
+        "macos" => "macos",
+        "linux" => "linux",
+        _ => {
+            return Err(CliError::Usage(
+                "unsupported update operating system".to_owned(),
+            ));
+        }
+    };
+    let arch = match std::env::consts::ARCH {
+        "aarch64" => "arm64",
+        "x86_64" => "x86_64",
+        _ => {
+            return Err(CliError::Usage(
+                "unsupported update architecture".to_owned(),
+            ));
+        }
+    };
+    let (archive, checksums) = updater.download_latest(os, arch).map_err(CliError::Relay)?;
+    updater
+        .verify_checksum(&archive, &checksums)
+        .map_err(CliError::Relay)?;
+    let staged = updater
+        .extract_verified(&archive)
+        .map_err(CliError::Relay)?;
+    let installed = std::env::current_exe()
+        .map_err(|_| CliError::Usage("current executable path is unavailable".to_owned()))?;
+    let backup = installed.with_extension("previous");
+    updater
+        .replace_binary(&staged, &installed, &backup)
+        .map_err(CliError::Relay)?;
+    eprintln!(
+        "{COMMAND_NAME}: stable-latest binary replaced; restart the user supervisor to create a new Relay generation"
+    );
+    Ok(())
+}
+
+/// Revokes one App through the protected local allowlist only.
+fn revoke(config_path: PathBuf, app_id: String) -> Result<(), CliError> {
+    let config = RelayConfig::from_path(&config_path).map_err(CliError::Relay)?;
+    require_verified_security(&config)?;
+    if !config.enrollment().enabled() {
+        return Err(CliError::Usage(
+            "enrollment allowlist is disabled".to_owned(),
+        ));
+    }
+    let app_id = herdr_dog_relay::enrollment::AppId::new(app_id)
+        .map_err(|_| CliError::Usage("--app-id is invalid".to_owned()))?;
+    let uid = herdr_dog_relay::material::current_uid().map_err(CliError::Relay)?;
+    let mut allowlist = herdr_dog_relay::allowlist::PersistentAllowlist::open(
+        config.enrollment().allowlist_path(),
+        uid,
+    )
+    .map_err(CliError::Relay)?;
+    let generation = allowlist
+        .revoke(&app_id)
+        .map_err(|_| CliError::Usage("allowlist entry could not be revoked".to_owned()))?;
+    eprintln!("{COMMAND_NAME}: local revocation applied at allowlist generation {generation}");
+    Ok(())
 }
 
 /// Loads validated configuration, binds the UDP listener and serves until termination.
@@ -229,6 +352,20 @@ idle_timeout_secs = 900
     #[test]
     fn qrm_print_commands_are_available() {
         assert_eq!(parse_args(["--help"]).expect("help"), CliCommand::Help);
+        assert_eq!(
+            parse_args(["update", "--config", "/tmp/relay.toml"]).expect("update"),
+            CliCommand::Update {
+                config_path: PathBuf::from("/tmp/relay.toml")
+            }
+        );
+        assert_eq!(
+            parse_args(["revoke", "--config", "/tmp/relay.toml", "--app-id", "app-a"])
+                .expect("revoke"),
+            CliCommand::Revoke {
+                config_path: PathBuf::from("/tmp/relay.toml"),
+                app_id: "app-a".to_owned()
+            }
+        );
         assert_eq!(
             parse_args(["--print-default-config"]).expect("config"),
             CliCommand::PrintDefaultConfig

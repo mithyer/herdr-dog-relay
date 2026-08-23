@@ -50,20 +50,36 @@ while [ "$#" -gt 0 ]; do
     esac
 done
 
-# Restrict this release installer to the supported user-level macOS targets.
-[ "$(uname -s)" = "Darwin" ] || fail "this release currently supports macOS only"
-case "$(uname -m)" in
-    arm64) ARCHIVE_ARCH="arm64" ;;
-    x86_64) ARCHIVE_ARCH="x86_64" ;;
-    *) fail "unsupported macOS architecture" ;;
+# Select only the explicitly released operating-system/architecture pairs.
+case "$(uname -s)" in
+    Darwin)
+        ARCHIVE_OS="macos"
+        case "$(uname -m)" in
+            arm64) ARCHIVE_ARCH="arm64" ;;
+            x86_64) ARCHIVE_ARCH="x86_64" ;;
+            *) fail "unsupported macOS architecture" ;;
+        esac
+        ;;
+    Linux)
+        ARCHIVE_OS="linux"
+        [ "$(uname -m)" = "x86_64" ] || fail "unsupported Linux architecture"
+        ARCHIVE_ARCH="x86_64"
+        ;;
+    *) fail "this release supports macOS and Linux only" ;;
 esac
 
 # Verify the small set of host tools required for HTTPS download and extraction.
 command -v curl >/dev/null 2>&1 || fail "curl is required"
-command -v shasum >/dev/null 2>&1 || fail "shasum is required"
 command -v tar >/dev/null 2>&1 || fail "tar is required"
 command -v install >/dev/null 2>&1 || fail "install is required"
 command -v awk >/dev/null 2>&1 || fail "awk is required"
+if command -v sha256sum >/dev/null 2>&1; then
+    CHECKSUM_TOOL="sha256sum"
+elif command -v shasum >/dev/null 2>&1; then
+    CHECKSUM_TOOL="shasum"
+else
+    fail "sha256sum or shasum is required"
+fi
 
 # Resolve the final tag through GitHub's HTTPS redirect without parsing JSON.
 if [ -z "$RELEASE_VERSION" ]; then
@@ -77,7 +93,7 @@ fi
 # Keep all downloaded material outside the destination until checksum verification succeeds.
 TEMP_DIRECTORY=$(mktemp -d "${TMPDIR:-/tmp}/herdogrelay-install.XXXXXX")
 trap 'rm -rf "$TEMP_DIRECTORY"' EXIT HUP INT TERM
-ARCHIVE_NAME="herdogrelay-macos-$ARCHIVE_ARCH.tar.gz"
+ARCHIVE_NAME="herdogrelay-$ARCHIVE_OS-$ARCHIVE_ARCH.tar.gz"
 RELEASE_BASE="https://github.com/$REPOSITORY/releases/download/$RELEASE_VERSION"
 ARCHIVE_PATH="$TEMP_DIRECTORY/$ARCHIVE_NAME"
 CHECKSUM_PATH="$TEMP_DIRECTORY/checksums.txt"
@@ -93,13 +109,22 @@ curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 \
 # Compare the release checksum before extracting or replacing the installed binary.
 EXPECTED_CHECKSUM=$(awk -v archive="$ARCHIVE_NAME" '$2 == archive { print $1; exit }' "$CHECKSUM_PATH")
 [ -n "$EXPECTED_CHECKSUM" ] || fail "release checksum entry is missing"
-ACTUAL_CHECKSUM=$(shasum -a 256 "$ARCHIVE_PATH" | awk '{ print $1 }')
+if [ "$CHECKSUM_TOOL" = "sha256sum" ]; then
+    ACTUAL_CHECKSUM=$(sha256sum "$ARCHIVE_PATH" | awk '{ print $1 }')
+else
+    ACTUAL_CHECKSUM=$(shasum -a 256 "$ARCHIVE_PATH" | awk '{ print $1 }')
+fi
 [ "$EXPECTED_CHECKSUM" = "$ACTUAL_CHECKSUM" ] || fail "release checksum does not match"
 
 # Extract the verified archive into a private temporary directory and require the expected file.
 EXTRACT_DIRECTORY="$TEMP_DIRECTORY/extracted"
 mkdir -m 700 "$EXTRACT_DIRECTORY"
-tar -xzf "$ARCHIVE_PATH" -C "$EXTRACT_DIRECTORY"
+# Reject archives containing paths, links or files other than the one executable.
+ARCHIVE_ENTRIES=$(tar -tzf "$ARCHIVE_PATH") || fail "release archive is invalid"
+[ "$ARCHIVE_ENTRIES" = "herdogrelay" ] || fail "release archive contains unexpected entries"
+ARCHIVE_TYPES=$(tar -tvzf "$ARCHIVE_PATH") || fail "release archive metadata is invalid"
+printf '%s\n' "$ARCHIVE_TYPES" | awk 'NF && substr($1, 1, 1) == "-" && $NF == "herdogrelay" { count++ } END { exit !(count == 1) }' || fail "release archive entry is not a regular executable"
+tar -xzf "$ARCHIVE_PATH" --no-same-owner --no-same-permissions -C "$EXTRACT_DIRECTORY"
 [ -f "$EXTRACT_DIRECTORY/herdogrelay" ] || fail "release archive has no herdogrelay binary"
 
 # Create the destination only when needed, preserving an existing custom directory mode.

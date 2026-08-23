@@ -8,14 +8,22 @@
 #[cfg(not(unix))]
 compile_error!("herdr-dog-relay currently supports Unix hosts only");
 
+/// Protected persistent App allowlist and generation store.
+pub mod allowlist;
 /// Bounded opaque bidirectional byte forwarding.
 pub mod bridge;
 /// QRM-1 single-listener configuration.
 pub mod config;
 /// Schema-neutral QRM-PROD-1 enrollment, allowlist, and update contracts/fakes.
 pub mod enrollment;
+/// Bounded same-port enrollment frame codec.
+pub mod enrollment_wire;
 /// Redacted Relay errors.
 pub mod error;
+/// Protected-file validation and transient deployment material loading.
+pub mod material;
+/// Transient protected certificate issuance for App enrollment.
+pub mod pki;
 /// QRM-1 bounded QUIC server owner and connection lifecycle.
 pub mod quic_server;
 /// QRM-1 HDQM/HDQS codec.
@@ -24,6 +32,10 @@ pub mod quic_wire;
 pub mod session_registry;
 /// Validated Herdr Unix socket access.
 pub mod socket;
+/// Portable user-level LaunchAgent and systemd templates.
+pub mod supervision;
+/// Fixed-source stable-latest updater and archive safety checks.
+pub mod updater;
 /// QRM-PROD-1 enrollment/allowlist/update contract and deterministic fake surface.
 pub use enrollment::{
     AUTHORITY_BYTES, AUTHORIZATION_ID_BYTES, AllowlistEntry, AllowlistRegistry, AllowlistRole,

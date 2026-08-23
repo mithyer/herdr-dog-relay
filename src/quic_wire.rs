@@ -95,6 +95,12 @@ pub enum HdqmKind {
     ErrorResponse = 11,
     /// Stable-latest Relay update request; execution remains P2-gated.
     RelayUpdate = 12,
+    /// Relay accepted an authorized stable-latest update.
+    RelayUpdateAccepted = 13,
+    /// Relay rejected a stable-latest update request.
+    RelayUpdateRejected = 14,
+    /// Relay reported a bounded update status.
+    RelayUpdateStatus = 15,
 }
 
 impl TryFrom<u8> for HdqmKind {
@@ -115,6 +121,9 @@ impl TryFrom<u8> for HdqmKind {
             10 => Ok(Self::GoAway),
             11 => Ok(Self::ErrorResponse),
             12 => Ok(Self::RelayUpdate),
+            13 => Ok(Self::RelayUpdateAccepted),
+            14 => Ok(Self::RelayUpdateRejected),
+            15 => Ok(Self::RelayUpdateStatus),
             _ => Err(QuicProtocolError::UnknownKind),
         }
     }
@@ -927,6 +936,9 @@ mod tests {
     #[test]
     fn relay_update_kind_is_registered() {
         assert_eq!(HdqmKind::try_from(12), Ok(HdqmKind::RelayUpdate));
+        assert_eq!(HdqmKind::try_from(13), Ok(HdqmKind::RelayUpdateAccepted));
+        assert_eq!(HdqmKind::try_from(14), Ok(HdqmKind::RelayUpdateRejected));
+        assert_eq!(HdqmKind::try_from(15), Ok(HdqmKind::RelayUpdateStatus));
     }
 
     // TEST:relay/src/quic_wire.rs[tests::relay_hdqs_binding_round_trips]

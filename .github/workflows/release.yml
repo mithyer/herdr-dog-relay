@@ -23,18 +23,24 @@ concurrency:
 
 jobs:
   build:
-    name: Build macOS ${{ matrix.arch }} archive
+    name: Build ${{ matrix.archive_os }} ${{ matrix.arch }} archive
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: true
       matrix:
         include:
           - arch: arm64
+            archive_os: macos
             target: aarch64-apple-darwin
             runner: macos-14
           - arch: x86_64
+            archive_os: macos
             target: x86_64-apple-darwin
             runner: macos-14
+          - arch: x86_64
+            archive_os: linux
+            target: x86_64-unknown-linux-gnu
+            runner: ubuntu-24.04
     steps:
       # Check out the exact tagged source used for the release archive.
       - name: Check out source
@@ -76,14 +82,14 @@ jobs:
           mkdir -p dist/package
           cp "target/${{ matrix.target }}/release/herdogrelay" dist/package/herdogrelay
           chmod 0755 dist/package/herdogrelay
-          tar -C dist/package -czf "dist/herdogrelay-macos-${{ matrix.arch }}.tar.gz" herdogrelay
+          tar -C dist/package -czf "dist/herdogrelay-${{ matrix.archive_os }}-${{ matrix.arch }}.tar.gz" herdogrelay
 
       # Pass only the release archive to the publishing job; checksums are generated once there.
       - name: Upload archive
         uses: actions/upload-artifact@v4
         with:
-          name: herdogrelay-macos-${{ matrix.arch }}
-          path: dist/herdogrelay-macos-${{ matrix.arch }}.tar.gz
+          name: herdogrelay-${{ matrix.archive_os }}-${{ matrix.arch }}
+          path: dist/herdogrelay-${{ matrix.archive_os }}-${{ matrix.arch }}.tar.gz
           if-no-files-found: error
 
   publish:
@@ -95,7 +101,7 @@ jobs:
       - name: Download archives
         uses: actions/download-artifact@v4
         with:
-          pattern: herdogrelay-macos-*
+          pattern: herdogrelay-*
           path: dist
           merge-multiple: true
 
@@ -104,7 +110,7 @@ jobs:
         run: |
           set -eu
           cd dist
-          shasum -a 256 herdogrelay-macos-*.tar.gz > checksums.txt
+          shasum -a 256 herdogrelay-*.tar.gz > checksums.txt
 
       # Update an existing tag release on manual reruns, otherwise create it once.
       - name: Publish GitHub release
@@ -114,7 +120,7 @@ jobs:
         run: |
           set -eu
           if gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            gh release upload "$RELEASE_TAG" dist/herdogrelay-macos-*.tar.gz dist/checksums.txt --repo "$GITHUB_REPOSITORY" --clobber
+            gh release upload "$RELEASE_TAG" dist/herdogrelay-*.tar.gz dist/checksums.txt --repo "$GITHUB_REPOSITORY" --clobber
           else
-            gh release create "$RELEASE_TAG" dist/herdogrelay-macos-*.tar.gz dist/checksums.txt --repo "$GITHUB_REPOSITORY" --generate-notes
+            gh release create "$RELEASE_TAG" dist/herdogrelay-*.tar.gz dist/checksums.txt --repo "$GITHUB_REPOSITORY" --generate-notes
           fi

@@ -2,7 +2,7 @@
 title: Herdr-dog Relay Operations
 description: User-level operation and verification rules for the single-port QUIC Relay.
 published: true
-date: 2026-08-23T11:25:00+08:00
+date: 2026-08-24T01:43:10+08:00
 tags: herdr-dog, relay, operations, quic, plan
 editor: markdown
 dateCreated: 2026-08-22T00:10:00+08:00
@@ -12,17 +12,18 @@ dateCreated: 2026-08-22T00:10:00+08:00
 
 ## Current status
 
-Status: `active` for QRM-1; Q4 weak-network validation is checkpointed as test-only and Q5 mb17 one-port/two-session deployment/read-only evidence is `validated`. `herdogrelay` is one user-level process per remote device. The process owns one UDP listener and multiple session streams; service supervision remains separate.
+Status: `active` for QRM-PROD-1 P2. QRM-1 Q4/Q5 evidence remains checkpointed. P2 local implementation covers protected files, enrollment/allowlist, stable-latest updater safety, CLI revoke/update and user-level supervision templates; live issuance, deployment and service execution remain separate gates.
 
 ## Configuration
 
-Use a complete TOML file with explicit values for bind address, UDP port, TLS identity/CA references and resource limits. Default port is `18743`; CLI `--port` overrides TOML. All certificate/private-key material is provisioned outside repository files and logs.
+Use a complete TOML file with explicit values for bind address, UDP port, TLS identity/CA references, protected Intermediate/Root paths, allowlist path, enrollment bounds, stable-latest updater bounds and resource limits. Default port is `18743`; CLI `--port` overrides TOML. Private-key, Intermediate and allowlist material is provisioned outside repository files and logs with protected owner/mode checks.
 
 ## Start and inspect
 
-- validate configuration before binding;
+- validate protected configuration and material paths before binding;
 - bind exactly one UDP listener;
-- complete QUIC TLS 1.3 and ALPN before accepting HDQM;
+- complete QUIC TLS 1.3 and normal/enrollment ALPN selection before accepting control frames;
+- require active allowlist admission for normal QRM and Core-origin/challenge binding for enrollment;
 - inspect only bounded status categories, connection/session counts and close reasons;
 - never print Herdr payloads, prompt text, tokens, fingerprints or private keys.
 
@@ -72,3 +73,27 @@ Run Relay locked tests, Clippy, rustfmt, rustdoc, diff checks, loopback three-se
 - Exclusions: payload logging, credential disclosure/mutation, arbitrary commands, Herdr parsing, writes, subscriptions, healthy Current, actions and passthrough.
 - Residual risk: no LaunchAgent, PKI rotation and final checkpoint remain open.
 - Next dependency: record post-fix test outputs and checkpoint Q5 selectively.
+
+[active](1-83) 2026-08-24 | QRM-PROD-1 P2 Relay operations implementation active
+- Repository state: P1 Relay checkpoint is preserved; P2 operations/source/template changes are uncommitted and mb17 is untouched.
+- Validation: 66 local Relay tests plus Clippy, rustfmt, rustdoc and diff checks pass.
+- Scope: protected-file configuration, enrollment/allowlist operations, stable-latest update/replacement and LaunchAgent/systemd templates.
+- Exclusions: no production material provisioning, live service installation, Herdr parsing, writes, subscriptions, healthy Current, actions, passthrough or automatic retry.
+- Residual risk: service lifecycle, updater restart/drain and real deployment preservation remain open.
+- Next dependency: complete fresh P2 review/fix/revalidation before selective Relay checkpointing.
+
+[implemented](1-91) 2026-08-24 | QRM-PROD-1 P2 Relay operations implementation completed
+- Repository state: P2 Relay operations/source/template changes are uncommitted; P1 checkpoints remain preserved and mb17/Herdr are untouched.
+- Validation: 69 Relay tests, Clippy, rustfmt, rustdoc, locked checks and diff checks pass locally.
+- Scope: protected configuration, enrollment/allowlist operations, stable-latest replacement/revoke and user-level supervision templates.
+- Exclusions: live P6 service installation/drain/restart/readiness/rebind, production deployment, Herdr parsing, writes, subscriptions, healthy Current, actions, passthrough and automatic retry.
+- Residual risk: fresh P2 review/fix/revalidation and real service/deployment evidence remain open.
+- Next dependency: complete fresh P2 review, apply fixes, then selectively checkpoint Relay.
+
+[accepted](1-99) 2026-08-24 | QRM-PROD-1 P2 Relay operations local implementation accepted
+- Repository state: P2 Relay operations/source/template changes remain uncommitted; P1 checkpoints and Herdr/mb17 exclusions are preserved.
+- Validation/review: Relay 69 passed with locked Clippy, rustfmt, rustdoc and diff gates; final fresh dual review found no P0-P2 findings.
+- Scope: protected configuration, enrollment/allowlist operations, stable-latest replacement/revoke and user-level supervision templates.
+- Exclusions: live P6 service installation/drain/restart/readiness/rebind, production deployment, Herdr parsing, writes, subscriptions, healthy Current, actions, passthrough and automatic retry.
+- Residual risk: P3 live lifecycle evidence and P4-P6 service/deployment preservation remain open; checkpointing is required.
+- Next dependency: selectively checkpoint Relay, then synchronize parent status.

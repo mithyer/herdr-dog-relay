@@ -15,8 +15,16 @@ mode = "verified"
 server_certificate = ""
 # Absolute path to the Relay private key; never commit or log this value.
 server_private_key = ""
-# Absolute path to the trusted Core client CA.
-trusted_client_ca = ""
+# Absolute path to the trusted App client CA used by normal QRM.
+trusted_client_ca = "/path/to/herdr-dog/app-client-ca.pem"
+# Absolute path to the trusted Core client CA used only by enrollment.
+trusted_core_enrollment_ca = "/path/to/herdr-dog/core-enrollment-ca.pem"
+# Absolute path to this device's Intermediate CA certificate chain.
+device_intermediate_certificate = "/path/to/herdr-dog/device-intermediate-chain.pem"
+# Absolute path to this device's Intermediate CA private key; keep mode 0600.
+device_intermediate_private_key = "/path/to/herdr-dog/device-intermediate.key"
+# Absolute path to the public Root CA chain returned to enrolled Apps.
+public_root_certificate = "/path/to/herdr-dog/deployment-root.pem"
 
 [limits]
 # Maximum number of Core device connections.
@@ -31,3 +39,39 @@ buffer_bytes = 65536
 handshake_timeout_secs = 5
 # Maximum QUIC connection idle duration in seconds.
 idle_timeout_secs = 900
+
+[enrollment]
+# Enable the terminal same-port enrollment ALPN in production.
+enabled = true
+# Protected non-secret JSON allowlist path; do not place it in the repository.
+allowlist_path = "/path/to/herdr-dog/allowlist.json"
+# Maximum pre-authenticated TLS handshakes held at once.
+max_handshakes = 16
+# Maximum enrollment connections after ALPN selection.
+max_connections = 8
+# Maximum complete enrollment request bytes.
+max_request_bytes = 65536
+# Maximum raw CSR bytes retained only during one request.
+max_csr_bytes = 16384
+# Maximum enrollment connection lifetime in seconds.
+connection_lifetime_secs = 30
+# Maximum Relay challenge lifetime in seconds.
+challenge_ttl_secs = 300
+
+[update]
+# Enable the explicit stable-latest updater control surface.
+enabled = true
+# Fixed GitHub source; arbitrary repositories are rejected.
+repository = "mithyer/herdr-dog-relay"
+# Fixed update selector; only stable-latest is accepted.
+channel = "stable-latest"
+# Protected staging directory outside the installed binary directory.
+staging_directory = "/path/to/herdr-dog/update-staging"
+# Maximum downloaded archive bytes.
+max_archive_bytes = 67108864
+# Maximum extracted tree bytes.
+max_extracted_bytes = 134217728
+# Maximum extracted archive entries.
+max_entries = 32
+# Maximum archive decompression ratio.
+max_compression_ratio = 100

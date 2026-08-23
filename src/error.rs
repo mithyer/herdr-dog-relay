@@ -66,6 +66,14 @@ pub enum RelayError {
         /// Stable protocol reason.
         reason: &'static str,
     },
+    /// A fixed-source updater operation failed a bounded safety check.
+    #[error("Relay updater failed: {reason}")]
+    Update {
+        /// Stable updater operation category.
+        operation: &'static str,
+        /// Stable non-secret failure reason.
+        reason: &'static str,
+    },
     /// A session authority did not match the current connection.
     #[error("session authority was rejected")]
     SessionAuthority,

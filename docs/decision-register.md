@@ -203,3 +203,19 @@ Q1 requires codec, fake authority and three-session tests. Q2 requires quinn TLS
 - Exclusions: Root signing key/runtime private material, real certificate issuance, mb17 deployment, Herdr writes, subscriptions, healthy Current, actions, passthrough and automatic retry.
 - Residual risk: P2 must preserve quota isolation, Core-origin/challenge binding, rollback and redacted authority diagnostics.
 - Next dependency: complete P2 activation review/status synchronization before Relay source implementation.
+
+[implemented](1-213) 2026-08-24 | QRM-PROD-1 P2 local Relay implementation completed
+- Repository state: P1 Relay checkpoint `86e174b`, Core P1 `4ba0852`, App-iOS P1 `8b956ab`/`5d2b1c3` and parent P1 `40390b6`/`4490417` are preserved; P2 activation docs are checkpointed in Core `9066dbf`, Relay `17fe0c3`, App-iOS `d7f3ea0` and parent `8d25df1`; P2 Relay source/config/workflow/template changes are uncommitted and mb17/Herdr are untouched.
+- Validation: Relay 69 tests, Clippy with warnings denied, rustfmt, rustdoc, locked checks and diff gates pass; no deployment evidence is claimed.
+- Scope: Relay PKI/enrollment origin, allowlist/revocation generation, stable-latest updater and supervision decisions represented by bounded production seams.
+- Exclusions: live GOAWAY/drain/restart/readiness/rebind is P6-only; no Root signing key, Herdr writes, subscriptions, healthy Current, actions, passthrough or automatic retry.
+- Residual risk: fresh P2 review/fix/revalidation and real issuance/service/deployment evidence remain open.
+- Next dependency: complete fresh P2 implementation review, apply fixes, revalidate, then selectively checkpoint Relay and parent.
+
+[accepted](1-221) 2026-08-24 | QRM-PROD-1 P2 local Relay implementation accepted
+- Repository state: P2 Relay source/docs/workflow/template changes remain uncommitted; P1 Core/Relay/App-iOS/parent checkpoints and Herdr/mb17 exclusions are preserved.
+- Validation/review: Relay 69 passed with locked Clippy, rustfmt, rustdoc and diff gates; Core wire/quality gates passed; final fresh dual review found no P0-P2 findings.
+- Scope: Relay PKI/enrollment origin, allowlist/revocation generation, stable-latest updater and supervision decisions represented by bounded production seams.
+- Exclusions: live P6 GOAWAY/drain/restart/readiness/rebind, Root signing key, production issuance/deployment, Herdr writes, subscriptions, healthy Current, actions, passthrough and automatic retry.
+- Residual risk: P3 live boundary coverage and P4-P6 real issuance/service/deployment evidence remain open; selective checkpointing is required.
+- Next dependency: selectively checkpoint Relay, then App-iOS and parent in order.

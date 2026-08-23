@@ -2,7 +2,7 @@
 title: Herdr-dog Relay Endpoint and Port Plan
 description: Fixed single UDP endpoint and explicit configuration rules for QRM-1.
 published: true
-date: 2026-08-23T11:25:00+08:00
+date: 2026-08-24T01:43:10+08:00
 tags: herdr-dog, relay, quic, port, plan
 editor: markdown
 dateCreated: 2026-08-22T00:10:00+08:00
@@ -12,7 +12,7 @@ dateCreated: 2026-08-22T00:10:00+08:00
 
 ## Current status
 
-Status: `active` for QRM-1; Q4 weak-network validation is checkpointed and Q5 mb17 one-port/two-session endpoint/read-only evidence is `validated`.
+Status: `active` for QRM-PROD-1 P2. QRM-1 Q4/Q5 endpoint evidence remains checkpointed. P2 keeps one device-scoped UDP listener and adds same-port normal/enrollment ALPN dispatch, protected allowlist admission and fixed-source updater/supervision configuration; deployment remains unverified.
 
 ## Contract
 
@@ -22,7 +22,9 @@ Status: `active` for QRM-1; Q4 weak-network validation is checkpointed and Q5 mb
 - no candidate range, discovery sweep, random fallback or per-session data port;
 - explicit bind address required for deployment;
 - Core receives one typed host/port endpoint and opens one QUIC connection;
-- QUIC TLS 1.3 and ALPN `herdr-dog-relay-quic/1` are required before control/data streams;
+- QUIC TLS 1.3 and ALPN `herdr-dog-relay-quic/1` are required before normal control/data streams;
+- same UDP listener may negotiate terminal `herdr-dog-relay-enroll/1` only for Core-mTLS enrollment;
+- normal QRM admission requires an active persisted App allowlist identity;
 - multiple sessions use independent QUIC bidirectional streams, not additional ports.
 
 ## Validation
@@ -66,3 +68,27 @@ Configuration tests reject zero/invalid ports, unknown fields, plaintext mode, m
 - Exclusions: port ranges, discovery, random fallback, per-session ports, credential mutation, Herdr parsing and live writes.
 - Residual risk: endpoint persistence/supervision and final checkpoint remain open.
 - Next dependency: finish post-fix review and checkpoint the deployment evidence.
+
+[active](1-78) 2026-08-24 | QRM-PROD-1 P2 Relay endpoint implementation active
+- Repository state: P1 Relay checkpoint is preserved; P2 endpoint/config/source changes are uncommitted and mb17 is untouched.
+- Validation: local Relay 66-test quality gates pass; no deployment or Herdr liveness evidence is claimed.
+- Scope: one UDP listener with normal/enrollment ALPN separation, allowlist admission and fixed updater/supervision endpoint configuration.
+- Exclusions: no port range/discovery/fallback, per-session ports, production deployment, Herdr parsing, writes, subscriptions, healthy Current, actions, passthrough or automatic retry.
+- Residual risk: live ALPN/mTLS/allowlist admission and supervised restart evidence remain open.
+- Next dependency: complete fresh P2 review/fix/revalidation before selective Relay checkpointing.
+
+[implemented](1-86) 2026-08-24 | QRM-PROD-1 P2 Relay endpoint implementation completed
+- Repository state: P2 endpoint/config/source changes are uncommitted; P1 checkpoints remain preserved and mb17/Herdr are untouched.
+- Validation: 69 Relay tests, Clippy, rustfmt, rustdoc, locked checks and diff checks pass locally.
+- Scope: one UDP listener with normal/enrollment ALPN, active allowlist admission and fixed updater/supervision endpoint configuration.
+- Exclusions: no port range/discovery/fallback, per-session ports, live P6 deployment, Herdr parsing, writes, subscriptions, healthy Current, actions, passthrough or automatic retry.
+- Residual risk: fresh P2 review/fix/revalidation and live ALPN/mTLS/allowlist/supervision evidence remain open.
+- Next dependency: complete fresh P2 review, apply fixes, then selectively checkpoint Relay.
+
+[accepted](1-94) 2026-08-24 | QRM-PROD-1 P2 Relay endpoint local implementation accepted
+- Repository state: P2 endpoint/config/source changes remain uncommitted; P1 checkpoints and Herdr/mb17 exclusions are preserved.
+- Validation/review: Relay 69 passed with locked Clippy, rustfmt, rustdoc and diff gates; final fresh dual review found no P0-P2 findings.
+- Scope: one UDP listener with normal/enrollment ALPN, active allowlist admission and fixed updater/supervision endpoint configuration.
+- Exclusions: no port range/discovery/fallback, per-session ports, live P6 deployment, Herdr parsing, writes, subscriptions, healthy Current, actions, passthrough or automatic retry.
+- Residual risk: P3 live ALPN/mTLS/allowlist evidence and P4-P6 supervision/deployment remain open; checkpointing is required.
+- Next dependency: selectively checkpoint Relay, then synchronize parent status.
