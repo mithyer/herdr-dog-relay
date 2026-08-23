@@ -45,7 +45,7 @@ Configuration tests reject zero/invalid ports, unknown fields, plaintext mode, m
 - Scope: UDP endpoint behavior under deterministic disturbance and reconnect.
 - Exclusions: port ranges, network classes, Broker discovery and per-session data ports.
 - Residual risk: deployed UDP reachability remains open.
-[checkpointed](1-59) 2026-08-23 | QRM-1 Relay Q4 endpoint validation checkpointed
+[checkpointed](1-54) 2026-08-23 | QRM-1 Relay Q4 endpoint validation checkpointed
 - Repository state: endpoint policy and Core Q4 implementation/status checkpoints `bbc39b9`/`a44ef6d` are preserved; Relay has no Q4 production endpoint change and this document is selectively checkpointed.
 - Validation: fixed endpoint/no-fallback policy remains tested; Core/Relay quality gates and the Luna max review correction loop pass.
 - Scope: UDP endpoint behavior under deterministic disturbance and reconnect.

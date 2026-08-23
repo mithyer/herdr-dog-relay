@@ -54,7 +54,7 @@ QRM-1 Q3 is locally accepted and checkpointed in the Relay submodule. The local 
 - Scope: bounded loss/delay/reorder, QUIC control progress during a stalled session stream, stream isolation, reconnect authority invalidation and no raw payload logging.
 - Exclusions: Q5 mb17 deployment, App transport, Herdr parsing, actions, subscriptions, healthy Current, passthrough and automatic retries.
 - Residual risk: Q4 remains active/uncheckpointed and local harness evidence is not deployed Relay or mb17 evidence.
-[checkpointed](1-68) 2026-08-23 | QRM-1 Relay Q4 weak-network validation checkpointed
+[checkpointed](1-63) 2026-08-23 | QRM-1 Relay Q4 weak-network validation checkpointed
 - Repository state: Relay Q4 introduces no production source change; Core implementation checkpoint `bbc39b9` and Core status checkpoint `a44ef6d` are committed, while this Relay documentation checkpoint is selective and unrelated content remains preserved.
 - Validation: the accepted `gpt-5.6-luna` max review's P1/P2 findings were closed by the pre-`SessionClosed` stall assertion, close-session stream retention and synchronized status tails; Core passed 313 tests and Relay passed 46 locked tests with all quality gates.
 - Scope: bounded loss/delay/reorder, QUIC control progress during a stalled session stream, stream isolation, reconnect authority invalidation and no raw payload logging.

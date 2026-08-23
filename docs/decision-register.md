@@ -83,7 +83,7 @@ Q1 requires codec, fake authority and three-session tests. Q2 requires quinn TLS
 - Scope: deterministic loss/delay/reorder, bounded packet/byte queues, heartbeat/close control progress during session flow-control stall, stream isolation and fresh-authority evidence.
 - Exclusions: Q5 mb17, App transport, Herdr parsing, actions, subscriptions, healthy Current, passthrough and automatic retries.
 - Residual risk: Q4 is active and uncheckpointed; local Core harness evidence is not deployed Relay or mb17 evidence.
-[checkpointed](1-94) 2026-08-23 | QRM-1 Relay Q4 decision/evidence gate checkpointed
+[checkpointed](1-92) 2026-08-23 | QRM-1 Relay Q4 decision/evidence gate checkpointed
 - Repository state: Q4 remains test-only with no Relay production source change; Core implementation/status checkpoints are `bbc39b9`/`a44ef6d`, and Relay documentation is selectively checkpointed.
 - Validation: 46 locked Relay tests, Clippy, rustfmt, rustdoc and diff checks pass; Core's 313-test battery and all quality gates pass. Luna max review P1/P2 findings were closed and revalidated.
 - Scope: deterministic loss/delay/reorder, bounded packet/byte queues, control-stream progress, stream isolation, connection-loss cleanup and fresh-authority evidence.

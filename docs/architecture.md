@@ -51,7 +51,7 @@ Relay owns QUIC authentication, bounded HDQM/HDQS validation, session fingerprin
 - Scope: packet disturbance, QUIC control progress during a stalled session stream, stream isolation, reconnect authority and bounded queues.
 - Exclusions: Q5 mb17, Herdr parsing, actions, subscriptions, healthy Current, passthrough and deployment claims.
 - Residual risk: Q4 remains active/uncheckpointed; local weak-network evidence is not field or deployed evidence.
-[checkpointed](1-66) 2026-08-23 | QRM-1 Relay Q4 architecture checkpointed
+[checkpointed](1-60) 2026-08-23 | QRM-1 Relay Q4 architecture checkpointed
 - Repository state: Relay Q4 has no production architecture change; Core implementation/status checkpoints are `bbc39b9`/`a44ef6d`, and this Relay architecture record is selectively checkpointed.
 - Validation: Luna max review findings on flow-control close ordering and status synchronization are closed; Core 313 tests and Relay 46 locked tests plus quality gates pass.
 - Scope: packet disturbance, QUIC control progress during a stalled session stream, stream isolation, reconnect authority and bounded queues.

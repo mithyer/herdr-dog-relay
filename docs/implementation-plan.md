@@ -131,7 +131,7 @@ Block QRM-1 when TLS is absent, invalid authority reaches Herdr, one session see
 - Scope: deterministic loss/delay/reorder, bounded packet/byte queues, heartbeat/close control progress during session flow-control stall, stream isolation and fresh-authority evidence.
 - Exclusions: Q5 mb17, Q6 App transport, Herdr parsing, actions, subscriptions, healthy Current, passthrough and automatic retries.
 - Residual risk: Q4 is active and uncheckpointed; local Core harness evidence is not deployed Relay or mb17 evidence.
-[checkpointed](1-144) 2026-08-23 | QRM-1 Relay Q4 weak-network implementation gate checkpointed
+[checkpointed](1-140) 2026-08-23 | QRM-1 Relay Q4 weak-network implementation gate checkpointed
 - Repository state: Q4 adds no Relay production source; Core implementation/status checkpoints are `bbc39b9`/`a44ef6d`, and this Relay plan/status checkpoint is selective.
 - Validation: Core passed 313 tests and Relay passed 46 locked tests with Clippy, rustfmt, rustdoc, fuzz and diff checks; Luna max review P1/P2 findings were closed and revalidated.
 - Scope: stream isolation, bounded packet/byte queues, deterministic loss/delay/reorder, control progress under flow-control stall and reconnect authority invalidation.

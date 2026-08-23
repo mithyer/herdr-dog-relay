@@ -50,7 +50,7 @@ Run Relay locked tests, Clippy, rustfmt, rustdoc, diff checks, loopback three-se
 - Scope: loss/delay/reorder, connection-loss cleanup and bounded diagnostics.
 - Exclusions: Q5 deployment, payload logging, arbitrary commands and Herdr parsing.
 - Residual risk: weak-network, certificate provisioning and mb17 UDP evidence remain open.
-[checkpointed](1-61) 2026-08-23 | QRM-1 Relay Q4 operations validation checkpointed
+[checkpointed](1-59) 2026-08-23 | QRM-1 Relay Q4 operations validation checkpointed
 - Repository state: Q4 is test-only with no Relay production source change; Core implementation/status checkpoints are `bbc39b9`/`a44ef6d`, and Relay operations documentation is selectively checkpointed.
 - Validation: Core 313 tests and Relay 46 locked tests plus Clippy, rustfmt, rustdoc, fuzz and diff gates pass; Luna max review P1/P2 findings were fixed and revalidated.
 - Scope: loss/delay/reorder, connection-loss cleanup, bounded diagnostics and control progress during a stalled session.

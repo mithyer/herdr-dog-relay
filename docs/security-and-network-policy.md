@@ -47,7 +47,7 @@ QRM tests must cover wrong certificate, missing client identity, wrong ALPN, mal
 - Scope: packet disturbance, bounded queues, stream isolation and reconnect authority invalidation.
 - Exclusions: plaintext, network classes, arbitrary commands, Herdr parsing and Q5 deployment.
 - Residual risk: certificate provisioning and weak-network evidence remain open.
-[checkpointed](1-61) 2026-08-23 | QRM-1 Relay Q4 security validation checkpointed
+[checkpointed](1-56) 2026-08-23 | QRM-1 Relay Q4 security validation checkpointed
 - Repository state: security policy and Q3 implementation are checkpointed; Q4 has no Relay production source change, Core implementation/status checkpoints are `bbc39b9`/`a44ef6d`, and this policy record is selective.
 - Validation: Core/Relay TLS, identity, authority, redaction and weak-network quality gates pass; Luna max review P1/P2 findings were closed and revalidated.
 - Scope: packet disturbance, bounded queues, stream isolation, reconnect authority invalidation and fail-closed cleanup.
