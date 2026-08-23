@@ -63,8 +63,8 @@ src/bin/herdogrelay.rs   one-port CLI host
 | Q2 | Quinn UDP server, TLS/mTLS, ALPN, HDQM and HDQS streams | accepted | loopback TLS, stream isolation, stale heartbeat and capacity rejection |
 | Q3 | Unix socket bridge, deadlines, EOF and redacted cleanup | accepted | socket replacement, bounded buffers and lifecycle tests |
 | Q4 | weak-network injection and reconnect | checkpointed | stream isolation, new epochs/handles and memory bounds |
-| Q5 | mb17 one-port/two-session read-only evidence | validated | typed ping/snapshot and socket-failure isolation |
-| Q6 | hidden App transport consumer | planned | typed App boundary and Keychain identity |
+| Q5 | mb17 one-port/two-session read-only evidence | checkpointed | typed ping/snapshot and socket-failure isolation |
+| Q6 | hidden App transport consumer | active | no Relay source change; Core/App-iOS target baseline and typed boundary |
 | Q7 | remove remaining conflicting files and checkpoint | planned | current QRM-only source/config/docs |
 
 ## Verification commands
@@ -153,4 +153,12 @@ Block QRM-1 when TLS is absent, invalid authority reaches Herdr, one session see
 - Scope: one Relay process/device, one UDP listener, two isolated session streams and opaque forwarding.
 - Exclusions: old TCP/Broker/HDRL/HDBR/HDBD, per-session ports/children, Herdr parsing, writes, subscriptions, healthy Current, actions, passthrough and automatic retries.
 - Residual risk: final review/checkpoint, supervision and PKI lifecycle remain open.
-- Next dependency: checkpoint the deployment evidence after post-fix Core review/revalidation.
+- Next dependency: keep Q6 outside Relay source and wait for the Core/App-iOS target baseline.
+
+[active](1-164) 2026-08-23 | QRM-1 Relay Q6 App/embedded Core integration activated; Relay unchanged
+- Repository state: Relay Q5 deployment/status documentation is checkpointed at `e2b694b`; no Relay Q6 source change is authorized or added.
+- Validation: Q5 one-process/one-port/two-session protocol-20 read-only evidence and session-local failure isolation passed.
+- Scope: preserve the opaque QUIC/session-stream authority while App consumes only typed Core results.
+- Exclusions: Relay implementation changes, App-Core wire/endpoint changes, App-to-Relay access, raw Herdr bytes, writes, subscriptions, healthy Current, actions and passthrough.
+- Residual risk: Core/App-iOS target/FFI/Keychain/reconnect evidence, Q6 review and Q7 cleanup remain open.
+- Next dependency: keep Relay unchanged until a separately scoped package requires a Relay change.
