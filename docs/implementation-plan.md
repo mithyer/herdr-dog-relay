@@ -2,7 +2,7 @@
 title: Herdr-dog Relay QUIC Implementation Plan
 description: QRM-1 single UDP listener, QUIC TLS 1.3, control/session streams and Unix byte bridge.
 published: true
-date: 2026-08-23T11:25:00+08:00
+date: 2026-08-24T01:43:10+08:00
 tags: herdr-dog, relay, quic, rust, plan
 editor: markdown
 dateCreated: 2026-08-22T00:10:00+08:00
@@ -12,7 +12,7 @@ dateCreated: 2026-08-22T00:10:00+08:00
 
 ## Current status
 
-Status: `checkpointed` for QRM-1 Q7 Legacy Cleanup at Relay commit `a2dd9dc`. Q4 weak-network validation, Q5 mb17 one-port/two-session read-only evidence and Q6 App/embedded Core integration are checkpointed. Q7 removed active legacy configuration/test references without adding Relay behavior. The implementation directly replaces previous TCP, listener-class, Broker, HDRL/HDBD, per-session data-port and relay-child entry points; service provisioning, Keychain lifecycle and QRM overall acceptance remain open.
+Status: `active` for QRM-PROD-1 after QRM-1 Q7 checkpoint at Relay `a2dd9dc`/`d30dea3`. Q4 weak-network, Q5 mb17 one-port/two-session read-only evidence, Q6 App/embedded Core integration and Q7 cleanup remain checkpointed; this package adds only protected-file PKI, same-port enrollment, per-App allowlist/admin, stable-latest update and macOS/Linux supervision. Herdr parsing, writes, subscriptions, healthy Current, actions, passthrough and automatic retry remain excluded.
 
 ## Architecture
 
@@ -65,12 +65,17 @@ src/bin/herdogrelay.rs   one-port CLI host
 | Q4 | weak-network injection and reconnect | checkpointed | stream isolation, new epochs/handles and memory bounds |
 | Q5 | mb17 one-port/two-session read-only evidence | checkpointed | typed ping/snapshot and socket-failure isolation |
 | Q6 | hidden App transport consumer | checkpointed | no Relay source change; Core/App-iOS target baseline and typed boundary |
-| Q7 | remove remaining conflicting files and checkpoint | checkpointed | current QRM-only source/config/docs after cleanup, 46-test quality/review/checkpoint gates |
+| QRM-PROD-1 | protected-file PKI, enrollment ALPN, App allowlist/admin, stable-latest updater, LaunchAgent/systemd templates | active | contract/fake, local service/update tests, fresh review and authorized mb17 deployment evidence |
+
+## QRM-PROD-1 Relay boundary
+
+- Normal `herdr-dog-relay-quic/1` remains mandatory mTLS plus active allowlist before `DeviceHello` becomes usable.
+- `herdr-dog-relay-enroll/1` is a terminal one-attempt path for bounded Core authorization, CSR and public certificate return; it cannot open QRM/session/Herdr paths.
+- Relay never stores Root signing key or App private key. Protected device Intermediate key use, allowlist atomicity, update staging/checksum/rollback and service supervision require dedicated tests.
 
 ## Verification commands
 
 ```text
-cargo test --manifest-path relay/Cargo.toml --locked --all-targets --all-features
 cargo clippy --manifest-path relay/Cargo.toml --locked --all-targets --all-features -- -D warnings
 cargo fmt --manifest-path relay/Cargo.toml --all -- --check
 cargo doc --manifest-path relay/Cargo.toml --all-features --no-deps
@@ -81,7 +86,7 @@ Q1 tests prove only bounded contract/fake behavior. Q2-Q5 are required before an
 
 ## Stop conditions
 
-Block QRM-1 when TLS is absent, invalid authority reaches Herdr, one session sees another session's bytes, a session error kills unrelated streams, buffers are unbounded, or any diagnostic contains payload/token/certificate material.
+Block QRM-PROD-1 when normal QRM lacks TLS/active allowlist enforcement, enrollment and normal QRM share unbounded quotas, invalid authority reaches Herdr, one session sees another session's bytes, a session error kills unrelated streams, buffers or certificate requests are unbounded, updater extraction accepts unsafe archive entries, rollback cannot restore the previous binary, or diagnostics contain payload/token/certificate material. QRM-1 carrier stop conditions remain inherited and unchanged.
 
 ## Checkpoint Log
 
@@ -200,3 +205,43 @@ Block QRM-1 when TLS is absent, invalid authority reaches Herdr, one session see
 - Exclusions: no legacy fallback, new protocol behavior, Herdr parsing, App-Core changes, deployment changes, writes, subscriptions, healthy Current, actions or passthrough.
 - Residual risk: long-term supervision/PKI, real native/device evidence, empty build-artifact directories and QRM overall acceptance remain open.
 - Next dependency: complete the ordered App-iOS and parent Wiki checkpoints.
+
+[active](1-215) 2026-08-23 | QRM-PROD-1 Relay deployment/enrollment/update boundary activated
+- Repository state: Relay documentation changes are uncommitted; QRM-1 implementation/status checkpoints and unrelated deployment/Herdr content remain preserved.
+- Validation: protected Root/Intermediate material boundary, enrollment ALPN isolation, allowlist/admin state, stable-latest updater, checksum/rollback and macOS/Linux supervision decisions are registered.
+- Scope: Relay-local contract and later production lifecycle only; normal QRM opaque byte bridge remains unchanged.
+- Exclusions: Root private key, App private key, Herdr parsing, writes, subscriptions, healthy Current, actions, passthrough, automatic retry and Windows service/credential adapter.
+- Residual risk: P1 fake, certificate parsing/issuance, protected persistence, service lifecycle, updater failure paths and mb17 evidence remain open.
+- Next dependency: complete structure/scope review, then add Relay-side P1 contract/fake with Core wire parity.
+
+[active](1-223) 2026-08-23 | QRM-PROD-1 P0 correction validation
+- Repository state: Relay implementation-plan changes are uncommitted; QRM-1 Relay source/status checkpoints and unrelated content remain preserved; no source, secret or deployment change was made.
+- Validation: protected Root/Intermediate boundary, enrollment quota isolation, local revocation, allowlist generation, safe archive extraction, stable-latest checksum and supervision decisions are synchronized.
+- Scope: Relay security/control boundary only; opaque Herdr bridge and normal QRM authority remain unchanged.
+- Exclusions: Root/App private material, Herdr parsing, writes, subscriptions, healthy Current, actions, passthrough, automatic retry and Windows support.
+- Residual risk: post-fix review, P1 fake, certificate/allowlist/update implementation and mb17 evidence remain open.
+- Next dependency: pass the corrected documentation review before Relay source changes.
+
+[active](1-231) 2026-08-23 | QRM-PROD-1 P0 security/structure correction
+- Repository state: Relay implementation-plan changes are uncommitted; QRM-1 source/status checkpoints and unrelated content remain preserved; no source, secret or deployment change was made.
+- Validation: Core-mtls enrollment origin/challenge, independent quotas, local revoke/allowlist closure, safe archive extraction, Linux artifact requirement and restored verification heading are synchronized.
+- Scope: Relay security/control boundary only; opaque Herdr bridge and normal QRM authority remain unchanged.
+- Exclusions: Root/App private material, Herdr parsing, writes, subscriptions, healthy Current, actions, passthrough, automatic retry and Windows support.
+- Residual risk: final review, P1 fake, certificate/allowlist/update implementation and mb17 evidence remain open.
+- Next dependency: complete the final P0 review before Relay source changes.
+
+[implemented](1-239) 2026-08-24 | QRM-PROD-1 Relay P1 contract/fake implementation completed locally
+- Repository state: Relay P1 source/tests and implementation-plan changes are uncommitted; QRM-1 Relay checkpoints and unrelated deployment/Herdr content remain preserved; no deployment or secret material was changed.
+- Validation: Relay locked tests passed 55, Clippy with warnings denied, rustfmt, rustdoc and diff checks passed; Core 312 passed/2 ignored with fuzz-crate checks and App hosted XCTest passed 37 tests.
+- Scope: Relay enrollment/allowlist/revocation/update/service contracts, deterministic CA/CSR/worker fakes, redaction tests, decode-only `relay.update` registry and fail-closed control dispatch.
+- Exclusions: real TLS/ALPN serving, protected material loading, remote updater, service installation, mb17 deployment, Herdr parsing, writes, subscriptions, healthy Current, actions, passthrough and automatic retry.
+- Residual risk: fresh post-fix read-only review and selective checkpoint remain; certificate issuance, persistence, supervision and updater behavior are not evidenced.
+- Next dependency: complete the fresh P1 review/fix gate, then append validated/accepted evidence before P2.
+
+[accepted](1-247) 2026-08-24 | QRM-PROD-1 Relay P1 contract/fake accepted
+- Repository state: Relay P1 source/tests and documentation remain uncommitted; QRM-1 checkpoints and unrelated content are preserved; no deployment or secret material was changed.
+- Validation/review: Relay 55 passed with Clippy, rustfmt, rustdoc and diff gates; final fresh dual review found no P0-P2 findings.
+- Scope: Relay enrollment/allowlist/revocation/update/service contracts, deterministic CA/CSR/worker fakes, redaction tests, decode-only `relay.update` and fail-closed control dispatch.
+- Exclusions: real TLS/ALPN serving, protected material loading, remote updater, service installation, mb17 deployment, Herdr parsing, writes, subscriptions, healthy Current, actions, passthrough and automatic retry.
+- Residual risk: P3 fake-parity items and production certificate issuance, persistence, supervision and updater behavior remain deferred; selective Relay checkpointing is still required.
+- Next dependency: selectively checkpoint Relay, then continue App-iOS/parent checkpointing before P2.

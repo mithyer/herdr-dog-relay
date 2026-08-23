@@ -93,6 +93,8 @@ pub enum HdqmKind {
     GoAway = 10,
     /// Stable failure response.
     ErrorResponse = 11,
+    /// Stable-latest Relay update request; execution remains P2-gated.
+    RelayUpdate = 12,
 }
 
 impl TryFrom<u8> for HdqmKind {
@@ -112,6 +114,7 @@ impl TryFrom<u8> for HdqmKind {
             9 => Ok(Self::Heartbeat),
             10 => Ok(Self::GoAway),
             11 => Ok(Self::ErrorResponse),
+            12 => Ok(Self::RelayUpdate),
             _ => Err(QuicProtocolError::UnknownKind),
         }
     }
@@ -918,6 +921,12 @@ mod tests {
             HdqmFrame::decode(&invalid),
             Err(QuicProtocolError::UnknownKind)
         );
+    }
+
+    // TEST:relay/src/quic_wire.rs[tests::relay_update_kind_is_registered]
+    #[test]
+    fn relay_update_kind_is_registered() {
+        assert_eq!(HdqmKind::try_from(12), Ok(HdqmKind::RelayUpdate));
     }
 
     // TEST:relay/src/quic_wire.rs[tests::relay_hdqs_binding_round_trips]

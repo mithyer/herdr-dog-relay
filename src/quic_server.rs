@@ -661,7 +661,8 @@ impl QuicRelayServer {
             | HdqmKind::SessionPrepareAck
             | HdqmKind::SessionOpened
             | HdqmKind::SessionClosed
-            | HdqmKind::ErrorResponse => {
+            | HdqmKind::ErrorResponse
+            | HdqmKind::RelayUpdate => {
                 return Err(RelayError::QuicProtocol {
                     reason: "unexpected control frame kind",
                 });
@@ -1551,6 +1552,77 @@ idle_timeout_secs = 900
             HdqmKind::DeviceHelloAck
         );
         (endpoint, connection, send, recv)
+    }
+
+    // TEST:relay/src/quic_server.rs[tests::qrm_relay_update_is_rejected_before_execution]
+    #[tokio::test(flavor = "current_thread")]
+    async fn qrm_relay_update_is_rejected_before_execution() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let root = fs::canonicalize(std::env::temp_dir())
+            .expect("canonical temp root")
+            .join(format!("qrm-update-reject-{}-{nonce}", std::process::id()));
+        fs::create_dir_all(&root).expect("root");
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).expect("root mode");
+        let server_cert =
+            rcgen::generate_simple_self_signed(vec!["localhost".to_owned()]).expect("server cert");
+        let server_cert_path = root.join("server.pem");
+        let server_key_path = root.join("server.key");
+        fs::write(&server_cert_path, server_cert.cert.pem()).expect("server cert file");
+        fs::write(&server_key_path, server_cert.signing_key.serialize_pem())
+            .expect("server key file");
+        let port = std::net::UdpSocket::bind("127.0.0.1:0")
+            .expect("free UDP port")
+            .local_addr()
+            .expect("UDP address")
+            .port();
+        let config = RelayConfig::from_toml_str(&format!(
+            "[listener]\nlisten_address=\"127.0.0.1\"\nport={port}\n[security]\nmode=\"development_unverified\"\nserver_certificate=\"{}\"\nserver_private_key=\"{}\"\ntrusted_client_ca=\"{}\"\n[limits]\nmax_connections=64\nmax_sessions_per_connection=64\nmax_control_frame_bytes=65536\nbuffer_bytes=65536\nhandshake_timeout_secs=5\nidle_timeout_secs=900\n",
+            server_cert_path.display(),
+            server_key_path.display(),
+            server_cert_path.display()
+        ))
+        .expect("config");
+        let server = QuicRelayServer::bind_with_socket_path(config, 16, root.join("missing.sock"))
+            .await
+            .expect("bind server");
+        let address = server.local_addr().expect("address");
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let server_task = tokio::spawn(server.serve_until(async move {
+            let _ = shutdown_rx.await;
+        }));
+        let (_endpoint, connection, mut control_send, mut control_recv) =
+            connect_dev_client(server_cert.cert.der().to_vec(), address).await;
+        send_control_frame(
+            &mut control_send,
+            HdqmFrame {
+                kind: HdqmKind::RelayUpdate,
+                request_id: [9; 16],
+                payload: Vec::new(),
+            },
+        )
+        .await
+        .expect("relay.update frame");
+        tokio::time::timeout(Duration::from_secs(1), connection.closed())
+            .await
+            .expect("unsupported relay.update must close the connection");
+        let no_response = tokio::time::timeout(
+            Duration::from_millis(100),
+            read_control_frame(&mut control_recv),
+        )
+        .await;
+        assert!(
+            no_response.is_err() || matches!(no_response, Ok(Err(_))),
+            "unsupported relay.update must not receive an execution response"
+        );
+        let _ = shutdown_tx.send(());
+        server_task
+            .await
+            .expect("server task")
+            .expect("server result");
+        fs::remove_dir_all(root).expect("cleanup");
     }
 
     // TEST:relay/src/quic_server.rs[tests::qrm_malformed_hdqs_gets_fixed_rejection]

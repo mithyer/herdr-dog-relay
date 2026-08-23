@@ -12,6 +12,8 @@ compile_error!("herdr-dog-relay currently supports Unix hosts only");
 pub mod bridge;
 /// QRM-1 single-listener configuration.
 pub mod config;
+/// Schema-neutral QRM-PROD-1 enrollment, allowlist, and update contracts/fakes.
+pub mod enrollment;
 /// Redacted Relay errors.
 pub mod error;
 /// QRM-1 bounded QUIC server owner and connection lifecycle.
@@ -22,3 +24,12 @@ pub mod quic_wire;
 pub mod session_registry;
 /// Validated Herdr Unix socket access.
 pub mod socket;
+/// QRM-PROD-1 enrollment/allowlist/update contract and deterministic fake surface.
+pub use enrollment::{
+    AUTHORITY_BYTES, AUTHORIZATION_ID_BYTES, AllowlistEntry, AllowlistRegistry, AllowlistRole,
+    AllowlistState, AppId, CERTIFICATE_VALIDITY_SECS, CertificateMetadata, CoreAuthorization,
+    CsrDigest, CsrMetadata, ENROLLMENT_TTL_SECS, EnrollmentChallenge, EnrollmentError,
+    EnrollmentOutcome, EnrollmentSubmission, FakeCertificateAuthority, FakeRelayEnrollment,
+    FakeUpdateWorker, Fingerprint, MAX_APP_ID_BYTES, MAX_CSR_BYTES, STABLE_LATEST_SELECTOR,
+    UpdateRequest, UpdateSelector, UpdateStatus,
+};
