@@ -12,7 +12,7 @@ dateCreated: 2026-08-22T00:10:00+08:00
 
 ## Current status
 
-Status: `accepted` for QRM-1 Q3; QRM-1 remains active with Q4 weak-network and Q5 mb17 evidence planned. The implementation directly replaces the previous TCP, listener-class, Broker, HDRL/HDBD, per-session data-port and relay-child entry points. The Relay remains an opaque byte bridge and never parses Herdr protocol.
+Status: `active` for QRM-1; Q4 weak-network validation is checkpointed as a Core-owned test-only phase and Q5 mb17 evidence remains planned. The implementation directly replaces the previous TCP, listener-class, Broker, HDRL/HDBD, per-session data-port and relay-child entry points. The Relay remains an opaque byte bridge and never parses Herdr protocol.
 
 ## Architecture
 
@@ -62,7 +62,7 @@ src/bin/herdogrelay.rs   one-port CLI host
 | Q1 | codec, fake SessionRegistry, authority matrix and three-session tests | accepted | malformed/no-forward tests, locked quality gates and read-only review |
 | Q2 | Quinn UDP server, TLS/mTLS, ALPN, HDQM and HDQS streams | accepted | loopback TLS, stream isolation, stale heartbeat and capacity rejection |
 | Q3 | Unix socket bridge, deadlines, EOF and redacted cleanup | accepted | socket replacement, bounded buffers and lifecycle tests |
-| Q4 | weak-network injection and reconnect | planned | stream isolation, new epochs/handles and memory bounds |
+| Q4 | weak-network injection and reconnect | checkpointed | stream isolation, new epochs/handles and memory bounds |
 | Q5 | mb17 one-port/two-session read-only evidence | planned | typed ping/snapshot only |
 | Q6 | hidden App transport consumer | planned | typed App boundary and Keychain identity |
 | Q7 | remove remaining conflicting files and checkpoint | planned | current QRM-only source/config/docs |
@@ -107,4 +107,34 @@ Block QRM-1 when TLS is absent, invalid authority reaches Herdr, one session see
 - Scope: exact rejection cleanup, malformed HDQS InvalidFrame closure, bounded control/bridge lease handling, authority redaction, production verified-mode gating and normalized socket routing.
 - Exclusions: Q4 weak-network, Q5 mb17, Q6 App transport, Herdr parsing, actions, subscriptions, healthy Current and passthrough.
 - Residual risk: Q4 weak-network and Q5 deployed evidence remain open; they are not implied by this checkpoint.
-- Next dependency: keep Q4/Q5 planned until their independent evidence gates are authorized.
+- Next dependency: continue Q4 weak-network validation while keeping Q5 planned.
+
+[active](1-118) 2026-08-22 | QRM-1 Relay Q4 weak-network validation active
+- Repository state: Relay Q3 checkpoints are committed; Q4 test-only weak-network validation is beginning without production listener or wire changes.
+- Validation: Q3 Relay named tests and quality gates remain recorded; Q4 evidence is not yet claimed.
+- Scope: deterministic loss/delay/reorder proxy coverage, bounded queue/bridge behavior, stream isolation and connection-loss cleanup.
+- Exclusions: Q5 mb17, Q6 App transport, Herdr parsing, actions, subscriptions, healthy Current and passthrough.
+- Residual risk: packet-level and memory-bound evidence remain open.
+- Next dependency: implement and validate the Q4 harness before fresh review.
+
+[active](1-126) 2026-08-23 | QRM-1 Relay Q4 evidence alignment
+- Repository state: Q4 remains the active test-only package; the Core-owned LossyUdpProxy and real-Quinn loopback harness provide the weak-network evidence around the existing Relay transport, and no Relay production source change is introduced by this phase.
+- Validation: the focused Core Q4 suite and the fresh read-only review are complete; the parent-led control-priority proof correction and the full Core/Relay quality battery remain pending before checkpointing.
+- Scope: deterministic loss/delay/reorder, bounded packet/byte queues, control-stream priority, stream isolation, connection-loss cleanup and fresh-authority evidence supplied by the shared QRM harness.
+- Exclusions: Q5 mb17, Q6 App transport, Herdr parsing, actions, subscriptions, healthy Current and passthrough.
+- Residual risk: full serialized validation, post-fix review, and selective Core/Relay checkpointing remain open; local evidence is not deployment evidence.
+- Next dependency: complete the parent-led P2 correction, rerun the quality battery, then append the final Q4 acceptance/checkpoint record.
+
+[active](1-134) 2026-08-23 | QRM-1 Relay Q4 post-fix validation checkpoint
+- Repository state: Q4 remains test-only and introduces no Relay production source change; Core/Relay quality and parent documentation changes are uncommitted, while unrelated content remains preserved.
+- Validation: Core passed 313 serial all-target/all-feature tests and Relay passed 46 locked tests with Clippy, rustfmt, rustdoc, fuzz and diff gates; the session close-order and pre-`SessionClosed` stall corrections are validated. The specified fresh GLM review remains pending.
+- Scope: deterministic loss/delay/reorder, bounded packet/byte queues, heartbeat/close control progress during session flow-control stall, stream isolation and fresh-authority evidence.
+- Exclusions: Q5 mb17, Q6 App transport, Herdr parsing, actions, subscriptions, healthy Current, passthrough and automatic retries.
+- Residual risk: Q4 is active and uncheckpointed; local Core harness evidence is not deployed Relay or mb17 evidence.
+[checkpointed](1-144) 2026-08-23 | QRM-1 Relay Q4 weak-network implementation gate checkpointed
+- Repository state: Q4 adds no Relay production source; Core implementation/status checkpoints are `bbc39b9`/`a44ef6d`, and this Relay plan/status checkpoint is selective.
+- Validation: Core passed 313 tests and Relay passed 46 locked tests with Clippy, rustfmt, rustdoc, fuzz and diff checks; Luna max review P1/P2 findings were closed and revalidated.
+- Scope: stream isolation, bounded packet/byte queues, deterministic loss/delay/reorder, control progress under flow-control stall and reconnect authority invalidation.
+- Exclusions: Q5 mb17, Q6 App transport, Herdr parsing, actions, subscriptions, healthy Current, passthrough and deployment claims.
+- Residual risk: P3 no-replay assertion hardening and real deployment evidence remain open.
+- Next dependency: keep Q5 planned until its own deployment/evidence gate is activated.

@@ -12,7 +12,7 @@ dateCreated: 2026-08-22T00:10:00+08:00
 
 ## Current status
 
-Status: `accepted` for QRM-1 Q3; deployed endpoint evidence remains planned.
+Status: `active` for QRM-1; Q4 weak-network validation is checkpointed and deployed endpoint evidence remains planned.
 
 ## Contract
 
@@ -37,4 +37,18 @@ Configuration tests reject zero/invalid ports, unknown fields, plaintext mode, m
 - Scope: generic UDP endpoint and QUIC stream multiplexing.
 - Exclusions: port ranges, network classes, Broker discovery and per-session data ports.
 - Residual risk: deployed UDP reachability remains open.
+- Next dependency: keep Q5 endpoint validation planned.
+
+[active](1-51) 2026-08-22 | QRM-1 Relay Q4 endpoint validation active
+- Repository state: endpoint policy and Q3 implementation are checkpointed; Q4 test-only network disturbance validation is beginning.
+- Validation: fixed endpoint/no-fallback policy remains tested; Q4 evidence is not yet claimed.
+- Scope: UDP endpoint behavior under deterministic disturbance and reconnect.
+- Exclusions: port ranges, network classes, Broker discovery and per-session data ports.
+- Residual risk: deployed UDP reachability remains open.
+[checkpointed](1-59) 2026-08-23 | QRM-1 Relay Q4 endpoint validation checkpointed
+- Repository state: endpoint policy and Core Q4 implementation/status checkpoints `bbc39b9`/`a44ef6d` are preserved; Relay has no Q4 production endpoint change and this document is selectively checkpointed.
+- Validation: fixed endpoint/no-fallback policy remains tested; Core/Relay quality gates and the Luna max review correction loop pass.
+- Scope: UDP endpoint behavior under deterministic disturbance and reconnect.
+- Exclusions: port ranges, network classes, Broker discovery and per-session data ports.
+- Residual risk: deployed UDP reachability and Q5 mb17 evidence remain open.
 - Next dependency: keep Q5 endpoint validation planned.

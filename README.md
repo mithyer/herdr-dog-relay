@@ -12,7 +12,7 @@ dateCreated: 2026-08-22T00:10:00+08:00
 
 ## Current status
 
-QRM-1 Q3 is locally accepted at the implementation/review gate. The Relay target is one user-level `herdogrelay` process, one UDP listener defaulting to `18743`, one QUIC TLS 1.3 connection per Core device and one session stream per Herdr session. Q4 weak-network and Q5 mb17 gates remain planned; no deployment claim is made.
+QRM-1 Q3 is locally accepted and checkpointed at the implementation/review gate. Q4 weak-network validation is checkpointed as a Core-owned test-only package; the Relay target is one user-level `herdogrelay` process, one UDP listener defaulting to `18743`, one QUIC TLS 1.3 connection per Core device and one session stream per Herdr session. Q5 mb17 remains planned; no deployment claim is made.
 
 ## Boundary
 
@@ -20,7 +20,7 @@ The Relay authenticates Core, validates HDQM/HDQS/session authority and bridges 
 
 ## Current implementation
 
-QRM-1 Q3 is locally accepted and checkpointed in the Relay submodule. The local Relay includes the production Quinn UDP server, HDQM/HDQS authority lifecycle, opaque Unix bridge, bounded control/lease handling, malformed-frame rejection, and verified-mode production gating. Local loopback evidence is not mb17 deployment evidence; Q4 weak-network and Q5 mb17 read-only gates remain planned. Actions, subscriptions, healthy `Online + Current` and arbitrary passthrough remain disabled.
+QRM-1 Q3 is locally accepted and checkpointed in the Relay submodule. The local Relay includes the production Quinn UDP server, HDQM/HDQS authority lifecycle, opaque Unix bridge, bounded control/lease handling, malformed-frame rejection, and verified-mode production gating. Q4 is checkpointed as a Core-owned test-only weak-network package; local loopback evidence is not mb17 deployment evidence, and Q5 mb17 read-only gates remain planned. Actions, subscriptions, healthy `Online + Current` and arbitrary passthrough remain disabled.
 
 ## Checkpoint Log
 
@@ -38,4 +38,26 @@ QRM-1 Q3 is locally accepted and checkpointed in the Relay submodule. The local 
 - Scope: production Quinn server/bridge authority, bounded malformed-frame/deadline handling, redacted diagnostics and verified-mode CLI boundary.
 - Exclusions: Q4 weak-network, Q5 mb17 deployment, Q6 App transport, Herdr parsing, actions, subscriptions, healthy Current and passthrough.
 - Residual risk: Q4/Q5 external evidence remains open and is not implied by this checkpoint.
-- Next dependency: keep Q4/Q5 planned until separately authorized and evidenced.
+- Next dependency: implement and validate Q4 before fresh review.
+
+[active](1-49) 2026-08-22 | QRM-1 Relay Q4 weak-network validation active
+- Repository state: Relay Q3 implementation/status checkpoints are committed; Q4 test-only weak-network coverage is being added around the existing QUIC server seams.
+- Validation: Relay Q3 local quality gates remain recorded; Q4 evidence is not yet claimed.
+- Scope: bounded loss/delay/reorder, stream isolation, connection-loss cleanup and no raw payload logging.
+- Exclusions: Q5 mb17 deployment, App transport, Herdr parsing, actions, subscriptions, healthy Current and passthrough.
+- Residual risk: field/mobile loss evidence and Q5 deployment evidence remain open.
+- Next dependency: complete Q4 Core/Relay test validation and fresh review.
+
+[active](1-57) 2026-08-23 | QRM-1 Relay Q4 post-fix validation checkpoint
+- Repository state: Relay Q3 implementation/status checkpoints remain committed; Q4 is test-only and introduces no Relay production source change, while parent and unrelated work remains preserved.
+- Validation: the shared Core Q4 harness and Relay quality gates have passed locally after the control-priority close-order correction; the specified fresh GLM review remains pending.
+- Scope: bounded loss/delay/reorder, QUIC control progress during a stalled session stream, stream isolation, reconnect authority invalidation and no raw payload logging.
+- Exclusions: Q5 mb17 deployment, App transport, Herdr parsing, actions, subscriptions, healthy Current, passthrough and automatic retries.
+- Residual risk: Q4 remains active/uncheckpointed and local harness evidence is not deployed Relay or mb17 evidence.
+[checkpointed](1-68) 2026-08-23 | QRM-1 Relay Q4 weak-network validation checkpointed
+- Repository state: Relay Q4 introduces no production source change; Core implementation checkpoint `bbc39b9` and Core status checkpoint `a44ef6d` are committed, while this Relay documentation checkpoint is selective and unrelated content remains preserved.
+- Validation: the accepted `gpt-5.6-luna` max review's P1/P2 findings were closed by the pre-`SessionClosed` stall assertion, close-session stream retention and synchronized status tails; Core passed 313 tests and Relay passed 46 locked tests with all quality gates.
+- Scope: bounded loss/delay/reorder, QUIC control progress during a stalled session stream, stream isolation, reconnect authority invalidation and no raw payload logging.
+- Exclusions: Q5 mb17 deployment, App transport, Herdr parsing, actions, subscriptions, healthy Current, passthrough and automatic retries.
+- Residual risk: the review's P3 no-replay assertion remains a future hardening gap; local evidence is not deployed Relay or mb17 evidence.
+- Next dependency: keep Q5 planned until its real two-session deployment gate is separately activated.

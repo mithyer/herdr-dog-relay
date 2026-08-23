@@ -12,7 +12,7 @@ dateCreated: 2026-08-22T00:10:00+08:00
 
 ## Current status
 
-Status: `accepted` for QRM-1 Q3; Q4/Q5 external security evidence remains planned. There is one generic UDP listener policy; network class is not a protocol concept.
+Status: `active` for QRM-1; Q4 weak-network validation is checkpointed and Q5 external security evidence remains planned. There is one generic UDP listener policy; network class is not a protocol concept.
 
 ## Required security
 
@@ -39,4 +39,18 @@ QRM tests must cover wrong certificate, missing client identity, wrong ALPN, mal
 - Scope: one generic QUIC listener and multiple isolated streams.
 - Exclusions: plaintext, network classes, arbitrary commands, Herdr parsing and Q4/Q5 evidence claims.
 - Residual risk: certificate provisioning and production evidence remain open.
-- Next dependency: keep Q4/Q5 security validation planned.
+- Next dependency: implement and validate Q4 before fresh review.
+
+[active](1-53) 2026-08-22 | QRM-1 Relay Q4 security validation active
+- Repository state: security policy and Q3 implementation are checkpointed; Q4 test-only network disturbance validation is beginning.
+- Validation: TLS, identity, authority and redaction gates remain recorded; Q4 evidence is not yet claimed.
+- Scope: packet disturbance, bounded queues, stream isolation and reconnect authority invalidation.
+- Exclusions: plaintext, network classes, arbitrary commands, Herdr parsing and Q5 deployment.
+- Residual risk: certificate provisioning and weak-network evidence remain open.
+[checkpointed](1-61) 2026-08-23 | QRM-1 Relay Q4 security validation checkpointed
+- Repository state: security policy and Q3 implementation are checkpointed; Q4 has no Relay production source change, Core implementation/status checkpoints are `bbc39b9`/`a44ef6d`, and this policy record is selective.
+- Validation: Core/Relay TLS, identity, authority, redaction and weak-network quality gates pass; Luna max review P1/P2 findings were closed and revalidated.
+- Scope: packet disturbance, bounded queues, stream isolation, reconnect authority invalidation and fail-closed cleanup.
+- Exclusions: plaintext, network classes, arbitrary commands, Herdr parsing and Q5 deployment.
+- Residual risk: P3 no-replay hardening, certificate provisioning and mb17 evidence remain open.
+- Next dependency: keep Q5 external security evidence planned.

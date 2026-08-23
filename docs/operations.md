@@ -12,7 +12,7 @@ dateCreated: 2026-08-22T00:10:00+08:00
 
 ## Current status
 
-Status: `accepted` for QRM-1 Q3; Q4 weak-network and Q5 mb17 evidence remain planned. `herdogrelay` is one user-level process per remote device. The process owns one UDP listener and multiple session streams.
+Status: `active` for QRM-1; Q4 weak-network validation is checkpointed as test-only and Q5 mb17 evidence remains planned. `herdogrelay` is one user-level process per remote device. The process owns one UDP listener and multiple session streams.
 
 ## Configuration
 
@@ -42,4 +42,18 @@ Run Relay locked tests, Clippy, rustfmt, rustdoc, diff checks, loopback three-se
 - Scope: user-level QUIC Relay operation.
 - Exclusions: old discovery/class listener, arbitrary command execution, payload logging and Q4/Q5 evidence claims.
 - Residual risk: deployment certificate provisioning and mb17 UDP path remain open.
-- Next dependency: keep Q4/Q5 operational validation planned.
+- Next dependency: implement and validate Q4 before fresh review.
+
+[active](1-56) 2026-08-22 | QRM-1 Relay Q4 operations validation active
+- Repository state: Relay Q3 operations and implementation are checkpointed; Q4 test-only weak-network validation is beginning.
+- Validation: one-process/one-port and bounded inspection rules remain recorded; Q4 evidence is not yet claimed.
+- Scope: loss/delay/reorder, connection-loss cleanup and bounded diagnostics.
+- Exclusions: Q5 deployment, payload logging, arbitrary commands and Herdr parsing.
+- Residual risk: weak-network, certificate provisioning and mb17 UDP evidence remain open.
+[checkpointed](1-61) 2026-08-23 | QRM-1 Relay Q4 operations validation checkpointed
+- Repository state: Q4 is test-only with no Relay production source change; Core implementation/status checkpoints are `bbc39b9`/`a44ef6d`, and Relay operations documentation is selectively checkpointed.
+- Validation: Core 313 tests and Relay 46 locked tests plus Clippy, rustfmt, rustdoc, fuzz and diff gates pass; Luna max review P1/P2 findings were fixed and revalidated.
+- Scope: loss/delay/reorder, connection-loss cleanup, bounded diagnostics and control progress during a stalled session.
+- Exclusions: Q5 deployment, payload logging, arbitrary commands, Herdr parsing, actions, subscriptions and healthy Current.
+- Residual risk: P3 no-replay hardening and certificate/mb17 deployment evidence remain open.
+- Next dependency: keep Q5 planned until deployment validation is separately activated.

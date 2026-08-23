@@ -12,7 +12,7 @@ dateCreated: 2026-08-22T00:10:00+08:00
 
 ## Current status
 
-Status: `accepted` for QRM-1 Q3. QRM-1 remains the active Relay package with Q4 weak-network and Q5 mb17 evidence planned. This register replaces the previous listener-class, TCP, Broker and per-session data-port decisions.
+Status: `active` for QRM-1; Q4 weak-network validation is checkpointed and Q5 mb17 evidence remains planned. This register replaces the previous listener-class, TCP, Broker and per-session data-port decisions.
 
 ## Decisions
 
@@ -59,4 +59,34 @@ Q1 requires codec, fake authority and three-session tests. Q2 requires quinn TLS
 - Scope: exact authority rejection cleanup, fixed malformed-HDQS response, bounded bridge/control lease handling, production verified-mode gating and normalized socket routing.
 - Exclusions: Q4 weak-network, Q5 mb17, Herdr parsing, actions, subscriptions, healthy Current and passthrough.
 - Residual risk: Q4/Q5 evidence remains open and is not implied by this checkpoint.
-- Next dependency: keep Q4/Q5 planned until separately authorized and evidenced.
+- Next dependency: implement and validate Q4 before fresh review.
+
+[active](1-73) 2026-08-22 | QRM-1 Relay Q4 decision/evidence gate active
+- Repository state: Relay Q3 checkpoints are committed; Q4 test-only weak-network validation is beginning without production wire changes.
+- Validation: Q3 authority, redaction and bridge gates remain recorded; Q4 packet-level evidence is not yet claimed.
+- Scope: deterministic loss/delay/reorder, bounded bridge queue, stream isolation and connection-loss cleanup.
+- Exclusions: Q5 mb17, App transport, Herdr parsing, actions, subscriptions, healthy Current and passthrough.
+- Residual risk: weak-network and memory-bound evidence remain open.
+- Next dependency: implement and validate Q4 before fresh review.
+
+[active](1-78) 2026-08-23 | QRM-1 Relay Q4 evidence alignment
+- Repository state: Q4 remains the active test-only package; Core owns the LossyUdpProxy and real-Quinn loopback harness around the existing Relay transport, with no Relay production wire or listener change in this phase.
+- Validation: the focused Core Q4 suite and fresh read-only review are complete; the control-priority proof correction, full serialized quality battery and post-fix review remain pending.
+- Scope: deterministic loss/delay/reorder, bounded packet/byte queues, control-stream progress, stream isolation, connection-loss cleanup and fresh-authority evidence.
+- Exclusions: Q5 mb17, App transport, Herdr parsing, actions, subscriptions, healthy Current and passthrough.
+- Residual risk: Q4 remains uncheckpointed, and local harness evidence must not be presented as deployed Relay or mb17 evidence.
+- Next dependency: complete the parent-led P2 correction, rerun the quality battery, then append the final Q4 acceptance/checkpoint record.
+
+[active](1-86) 2026-08-23 | QRM-1 Relay Q4 post-fix validation checkpoint
+- Repository state: Q4 remains test-only with no Relay production source change; Core/Relay quality and parent documentation changes are uncommitted, while unrelated content remains preserved.
+- Validation: Core passed 313 serial all-target/all-feature tests and Relay passed 46 locked tests with Clippy, rustfmt, rustdoc, fuzz and diff gates; session close-order and pre-`SessionClosed` stall corrections are validated. The specified fresh GLM review remains pending.
+- Scope: deterministic loss/delay/reorder, bounded packet/byte queues, heartbeat/close control progress during session flow-control stall, stream isolation and fresh-authority evidence.
+- Exclusions: Q5 mb17, App transport, Herdr parsing, actions, subscriptions, healthy Current, passthrough and automatic retries.
+- Residual risk: Q4 is active and uncheckpointed; local Core harness evidence is not deployed Relay or mb17 evidence.
+[checkpointed](1-94) 2026-08-23 | QRM-1 Relay Q4 decision/evidence gate checkpointed
+- Repository state: Q4 remains test-only with no Relay production source change; Core implementation/status checkpoints are `bbc39b9`/`a44ef6d`, and Relay documentation is selectively checkpointed.
+- Validation: 46 locked Relay tests, Clippy, rustfmt, rustdoc and diff checks pass; Core's 313-test battery and all quality gates pass. Luna max review P1/P2 findings were closed and revalidated.
+- Scope: deterministic loss/delay/reorder, bounded packet/byte queues, control-stream progress, stream isolation, connection-loss cleanup and fresh-authority evidence.
+- Exclusions: Q5 mb17, App transport, Herdr parsing, actions, subscriptions, healthy Current and passthrough.
+- Residual risk: P3 no-replay assertion hardening and real deployment evidence remain open.
+- Next dependency: keep Q5 planned until the real two-session deployment gate is explicitly activated.
