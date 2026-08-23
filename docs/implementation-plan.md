@@ -65,7 +65,7 @@ src/bin/herdogrelay.rs   one-port CLI host
 | Q4 | weak-network injection and reconnect | checkpointed | stream isolation, new epochs/handles and memory bounds |
 | Q5 | mb17 one-port/two-session read-only evidence | checkpointed | typed ping/snapshot and socket-failure isolation |
 | Q6 | hidden App transport consumer | checkpointed | no Relay source change; Core/App-iOS target baseline and typed boundary |
-| Q7 | remove remaining conflicting files and checkpoint | active | current QRM-only source/config/docs after baseline, cleanup, quality and review gates |
+| Q7 | remove remaining conflicting files and checkpoint | checkpointed | current QRM-only source/config/docs after cleanup, 46-test quality/review/checkpoint gates |
 
 ## Verification commands
 
