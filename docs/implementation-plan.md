@@ -184,3 +184,11 @@ Block QRM-1 when TLS is absent, invalid authority reaches Herdr, one session see
 - Inventory findings: tracked Relay source contains no legacy Broker/HDBR/HDBD/HDRL/TCP implementation; `src/config.rs` retains only a stale network-class rejection test/config probe for Q7 removal or rewrite.
 - Exclusions/residual risk: QRM QUIC listener, SessionRegistry, TLS/ALPN and opaque bridge remain unchanged; config/test cleanup and final review remain open.
 - Next dependency: implement Q7 cleanup from the recorded active-entrypoint inventory.
+
+[accepted](1-194) 2026-08-23 | QRM-1 Relay Q7 legacy cleanup accepted at review gate
+- Repository state: Relay Q7 source/test cleanup is present but uncommitted; deployment artifacts, Herdr generated content and unrelated Relay work remain excluded.
+- Validation: 46 locked tests passed with Clippy warnings denied, rustfmt, rustdoc and diff checks; fresh dual review found no P0-P2.
+- Scope: retained the generic single-port QUIC TLS 1.3 listener, HDQM/HDQS SessionRegistry and opaque Unix bridge; replaced the stale network-class test with explicit unknown-table rejection.
+- Exclusions: no legacy fallback, new protocol behavior, Herdr parsing, App-Core changes, deployment changes, writes, subscriptions, healthy Current, actions or passthrough.
+- Residual risk: long-term supervision/PKI, real native/device evidence, empty build-artifact directories and QRM overall acceptance remain open.
+- Next dependency: checkpoint Core, then Relay and App-iOS, and finally synchronize parent status/gitlinks.

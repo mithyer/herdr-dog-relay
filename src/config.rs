@@ -331,13 +331,10 @@ idle_timeout_secs = 900
         assert_eq!(config.limits().max_sessions_per_connection(), 64);
     }
 
-    // TEST:relay/src/config.rs[tests::unknown_network_class_is_rejected]
+    // TEST:relay/src/config.rs[tests::legacy_network_tables_are_rejected]
     #[test]
-    fn unknown_network_class_is_rejected() {
-        let invalid = VALID.replace(
-            "[limits]",
-            "[network.tailscale]\nenabled = true\n\n[limits]",
-        );
+    fn legacy_network_tables_are_rejected() {
+        let invalid = VALID.replace("[limits]", "[network]\nclass = \"tailscale\"\n\n[limits]");
         assert!(RelayConfig::from_toml_str(&invalid).is_err());
     }
 

@@ -122,3 +122,11 @@ Q1 requires codec, fake authority and three-session tests. Q2 requires quinn TLS
 - Inventory findings: tracked Relay source has no legacy Broker/HDBR/HDBD/HDRL/TCP implementation; only the stale network-class config rejection test remains in `src/config.rs`.
 - Exclusions/residual risk: QRM TLS/ALPN, generic UDP listener and session authority decisions remain unchanged; cleanup and final review remain open.
 - Next dependency: implement Q7 cleanup from the recorded active-entrypoint inventory.
+
+[accepted](1-132) 2026-08-23 | QRM-1 Relay Q7 legacy cleanup accepted at review gate
+- Repository state: Relay cleanup and explicit generic legacy-network rejection test are uncommitted; no deployment or Herdr generated content changed.
+- Validation: 46 locked Relay tests passed with Clippy warnings denied, rustfmt, rustdoc and diff checks; Core/App quality and fresh dual review found no P0-P2 across the package.
+- Scope: removed the old network-class test semantics and replaced them with fail-closed unknown `[network]` table rejection while retaining generic QRM UDP, TLS/ALPN, SessionRegistry and opaque bridge behavior.
+- Exclusions: no legacy fallback, protocol expansion, Herdr parsing, App-Core changes, deployment, writes, subscriptions, healthy Current, actions or passthrough.
+- Residual risk: Relay PKI/service supervision, real native/device evidence and QRM overall acceptance remain open.
+- Next dependency: checkpoint Core first, then Relay, App-iOS and the parent Wiki in the required order.
