@@ -21,3 +21,6 @@ target
 #.idea/
 
 # Parent Wiki instructions and design documents are tracked as QRM plan inputs.
+
+AGENTS.md
+docs
