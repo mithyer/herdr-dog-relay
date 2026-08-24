@@ -45,6 +45,8 @@ idle_timeout_secs = 900
 enabled = true
 # Protected non-secret JSON allowlist path; do not place it in the repository.
 allowlist_path = "/path/to/herdr-dog/allowlist.json"
+# Protected bounded issuance-result record path for response-lost reconciliation.
+issuance_result_path = "/path/to/herdr-dog/issuance-results.json"
 # Maximum pre-authenticated TLS handshakes held at once.
 max_handshakes = 16
 # Maximum enrollment connections after ALPN selection.

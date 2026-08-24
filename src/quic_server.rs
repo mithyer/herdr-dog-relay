@@ -34,9 +34,12 @@ use crate::{
     enrollment_wire::{
         EnrollmentChallengePayload, EnrollmentFrame, EnrollmentFrameKind, EnrollmentIssuedPayload,
         EnrollmentRejectedPayload, EnrollmentSubmitPayload, EnrollmentWireError,
-        read_frame as read_enrollment_frame, write_frame as write_enrollment_frame,
+        write_frame as write_enrollment_frame,
     },
     error::{RelayError, RelayResult},
+    issuance::{
+        IssuanceBeginResult, IssuanceResultKey, IssuanceResultStatus, PersistentIssuanceResults,
+    },
     material::{
         MAX_PRIVATE_MATERIAL_BYTES, MAX_PUBLIC_MATERIAL_BYTES, ProtectedFileKind, current_uid,
         read_protected_file,
@@ -45,6 +48,12 @@ use crate::{
     quic_wire::{
         DeviceHelloAck, HdqmFrame, HdqmKind, HdqsBinding, HdqsReason, HdqsResponse, SessionOpenAck,
         SessionOpenRequest, SessionPrepareAck, SessionPrepareRequest,
+    },
+    reconciliation_wire::{
+        RECONCILIATION_HEADER_BYTES, RECONCILIATION_MAGIC, RECONCILIATION_VERSION,
+        ReconcilePayload, ReconciliationFrame, ReconciliationFrameKind,
+        ReconciliationResultPayload, ReconciliationStatus,
+        write_frame as write_reconciliation_frame,
     },
     session_registry::SessionRegistry,
     socket::UnixSocketConnector,
@@ -55,8 +64,6 @@ use crate::{
 pub const QRM_RELAY_ALPN: &[u8] = b"herdr-dog-relay-quic/1";
 /// ALPN selected by the terminal App enrollment path.
 pub const QRM_ENROLLMENT_ALPN: &[u8] = b"herdr-dog-relay-enroll/1";
-/// Maximum retained single-use enrollment authorizations per Relay process.
-pub const QRM_MAX_CONSUMED_ENROLLMENT_AUTHORIZATIONS: usize = 4096;
 /// Maximum time allowed for the initial control stream and session bind.
 pub const QRM_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(QRM_HANDSHAKE_TIMEOUT_SECS);
 
@@ -121,6 +128,62 @@ impl AsyncWrite for QuicBiStream {
     }
 }
 
+/// One request frame accepted after the enrollment challenge.
+enum EnrollmentRequestFrame {
+    /// Existing HDE1 Challenge/Submit/Issued/Rejected namespace.
+    V1(EnrollmentFrame),
+    /// HDE version-two response-lost reconciliation namespace.
+    V2(ReconciliationFrame),
+}
+
+/// Reads one bounded HDE1 or HDE version-two request without widening either decoder.
+async fn read_versioned_enrollment_frame(
+    reader: &mut quinn::RecvStream,
+    max_bytes: usize,
+) -> RelayResult<EnrollmentRequestFrame> {
+    let mut header = [0_u8; RECONCILIATION_HEADER_BYTES];
+    reader
+        .read_exact(&mut header)
+        .await
+        .map_err(|_| RelayError::QuicProtocol {
+            reason: "enrollment frame header is invalid",
+        })?;
+    let payload_len = u32::from_be_bytes([header[7], header[8], header[9], header[10]]) as usize;
+    if payload_len > max_bytes {
+        return Err(RelayError::ResourceLimit);
+    }
+    let mut bytes = Vec::with_capacity(RECONCILIATION_HEADER_BYTES + payload_len);
+    bytes.extend_from_slice(&header);
+    let mut payload = vec![0_u8; payload_len];
+    reader
+        .read_exact(&mut payload)
+        .await
+        .map_err(|_| RelayError::QuicProtocol {
+            reason: "enrollment frame payload is invalid",
+        })?;
+    bytes.extend_from_slice(&payload);
+    if header[..4] != RECONCILIATION_MAGIC {
+        return Err(RelayError::QuicProtocol {
+            reason: "enrollment frame magic is invalid",
+        });
+    }
+    match u16::from_be_bytes([header[4], header[5]]) {
+        1 => EnrollmentFrame::decode(&bytes, max_bytes)
+            .map(EnrollmentRequestFrame::V1)
+            .map_err(|_| RelayError::QuicProtocol {
+                reason: "HDE1 enrollment frame is invalid",
+            }),
+        RECONCILIATION_VERSION => ReconciliationFrame::decode(&bytes, max_bytes)
+            .map(EnrollmentRequestFrame::V2)
+            .map_err(|_| RelayError::QuicProtocol {
+                reason: "HDE2 reconciliation frame is invalid",
+            }),
+        _ => Err(RelayError::QuicProtocol {
+            reason: "enrollment frame version is unsupported",
+        }),
+    }
+}
+
 struct SessionTaskControl {
     /// One-shot cancellation authority for the exact session stream.
     cancel: oneshot::Sender<()>,
@@ -148,8 +211,8 @@ pub struct QuicRelayServer {
     enrollment_handshakes: Arc<Semaphore>,
     /// Independent post-ALPN enrollment connection budget.
     enrollment_connections: Arc<Semaphore>,
-    /// In-memory single-use Core authorization IDs invalidated on process restart.
-    consumed_enrollment_authorizations: Arc<Mutex<BTreeMap<[u8; 16], u64>>>,
+    /// Protected durable issuance-result store used for response-lost reconciliation.
+    issuance_results: Option<Arc<Mutex<crate::issuance::PersistentIssuanceResults>>>,
     /// Protected App allowlist required by every bound verified-QRM server.
     ///
     /// Contract-only and test-only unverified owners retain `None` because they never expose
@@ -183,7 +246,7 @@ impl QuicRelayServer {
     /// A server owner that has not opened a UDP socket.
     // TEST:relay/src/quic_server.rs[tests::server_accepts_only_valid_generation]
     pub fn new(config: RelayConfig, relay_generation: u64) -> RelayResult<Self> {
-        Self::new_inner(config, relay_generation, None, None, None, [1; 32])
+        Self::new_inner(config, relay_generation, None, None, None, None, [1; 32])
     }
 
     /// Binds one UDP QUIC endpoint with verified TLS 1.3 mutual authentication.
@@ -326,14 +389,23 @@ impl QuicRelayServer {
             .map_err(|error| RelayError::io("binding QRM UDP listener", error))?;
         let relay_identity = load_relay_identity(&config)?;
         // Enrollment may be disabled, but verified normal QRM still requires an active allowlist.
-        let allowlist = if config.security().mode() == SecurityMode::Verified {
+        let (allowlist, issuance_results) = if config.security().mode() == SecurityMode::Verified {
             let uid = current_uid()?;
-            Some(Arc::new(Mutex::new(PersistentAllowlist::open(
+            let allowlist = Arc::new(Mutex::new(PersistentAllowlist::open(
                 config.enrollment().allowlist_path(),
                 uid,
-            )?)))
+            )?));
+            let issuance_results = config
+                .enrollment()
+                .enabled()
+                .then(|| {
+                    PersistentIssuanceResults::open(config.enrollment().issuance_result_path(), uid)
+                        .map(|store| Arc::new(Mutex::new(store)))
+                })
+                .transpose()?;
+            (Some(allowlist), issuance_results)
         } else {
-            None
+            (None, None)
         };
         Self::new_inner(
             config,
@@ -341,6 +413,7 @@ impl QuicRelayServer {
             Some(endpoint),
             socket_override,
             allowlist,
+            issuance_results,
             relay_identity,
         )
     }
@@ -352,6 +425,7 @@ impl QuicRelayServer {
         endpoint: Option<quinn::Endpoint>,
         socket_override: Option<PathBuf>,
         allowlist: Option<Arc<Mutex<PersistentAllowlist>>>,
+        issuance_results: Option<Arc<Mutex<PersistentIssuanceResults>>>,
         relay_identity: [u8; 32],
     ) -> RelayResult<Self> {
         if relay_generation == 0 {
@@ -374,7 +448,7 @@ impl QuicRelayServer {
             relay_generation,
             relay_identity,
             endpoint,
-            consumed_enrollment_authorizations: Arc::new(Mutex::new(BTreeMap::new())),
+            issuance_results,
             allowlist,
             socket_override,
         })
@@ -957,18 +1031,31 @@ impl QuicRelayServer {
             reason: "enrollment challenge write timeout",
         })?
         .map_err(map_enrollment_wire_error)?;
-        let frame = match timeout(
+        let request_frame = match timeout(
             Duration::from_secs(self.config.enrollment().connection_lifetime_secs()),
-            read_enrollment_frame(&mut recv, self.config.enrollment().max_request_bytes()),
+            read_versioned_enrollment_frame(
+                &mut recv,
+                self.config.enrollment().max_request_bytes(),
+            ),
         )
         .await
         {
             Ok(Ok(frame)) => frame,
-            Ok(Err(error)) => return self.reject_enrollment(&mut send, error).await,
+            Ok(Err(_)) => {
+                return self
+                    .reject_enrollment(&mut send, EnrollmentWireError::InvalidFrame)
+                    .await;
+            }
             Err(_) => {
                 return self
                     .reject_enrollment(&mut send, EnrollmentWireError::ResourceLimit)
                     .await;
+            }
+        };
+        let frame = match request_frame {
+            EnrollmentRequestFrame::V1(frame) => frame,
+            EnrollmentRequestFrame::V2(frame) => {
+                return self.serve_reconciliation_frame(&mut send, frame).await;
             }
         };
         let submission: EnrollmentSubmitPayload =
@@ -983,6 +1070,7 @@ impl QuicRelayServer {
             || submission.challenge != challenge
             || submission_now > expires_at
             || submission.expires_at_epoch_seconds < submission_now
+            || submission.expires_at_epoch_seconds > expires_at
             || submission.core_identity != core_identity.to_bytes()
         {
             return self
@@ -1024,36 +1112,57 @@ impl QuicRelayServer {
             Ok(authorization) => authorization,
             Err(error) => return self.reject_enrollment(&mut send, error.into()).await,
         };
+        let csr_digest = csr.digest();
         if EnrollmentSubmission::new(authorization, csr).is_err() {
             return self
                 .reject_enrollment(&mut send, EnrollmentWireError::AuthorizationRejected)
                 .await;
+        }
+        let Some(issuance_results) = &self.issuance_results else {
+            return self
+                .reject_enrollment(&mut send, EnrollmentWireError::PersistenceFailed)
+                .await;
+        };
+        let key = match IssuanceResultKey::new(submission.authorization_id, *csr_digest.as_bytes())
+        {
+            Ok(key) => key,
+            Err(_) => {
+                return self
+                    .reject_enrollment(&mut send, EnrollmentWireError::AuthorizationRejected)
+                    .await;
+            }
+        };
+        let begin = match issuance_results.lock().await.begin_pending(
+            key,
+            app_id.as_str(),
+            submission.expires_at_epoch_seconds,
+            submission_now,
+        ) {
+            Ok(begin) => begin,
+            Err(error) => {
+                return self
+                    .reject_enrollment(&mut send, map_issuance_error(&error))
+                    .await;
+            }
+        };
+        match begin {
+            IssuanceBeginResult::Created(_) => {}
+            IssuanceBeginResult::Existing(record) => match record.status() {
+                IssuanceResultStatus::Issued | IssuanceResultStatus::Rejected => {
+                    return self.send_reconciled_record(&mut send, &record).await;
+                }
+                IssuanceResultStatus::Pending => {
+                    // A duplicate Submit must never mint another certificate. The pending outcome
+                    // is intentionally surfaced as a closed response so Core uses HDE v2.
+                    return self.finish_unknown_enrollment(&mut send);
+                }
+            },
         }
         let Some(allowlist) = &self.allowlist else {
             return self
                 .reject_enrollment(&mut send, EnrollmentWireError::PersistenceFailed)
                 .await;
         };
-        {
-            let mut consumed = self.consumed_enrollment_authorizations.lock().await;
-            consumed.retain(|_, expiry| *expiry >= submission_now);
-            if consumed.len() >= QRM_MAX_CONSUMED_ENROLLMENT_AUTHORIZATIONS {
-                return self
-                    .reject_enrollment(&mut send, EnrollmentWireError::ResourceLimit)
-                    .await;
-            }
-            if consumed
-                .insert(
-                    submission.authorization_id,
-                    submission.expires_at_epoch_seconds,
-                )
-                .is_some()
-            {
-                return self
-                    .reject_enrollment(&mut send, EnrollmentWireError::AuthorizationRejected)
-                    .await;
-            }
-        }
         let expected_uid = current_uid().map_err(|_| RelayError::QuicAuthentication)?;
         let next_generation = allowlist.lock().await.generation().checked_add(1).ok_or(
             RelayError::ListenerStartup {
@@ -1070,23 +1179,87 @@ impl QuicRelayServer {
             Ok(issued) => issued,
             Err(error) => return self.reject_enrollment(&mut send, error.into()).await,
         };
-        let metadata = match issued.metadata(app_id, next_generation) {
+        let metadata = match issued.metadata(app_id.clone(), next_generation) {
             Ok(metadata) => metadata,
             Err(error) => return self.reject_enrollment(&mut send, error.into()).await,
         };
         let fingerprint = metadata.fingerprint().to_bytes();
         let not_after = metadata.not_after_epoch_seconds();
-        if allowlist.lock().await.enroll(metadata).is_err() {
+        let certificate_chain = issued.certificate_chain();
+        if issuance_results
+            .lock()
+            .await
+            .attach_certificate(
+                key,
+                certificate_chain.clone(),
+                fingerprint,
+                next_generation,
+                not_after,
+                submission_now,
+            )
+            .is_err()
+        {
             return self
                 .reject_enrollment(&mut send, EnrollmentWireError::PersistenceFailed)
                 .await;
         }
+        let allowlist_result = { allowlist.lock().await.enroll(metadata) };
+        let committed_generation = match allowlist_result {
+            Ok(entry) => entry.generation(),
+            Err(crate::enrollment::EnrollmentError::DuplicateEnrollment) => {
+                let snapshot = allowlist.lock().await.snapshot();
+                let app = AppId::new(app_id.as_str().to_owned()).map_err(|_| {
+                    RelayError::QuicProtocol {
+                        reason: "issued App identity is invalid",
+                    }
+                })?;
+                let Some(entry) = snapshot.entry(&app) else {
+                    let _ = issuance_results.lock().await.mark_rejected(
+                        key,
+                        EnrollmentWireError::AuthorizationRejected as u16,
+                        submission_now,
+                    );
+                    return self
+                        .reject_enrollment(&mut send, EnrollmentWireError::AuthorizationRejected)
+                        .await;
+                };
+                if entry.state() != crate::enrollment::AllowlistState::Active
+                    || entry.fingerprint().to_bytes() != fingerprint
+                {
+                    let _ = issuance_results.lock().await.mark_rejected(
+                        key,
+                        EnrollmentWireError::AuthorizationRejected as u16,
+                        submission_now,
+                    );
+                    return self
+                        .reject_enrollment(&mut send, EnrollmentWireError::AuthorizationRejected)
+                        .await;
+                }
+                entry.generation()
+            }
+            Err(_) => return self.finish_unknown_enrollment(&mut send),
+        };
+        if issuance_results
+            .lock()
+            .await
+            .mark_issued(
+                key,
+                certificate_chain.clone(),
+                fingerprint,
+                committed_generation,
+                not_after,
+                submission_now,
+            )
+            .is_err()
+        {
+            return self.finish_unknown_enrollment(&mut send);
+        }
         let response = EnrollmentFrame::json(
             EnrollmentFrameKind::Issued,
             &EnrollmentIssuedPayload {
-                certificate_chain: issued.certificate_chain(),
+                certificate_chain,
                 fingerprint,
-                allowlist_generation: next_generation,
+                allowlist_generation: committed_generation,
                 not_after_epoch_seconds: not_after,
             },
             self.config.enrollment().max_request_bytes(),
@@ -1117,6 +1290,198 @@ impl QuicRelayServer {
         .await;
         connection.close(0u32.into(), b"enrollment complete");
         Ok(())
+    }
+
+    /// Serves one authenticated HDE version-two reconciliation request.
+    async fn serve_reconciliation_frame(
+        &self,
+        send: &mut quinn::SendStream,
+        frame: ReconciliationFrame,
+    ) -> RelayResult<()> {
+        let request: ReconcilePayload = frame
+            .parse_json(ReconciliationFrameKind::Reconcile)
+            .map_err(|_| RelayError::QuicProtocol {
+                reason: "reconciliation request is invalid",
+            })?;
+        let key =
+            IssuanceResultKey::new(request.authorization_id, request.csr_digest).map_err(|_| {
+                RelayError::QuicProtocol {
+                    reason: "reconciliation binding is invalid",
+                }
+            })?;
+        let now = current_epoch_seconds().map_err(|_| RelayError::QuicHandshake {
+            reason: "enrollment clock unavailable",
+        })?;
+        let mut result = self
+            .issuance_results
+            .as_ref()
+            .ok_or(RelayError::ConfigurationRead)?
+            .lock()
+            .await
+            .reconcile(key, now)?;
+        let pending_material = result.as_ref().and_then(|record| {
+            if record.status() != IssuanceResultStatus::Pending
+                || record.certificate_chain().is_empty()
+            {
+                return None;
+            }
+            Some((
+                record.key(),
+                record.app_id().to_owned(),
+                record.certificate_chain().to_vec(),
+                record.fingerprint()?,
+                record.allowlist_generation()?,
+                record.not_after_epoch_seconds()?,
+            ))
+        });
+        if let Some((pending_key, app_id, chain, fingerprint, generation, not_after)) =
+            pending_material
+        {
+            let app = AppId::new(app_id).map_err(|_| RelayError::ConfigurationRead)?;
+            let allowlist_matches = if let Some(allowlist) = &self.allowlist {
+                let mut allowlist = allowlist.lock().await;
+                allowlist.reload()?;
+                let snapshot = allowlist.snapshot();
+                snapshot.entry(&app).is_some_and(|entry| {
+                    entry.state() == crate::enrollment::AllowlistState::Active
+                        && entry.fingerprint().to_bytes() == fingerprint
+                        && entry.generation() == generation
+                })
+            } else {
+                false
+            };
+            if allowlist_matches {
+                result = Some(
+                    self.issuance_results
+                        .as_ref()
+                        .ok_or(RelayError::ConfigurationRead)?
+                        .lock()
+                        .await
+                        .mark_issued(pending_key, chain, fingerprint, generation, not_after, now)?,
+                );
+            }
+        }
+        let payload = reconciliation_payload(result.as_ref())?;
+        payload.validate().map_err(|_| RelayError::QuicProtocol {
+            reason: "reconciliation result is invalid",
+        })?;
+        let response = ReconciliationFrame::json(
+            ReconciliationFrameKind::Result,
+            &payload,
+            self.config.enrollment().max_request_bytes(),
+        )
+        .map_err(|_| RelayError::QuicProtocol {
+            reason: "reconciliation result exceeds bounds",
+        })?;
+        timeout(
+            self.handshake_timeout(),
+            write_reconciliation_frame(
+                send,
+                &response,
+                self.config.enrollment().max_request_bytes(),
+            ),
+        )
+        .await
+        .map_err(|_| RelayError::QuicHandshake {
+            reason: "reconciliation response write timeout",
+        })?
+        .map_err(|_| RelayError::QuicProtocol {
+            reason: "reconciliation response write failed",
+        })?;
+        send.finish().map_err(|_| RelayError::QuicProtocol {
+            reason: "finishing reconciliation connection",
+        })?;
+        let _ = timeout(
+            Duration::from_secs(self.config.enrollment().connection_lifetime_secs()),
+            send.stopped(),
+        )
+        .await;
+        Ok(())
+    }
+
+    /// Finishes one unresolved enrollment connection without creating a terminal rejection.
+    fn finish_unknown_enrollment(&self, send: &mut quinn::SendStream) -> RelayResult<()> {
+        send.finish().map_err(|_| RelayError::QuicProtocol {
+            reason: "finishing unresolved enrollment connection",
+        })
+    }
+
+    /// Sends one durable reconciliation record without exposing private material.
+    async fn send_reconciled_record(
+        &self,
+        send: &mut quinn::SendStream,
+        record: &crate::issuance::IssuanceResultRecord,
+    ) -> RelayResult<()> {
+        match record.status() {
+            IssuanceResultStatus::Issued => {
+                let (Some(fingerprint), Some(allowlist_generation), Some(not_after_epoch_seconds)) = (
+                    record.fingerprint(),
+                    record.allowlist_generation(),
+                    record.not_after_epoch_seconds(),
+                ) else {
+                    return self
+                        .reject_enrollment(send, EnrollmentWireError::PersistenceFailed)
+                        .await;
+                };
+                let frame = EnrollmentFrame::json(
+                    EnrollmentFrameKind::Issued,
+                    &EnrollmentIssuedPayload {
+                        certificate_chain: record.certificate_chain().to_vec(),
+                        fingerprint,
+                        allowlist_generation,
+                        not_after_epoch_seconds,
+                    },
+                    self.config.enrollment().max_request_bytes(),
+                )
+                .map_err(map_enrollment_wire_error)?;
+                timeout(
+                    self.handshake_timeout(),
+                    write_enrollment_frame(
+                        send,
+                        &frame,
+                        self.config.enrollment().max_request_bytes(),
+                    ),
+                )
+                .await
+                .map_err(|_| RelayError::QuicHandshake {
+                    reason: "reconciled issuance response write timeout",
+                })?
+                .map_err(map_enrollment_wire_error)?;
+                send.finish().map_err(|_| RelayError::QuicProtocol {
+                    reason: "finishing reconciled enrollment connection",
+                })?;
+                Ok(())
+            }
+            IssuanceResultStatus::Rejected => {
+                let code = record
+                    .rejection_code()
+                    .ok_or(RelayError::ConfigurationRead)?;
+                let frame = EnrollmentFrame::json(
+                    EnrollmentFrameKind::Rejected,
+                    &EnrollmentRejectedPayload { code },
+                    self.config.enrollment().max_request_bytes(),
+                )
+                .map_err(map_enrollment_wire_error)?;
+                timeout(
+                    self.handshake_timeout(),
+                    write_enrollment_frame(
+                        send,
+                        &frame,
+                        self.config.enrollment().max_request_bytes(),
+                    ),
+                )
+                .await
+                .map_err(|_| RelayError::QuicHandshake {
+                    reason: "reconciled rejection response write timeout",
+                })?
+                .map_err(map_enrollment_wire_error)?;
+                send.finish().map_err(|_| RelayError::QuicProtocol {
+                    reason: "finishing reconciled rejection connection",
+                })?;
+                Ok(())
+            }
+            IssuanceResultStatus::Pending => self.finish_unknown_enrollment(send),
+        }
     }
 
     /// Sends one sanitized terminal enrollment rejection and closes the stream.
@@ -1408,9 +1773,7 @@ impl QuicRelayServer {
             pre_auth_handshakes: Arc::clone(&self.pre_auth_handshakes),
             enrollment_handshakes: Arc::clone(&self.enrollment_handshakes),
             enrollment_connections: Arc::clone(&self.enrollment_connections),
-            consumed_enrollment_authorizations: Arc::clone(
-                &self.consumed_enrollment_authorizations,
-            ),
+            issuance_results: self.issuance_results.clone(),
             allowlist: self.allowlist.clone(),
             socket_override: self.socket_override.clone(),
         }
@@ -1451,6 +1814,66 @@ fn perform_stable_latest_update(config: RelayConfig) -> RelayResult<()> {
     })?;
     let backup = installed.with_extension("previous");
     updater.replace_binary(&staged, &installed, &backup)
+}
+
+/// Maps durable issuance-store failures to stable sanitized HDE1 categories.
+fn map_issuance_error(error: &RelayError) -> EnrollmentWireError {
+    match error {
+        RelayError::ResourceLimit => EnrollmentWireError::ResourceLimit,
+        RelayError::QuicProtocol { .. } => EnrollmentWireError::AuthorizationRejected,
+        _ => EnrollmentWireError::PersistenceFailed,
+    }
+}
+
+/// Maps one durable issuance record to the version-two status payload.
+fn reconciliation_payload(
+    record: Option<&crate::issuance::IssuanceResultRecord>,
+) -> RelayResult<ReconciliationResultPayload> {
+    let Some(record) = record else {
+        return Ok(ReconciliationResultPayload {
+            status: ReconciliationStatus::Rejected,
+            certificate_chain: Vec::new(),
+            fingerprint: None,
+            allowlist_generation: None,
+            not_after_epoch_seconds: None,
+            rejection_code: Some(EnrollmentWireError::AuthorizationRejected as u16),
+        });
+    };
+    match record.status() {
+        IssuanceResultStatus::Pending => Ok(ReconciliationResultPayload {
+            status: ReconciliationStatus::Pending,
+            certificate_chain: Vec::new(),
+            fingerprint: None,
+            allowlist_generation: None,
+            not_after_epoch_seconds: None,
+            rejection_code: None,
+        }),
+        IssuanceResultStatus::Issued => {
+            let (Some(fingerprint), Some(allowlist_generation), Some(not_after_epoch_seconds)) = (
+                record.fingerprint(),
+                record.allowlist_generation(),
+                record.not_after_epoch_seconds(),
+            ) else {
+                return Err(RelayError::ConfigurationRead);
+            };
+            Ok(ReconciliationResultPayload {
+                status: ReconciliationStatus::Issued,
+                certificate_chain: record.certificate_chain().to_vec(),
+                fingerprint: Some(fingerprint),
+                allowlist_generation: Some(allowlist_generation),
+                not_after_epoch_seconds: Some(not_after_epoch_seconds),
+                rejection_code: None,
+            })
+        }
+        IssuanceResultStatus::Rejected => Ok(ReconciliationResultPayload {
+            status: ReconciliationStatus::Rejected,
+            certificate_chain: Vec::new(),
+            fingerprint: None,
+            allowlist_generation: None,
+            not_after_epoch_seconds: None,
+            rejection_code: record.rejection_code(),
+        }),
+    }
 }
 
 fn map_enrollment_wire_error(error: EnrollmentWireError) -> RelayError {
@@ -1829,6 +2252,11 @@ mod tests {
         quic_wire::{
             HdqmFrame, HdqmKind, HdqsBinding, HdqsResponse, SessionName, SessionOpenAck,
             SessionOpenRequest, SessionPrepareAck, SessionPrepareRequest,
+        },
+        reconciliation_wire::{
+            ReconcilePayload, ReconciliationFrame, ReconciliationFrameKind,
+            ReconciliationResultPayload, ReconciliationStatus,
+            read_frame as read_reconciliation_frame, write_frame as write_reconciliation_frame,
         },
     };
     use rcgen::{
@@ -3109,6 +3537,209 @@ idle_timeout_secs = 900
         ))
     }
 
+    /// Query one unknown authorization through the real HDE version-two reconciliation path.
+    async fn reconcile_unknown_test(
+        address: SocketAddr,
+        server_certificate: Vec<u8>,
+        core_chain: Vec<Vec<u8>>,
+        core_key: Vec<u8>,
+    ) {
+        let mut endpoint = quinn::Endpoint::client("127.0.0.1:0".parse().expect("client bind"))
+            .expect("client endpoint");
+        endpoint.set_default_client_config(test_client_config(
+            server_certificate,
+            core_chain,
+            Some(core_key),
+            QRM_ENROLLMENT_ALPN,
+        ));
+        let connection = endpoint
+            .connect(address, "localhost")
+            .expect("reconciliation connect")
+            .await
+            .expect("reconciliation TLS");
+        let (mut send, mut recv) = connection.accept_bi().await.expect("reconciliation stream");
+        let challenge = read_enrollment_frame(&mut recv, 65_536)
+            .await
+            .expect("enrollment challenge");
+        assert_eq!(challenge.kind, EnrollmentFrameKind::Challenge);
+        let request = ReconciliationFrame::json(
+            ReconciliationFrameKind::Reconcile,
+            &ReconcilePayload {
+                authorization_id: [41; 16],
+                csr_digest: [42; 32],
+            },
+            65_536,
+        )
+        .expect("reconciliation request");
+        write_reconciliation_frame(&mut send, &request, 65_536)
+            .await
+            .expect("reconciliation request write");
+        let response = read_reconciliation_frame(&mut recv, 65_536)
+            .await
+            .expect("reconciliation response");
+        assert_eq!(response.kind, ReconciliationFrameKind::Result);
+        let payload: ReconciliationResultPayload = response
+            .parse_json(ReconciliationFrameKind::Result)
+            .expect("reconciliation result payload");
+        payload.validate().expect("valid reconciliation result");
+        assert_eq!(payload.status, ReconciliationStatus::Rejected);
+        assert!(payload.rejection_code.is_some());
+        connection.close(0u32.into(), b"reconciliation complete");
+        endpoint.close(0u32.into(), b"reconciliation complete");
+    }
+
+    /// Replay one durable issued record through the real HDE version-two path.
+    async fn reconcile_issued_test(
+        address: SocketAddr,
+        server_certificate: Vec<u8>,
+        core_chain: Vec<Vec<u8>>,
+        core_key: Vec<u8>,
+        authorization_id: [u8; 16],
+        csr_digest: [u8; 32],
+        expected_chain: Vec<Vec<u8>>,
+    ) {
+        let mut endpoint = quinn::Endpoint::client("127.0.0.1:0".parse().expect("client bind"))
+            .expect("client endpoint");
+        endpoint.set_default_client_config(test_client_config(
+            server_certificate,
+            core_chain,
+            Some(core_key),
+            QRM_ENROLLMENT_ALPN,
+        ));
+        let connection = endpoint
+            .connect(address, "localhost")
+            .expect("issued reconciliation connect")
+            .await
+            .expect("issued reconciliation TLS");
+        let (mut send, mut recv) = connection.accept_bi().await.expect("reconciliation stream");
+        let challenge = read_enrollment_frame(&mut recv, 65_536)
+            .await
+            .expect("enrollment challenge");
+        assert_eq!(challenge.kind, EnrollmentFrameKind::Challenge);
+        let request = ReconciliationFrame::json(
+            ReconciliationFrameKind::Reconcile,
+            &ReconcilePayload {
+                authorization_id,
+                csr_digest,
+            },
+            65_536,
+        )
+        .expect("reconciliation request");
+        write_reconciliation_frame(&mut send, &request, 65_536)
+            .await
+            .expect("reconciliation request write");
+        let response = read_reconciliation_frame(&mut recv, 65_536)
+            .await
+            .expect("reconciliation response");
+        let payload: ReconciliationResultPayload = response
+            .parse_json(ReconciliationFrameKind::Result)
+            .expect("reconciliation result payload");
+        payload.validate().expect("valid reconciliation result");
+        assert_eq!(payload.status, ReconciliationStatus::Issued);
+        assert_eq!(payload.certificate_chain, expected_chain);
+        connection.close(0u32.into(), b"issued reconciliation complete");
+        endpoint.close(0u32.into(), b"issued reconciliation complete");
+    }
+
+    /// Re-submit one durable pending authorization and prove no second leaf is created.
+    #[allow(clippy::too_many_arguments)]
+    async fn duplicate_pending_submit_test(
+        address: SocketAddr,
+        server_certificate: Vec<u8>,
+        core_chain: Vec<Vec<u8>>,
+        core_key: Vec<u8>,
+        core_identity: [u8; 32],
+        issuance_path: &Path,
+        app_id: &str,
+        authorization_id: [u8; 16],
+    ) {
+        let app_key = KeyPair::generate().expect("pending App key");
+        let mut csr_params = CertificateParams::new(Vec::<String>::new()).expect("CSR params");
+        csr_params
+            .distinguished_name
+            .push(DnType::CommonName, app_id);
+        let csr = csr_params
+            .serialize_request(&app_key)
+            .expect("CSR")
+            .der()
+            .to_vec();
+        let csr_digest: [u8; 32] = Sha256::digest(&csr).into();
+        let uid = crate::material::current_uid().expect("uid");
+        let now = current_epoch_seconds().expect("clock");
+        let mut store = crate::issuance::PersistentIssuanceResults::open(issuance_path, uid)
+            .expect("issuance store");
+        store
+            .begin_pending(
+                crate::issuance::IssuanceResultKey::new(authorization_id, csr_digest)
+                    .expect("pending key"),
+                app_id,
+                now + 300,
+                now,
+            )
+            .expect("pending seed");
+        drop(store);
+
+        let mut endpoint = quinn::Endpoint::client("127.0.0.1:0".parse().expect("client bind"))
+            .expect("pending client endpoint");
+        endpoint.set_default_client_config(test_client_config(
+            server_certificate,
+            core_chain,
+            Some(core_key),
+            QRM_ENROLLMENT_ALPN,
+        ));
+        let connection = endpoint
+            .connect(address, "localhost")
+            .expect("pending connect")
+            .await
+            .expect("pending TLS");
+        let (mut send, mut recv) = connection.accept_bi().await.expect("pending stream");
+        let challenge_frame = read_enrollment_frame(&mut recv, 65_536)
+            .await
+            .expect("pending challenge");
+        let challenge: EnrollmentChallengePayload = challenge_frame
+            .parse_json(EnrollmentFrameKind::Challenge)
+            .expect("pending challenge payload");
+        let submission = EnrollmentFrame::json(
+            EnrollmentFrameKind::Submit,
+            &EnrollmentSubmitPayload {
+                app_id: app_id.to_owned(),
+                pairing_id: "pending-pairing".to_owned(),
+                target_id: "pending-target".to_owned(),
+                core_identity,
+                authorization_id,
+                challenge: challenge.challenge,
+                code_proof: [91; 32],
+                configuration_generation: 1,
+                expires_at_epoch_seconds: challenge.expires_at_epoch_seconds,
+                csr,
+            },
+            65_536,
+        )
+        .expect("pending submission");
+        write_enrollment_frame(&mut send, &submission, 65_536)
+            .await
+            .expect("pending submission write");
+        let result = tokio::time::timeout(
+            Duration::from_secs(1),
+            read_enrollment_frame(&mut recv, 65_536),
+        )
+        .await;
+        assert!(result.is_err() || matches!(result, Ok(Err(_))));
+        connection.close(0u32.into(), b"pending duplicate complete");
+        endpoint.close(0u32.into(), b"pending duplicate complete");
+        let mut store = crate::issuance::PersistentIssuanceResults::open(issuance_path, uid)
+            .expect("reopen issuance store");
+        let record = store
+            .reconcile(
+                crate::issuance::IssuanceResultKey::new(authorization_id, csr_digest)
+                    .expect("reconcile key"),
+                current_epoch_seconds().expect("clock"),
+            )
+            .expect("reconcile pending")
+            .expect("pending record");
+        assert_eq!(record.status(), IssuanceResultStatus::Pending);
+    }
+
     /// Enroll one App over the real terminal enrollment ALPN and return its public chain/key.
     async fn enroll_test_app(
         address: SocketAddr,
@@ -3424,6 +4055,7 @@ idle_timeout_secs = 900
         let device_key_path = root.join("device-intermediate.key");
         let public_root_path = root.join("device-root.pem");
         let allowlist_path = root.join("allowlist.json");
+        let issuance_result_path = root.join("issuance.json");
         write_test_material(
             &server_certificate_path,
             server_identity.cert.pem().as_bytes(),
@@ -3446,7 +4078,7 @@ idle_timeout_secs = 900
             .expect("UDP address")
             .port();
         let config = RelayConfig::from_toml_str(&format!(
-            "[listener]\nlisten_address=\"127.0.0.1\"\nport={port}\n[security]\nmode=\"verified\"\nserver_certificate=\"{}\"\nserver_private_key=\"{}\"\ntrusted_client_ca=\"{}\"\ntrusted_core_enrollment_ca=\"{}\"\ndevice_intermediate_certificate=\"{}\"\ndevice_intermediate_private_key=\"{}\"\npublic_root_certificate=\"{}\"\n[enrollment]\nenabled=true\nallowlist_path=\"{}\"\nmax_handshakes=4\nmax_connections=4\nmax_request_bytes=65536\nmax_csr_bytes=16384\nconnection_lifetime_secs=5\nchallenge_ttl_secs=300\n[limits]\nmax_connections=8\nmax_sessions_per_connection=8\nmax_control_frame_bytes=65536\nbuffer_bytes=65536\nhandshake_timeout_secs=5\nidle_timeout_secs=900\n",
+            "[listener]\nlisten_address=\"127.0.0.1\"\nport={port}\n[security]\nmode=\"verified\"\nserver_certificate=\"{}\"\nserver_private_key=\"{}\"\ntrusted_client_ca=\"{}\"\ntrusted_core_enrollment_ca=\"{}\"\ndevice_intermediate_certificate=\"{}\"\ndevice_intermediate_private_key=\"{}\"\npublic_root_certificate=\"{}\"\n[enrollment]\nenabled=true\nallowlist_path=\"{}\"\nissuance_result_path=\"{}\"\nmax_handshakes=4\nmax_connections=4\nmax_request_bytes=65536\nmax_csr_bytes=16384\nconnection_lifetime_secs=5\nchallenge_ttl_secs=300\n[limits]\nmax_connections=8\nmax_sessions_per_connection=8\nmax_control_frame_bytes=65536\nbuffer_bytes=65536\nhandshake_timeout_secs=5\nidle_timeout_secs=900\n",
             server_certificate_path.display(),
             server_key_path.display(),
             trusted_client_ca_path.display(),
@@ -3455,6 +4087,7 @@ idle_timeout_secs = 900
             device_key_path.display(),
             public_root_path.display(),
             allowlist_path.display(),
+            issuance_result_path.display(),
         ))
         .expect("verified P4 config");
         // Keep the absolute Unix path short enough for macOS sockaddr_un limits.
@@ -3501,12 +4134,122 @@ idle_timeout_secs = 900
         .await;
         let core_chain_for_quota = core_chain.clone();
         let core_key_for_quota = core_key_der.clone();
+        reconcile_unknown_test(
+            address,
+            server_der.clone(),
+            core_chain.clone(),
+            core_key_der.clone(),
+        )
+        .await;
+        let uid = crate::material::current_uid().expect("uid");
+        let replay_now = current_epoch_seconds().expect("clock");
+        let replay_fingerprint = [61; 32];
+        let replay_generation = {
+            let allowlist = crate::allowlist::PersistentAllowlist::open(&allowlist_path, uid)
+                .expect("replay allowlist");
+            allowlist.generation() + 1
+        };
+        let replay_metadata = crate::enrollment::CertificateMetadata::new(
+            crate::enrollment::AppId::new("p4-replay").expect("replay app"),
+            crate::enrollment::Fingerprint::from_bytes(replay_fingerprint)
+                .expect("replay fingerprint"),
+            1,
+            replay_generation,
+            replay_now,
+            replay_now + 3600,
+        )
+        .expect("replay metadata");
+        let mut replay_allowlist =
+            crate::allowlist::PersistentAllowlist::open(&allowlist_path, uid)
+                .expect("replay allowlist reopen");
+        replay_allowlist
+            .enroll(replay_metadata)
+            .expect("replay allowlist entry");
+        drop(replay_allowlist);
+        let replay_chain = vec![vec![1, 2], vec![3]];
+        let replay_key =
+            crate::issuance::IssuanceResultKey::new([51; 16], [52; 32]).expect("replay key");
+        let mut replay_store =
+            crate::issuance::PersistentIssuanceResults::open(&issuance_result_path, uid)
+                .expect("replay issuance store");
+        replay_store
+            .begin_pending(replay_key, "p4-replay", replay_now + 300, replay_now)
+            .expect("replay pending");
+        replay_store
+            .attach_certificate(
+                replay_key,
+                replay_chain.clone(),
+                replay_fingerprint,
+                replay_generation,
+                replay_now + 3600,
+                replay_now,
+            )
+            .expect("replay candidate");
+        drop(replay_store);
+        reconcile_issued_test(
+            address,
+            server_der.clone(),
+            core_chain.clone(),
+            core_key_der.clone(),
+            [51; 16],
+            [52; 32],
+            replay_chain.clone(),
+        )
+        .await;
+        // The second query proves the issued result is replayed from durable state.
+        reconcile_issued_test(
+            address,
+            server_der.clone(),
+            core_chain.clone(),
+            core_key_der.clone(),
+            [51; 16],
+            [52; 32],
+            replay_chain,
+        )
+        .await;
+        duplicate_pending_submit_test(
+            address,
+            server_der.clone(),
+            core_chain.clone(),
+            core_key_der.clone(),
+            core_identity,
+            &issuance_result_path,
+            "p4-pending",
+            [71; 16],
+        )
+        .await;
         enrollment_rejects_normal_qrm_frame(address, server_der.clone(), core_chain, core_key_der)
             .await;
+        // A certificate chaining only to the Core enrollment CA must not enter normal QRM even
+        // though the shared TLS root store accepts that chain at the transport layer.
+        let (enrollment_ca_leaf, enrollment_ca_key) =
+            test_client_certificate("p4-enrollment-only", &core_ca);
+        let mut enrollment_ca_endpoint =
+            quinn::Endpoint::client("127.0.0.1:0".parse().expect("client bind"))
+                .expect("enrollment-only client endpoint");
+        enrollment_ca_endpoint.set_default_client_config(test_client_config(
+            server_der.clone(),
+            vec![enrollment_ca_leaf.der().to_vec(), core_ca.der().to_vec()],
+            Some(enrollment_ca_key.serialize_der()),
+            QRM_RELAY_ALPN,
+        ));
+        let enrollment_ca_result = enrollment_ca_endpoint
+            .connect(address, "localhost")
+            .expect("enrollment-only connect")
+            .await;
+        match enrollment_ca_result {
+            Err(_) => {}
+            Ok(connection) => {
+                tokio::time::timeout(Duration::from_secs(1), connection.closed())
+                    .await
+                    .expect("enrollment CA certificate must close on normal QRM");
+            }
+        }
+        enrollment_ca_endpoint.close(0u32.into(), b"enrollment-only complete");
         let uid = crate::material::current_uid().expect("uid");
         let mut allowlist =
             crate::allowlist::PersistentAllowlist::open(&allowlist_path, uid).expect("allowlist");
-        assert_eq!(allowlist.entries().count(), 2);
+        assert_eq!(allowlist.entries().count(), 3);
         assert!(
             allowlist
                 .authorize_update(
@@ -3538,11 +4281,11 @@ idle_timeout_secs = 900
         .await;
         let (b_endpoint, _b_connection, mut b_send, mut b_recv) =
             connect_normal_test_app(address, server_der.clone(), app_b_chain, app_b_key).await;
-        // Generation 4 is initial generation 1 plus two enrollments and one revocation.
+        // Generation 5 is initial generation 1 plus two App enrollments, one replay entry and one revocation.
         let generation = allowlist
             .revoke(&crate::enrollment::AppId::new("p4-app-a").expect("App A"))
             .expect("revoke App A");
-        assert_eq!(generation, 4);
+        assert_eq!(generation, 5);
         let reloaded = crate::allowlist::PersistentAllowlist::open(&allowlist_path, uid)
             .expect("reopen allowlist");
         assert!(!reloaded.allows_qrm(

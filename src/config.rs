@@ -268,6 +268,9 @@ pub struct EnrollmentConfig {
     enabled: bool,
     /// Absolute path to the protected non-secret App allowlist.
     allowlist_path: PathBuf,
+    /// Absolute protected path for response-lost issuance reconciliation records.
+    #[serde(default)]
+    issuance_result_path: PathBuf,
     /// Maximum pre-authenticated enrollment handshakes.
     max_handshakes: usize,
     /// Maximum enrollment connections after TLS/ALPN selection.
@@ -288,6 +291,7 @@ impl Default for EnrollmentConfig {
         Self {
             enabled: false,
             allowlist_path: PathBuf::new(),
+            issuance_result_path: PathBuf::new(),
             max_handshakes: QRM_MAX_ENROLLMENT_HANDSHAKES,
             max_connections: QRM_MAX_ENROLLMENT_CONNECTIONS,
             max_request_bytes: QRM_MAX_ENROLLMENT_REQUEST_BYTES,
@@ -305,6 +309,10 @@ impl EnrollmentConfig {
             return Ok(());
         }
         validate_absolute_path("enrollment.allowlist_path", &self.allowlist_path)?;
+        validate_absolute_path(
+            "enrollment.issuance_result_path",
+            &self.issuance_result_path,
+        )?;
         if self.max_handshakes == 0 || self.max_handshakes > QRM_MAX_ENROLLMENT_HANDSHAKES {
             return Err(RelayError::InvalidConfiguration {
                 field: "enrollment.max_handshakes",
@@ -341,6 +349,11 @@ impl EnrollmentConfig {
     /// Returns the protected allowlist path.
     pub fn allowlist_path(&self) -> &Path {
         &self.allowlist_path
+    }
+
+    /// Returns the protected issuance-result path.
+    pub fn issuance_result_path(&self) -> &Path {
+        &self.issuance_result_path
     }
 
     /// Returns the pre-authentication semaphore bound.

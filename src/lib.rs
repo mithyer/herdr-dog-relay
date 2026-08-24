@@ -20,6 +20,8 @@ pub mod enrollment;
 pub mod enrollment_wire;
 /// Redacted Relay errors.
 pub mod error;
+/// Protected durable enrollment issuance-result records.
+pub mod issuance;
 /// Protected-file validation and transient deployment material loading.
 pub mod material;
 /// Transient protected certificate issuance for App enrollment.
@@ -28,6 +30,8 @@ pub mod pki;
 pub mod quic_server;
 /// QRM-1 HDQM/HDQS codec.
 pub mod quic_wire;
+/// Version-two response-lost enrollment reconciliation frame codec.
+pub mod reconciliation_wire;
 /// QRM-1 per-connection session authority registry.
 pub mod session_registry;
 /// Validated Herdr Unix socket access.
