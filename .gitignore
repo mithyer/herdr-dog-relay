@@ -20,4 +20,4 @@ target
 #  option (not recommended) you can uncomment the following to ignore the entire idea folder.
 #.idea/
 
-# Relay-owned instructions and QRM plan documents are versioned in this submodule.
+# Internal documentation is maintained in the parent repository under docs/. The root README is public.
