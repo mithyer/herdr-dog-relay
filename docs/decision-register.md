@@ -12,7 +12,7 @@ dateCreated: 2026-08-22T00:10:00+08:00
 
 ## Current status
 
-Status: `active` for QRM-PROD-1 P4 local cross-platform validation. P4 activation/baseline checkpoints are Core `413c5c0`/`1c0371e`, Relay `a244ba0`/`07b1be3`, App-iOS `e58eb3f`/`fe3c62a`, and parent `52fbe34`/`484d806`. The current Relay worktree restores its accidentally untracked governance sources and records only P4 local evidence requirements; it does not widen Herdr capabilities or change the opaque bridge boundary.
+Status: `checkpointed` for QRM-PROD-1 P4 local cross-platform validation at Relay `074d84d`. P4 activation/baseline checkpoints are Core `413c5c0`/`1c0371e`, Relay `a244ba0`/`07b1be3`, App-iOS `e58eb3f`/`fe3c62a`, and parent `52fbe34`/`484d806`. The checkpoint restores Relay-owned governance sources and records only P4 local evidence; it does not widen Herdr capabilities or change the opaque bridge boundary. P6 remains planned and inactive.
 
 ## Decisions
 
@@ -336,4 +336,13 @@ Q1 requires codec, fake authority and three-session tests. Q2 requires quinn TLS
 - Scope: local protected material, expiry-aware allowlist, enrollment/revocation, updater, supervision and cross-platform evidence.
 - Exclusions: no mb17 deployment, live issuance, remote update, Herdr parsing, writes, subscriptions, healthy Current, actions, passthrough or automatic retry.
 - Residual risk: same-source checksum provenance, published Linux CI/artifact provenance, restart-persistent authorization and P6 lifecycle/rebind evidence remain open.
-- Next dependency: replacement fresh review, then selective Core/Relay/App-iOS/parent checkpointing; keep P4 active until closure.
+- Next dependency: keep P6 planned and inactive until separate deployment authorization; do not claim live issuance, mb17 deployment or P6 lifecycle evidence.
+
+[checkpointed](1-348) 2026-08-24 | QRM-PROD-1 P4 local validation checkpointed
+- Repository state: Relay implementation and restored governance sources are checkpointed at `074d84d`; no push; unrelated parent/Core/App-iOS/Herdr content remains preserved.
+- Review: fresh GLM-5.3 security review found no P0-P3 issues; governance review's table-shape P3 was corrected and the narrow GLM-5.3 re-review found no P0-P3 issues.
+- Validation: macOS passed 82 Relay tests (79 library plus 3 binary) and native Ubuntu 24.04 x86_64 passed 81 (78 library plus 3 binary), with locked quality, rustdoc, release/archive/checksum, supervision and version checks.
+- Scope: local protected material, enrollment/allowlist, updater, supervision, governance restoration and cross-platform evidence only.
+- Exclusions: no mb17 deployment, live issuance, remote update, Herdr mutation/parsing, writes, subscriptions, healthy Current, actions, passthrough or automatic retry.
+- Residual risk: same-source checksum provenance, published Linux CI/artifact provenance, restart-persistent authorization and P6 lifecycle/rebind evidence remain open.
+- Next dependency: keep P6 planned and inactive until separate deployment authorization; do not claim live issuance, mb17 deployment or P6 lifecycle evidence.

@@ -12,7 +12,7 @@ dateCreated: 2026-08-22T00:10:00+08:00
 
 ## Current status
 
-QRM-PROD-1 P4 local cross-platform validation is the active implementation/validation stage. Its activation/baseline checkpoints are Core `413c5c0`/`1c0371e`, Relay `a244ba0`/`07b1be3`, App-iOS `e58eb3f`/`fe3c62a`, and parent `52fbe34`/`484d806`. The current P4 Relay corrections are uncommitted and include versioned Relay-governance restoration, verified enrollment/revocation validation, updater hardening, and disposable user-service evidence. No live/production certificate issuance or deployment, Herdr payload parsing, writes, subscriptions, healthy `Online + Current`, actions, passthrough or automatic retry is claimed; disposable local certificate issuance is covered only as P4 test evidence.
+QRM-PROD-1 P4 local cross-platform validation is checkpointed in Relay at `074d84d`. Its activation/baseline checkpoints are Core `413c5c0`/`1c0371e`, Relay `a244ba0`/`07b1be3`, App-iOS `e58eb3f`/`fe3c62a`, and parent `52fbe34`/`484d806`; the implementation checkpoint includes the restored Relay-owned governance sources and parent-led P4 hardening. P6 deployment remains planned and inactive. No live/production certificate issuance or deployment, Herdr payload parsing, writes, subscriptions, healthy `Online + Current`, actions, passthrough or automatic retry is claimed; disposable local certificate issuance is covered only as P4 test evidence.
 
 ## Boundary
 
@@ -20,7 +20,7 @@ The Relay authenticates Core, validates HDQM/HDQS/session authority and bridges 
 
 ## Current implementation
 
-QRM-PROD-1 P2 implementation/status is checkpointed at `51134bb`/`6176552`; P3 has no Relay source changes and its status is checkpointed at `76270bd`. P4 has uncommitted local enrollment/updater/supervision/test work. The prior `0fc3563` index change removed Relay governance documents; the active correction restores `AGENTS.md` and `docs/` for Relay-index tracking in the next selective P4 checkpoint. No P4 production capability is claimed and the opaque QUIC bridge boundary remains unchanged.
+QRM-PROD-1 P2 implementation/status is checkpointed at `51134bb`/`6176552`; P3 has no Relay source changes and its status is checkpointed at `76270bd`. P4 local enrollment/updater/supervision/test work and restored Relay governance sources are checkpointed at `074d84d`. The prior `0fc3563` index change removed Relay governance documents; the checkpoint restores `AGENTS.md` and `docs/` for Relay-index tracking. No P4 production capability is claimed and the opaque QUIC bridge boundary remains unchanged.
 
 ## Validation evidence
 
@@ -195,4 +195,13 @@ QRM-PROD-1 P2 implementation/status is checkpointed at `51134bb`/`6176552`; P3 h
 - Scope: local protected material, expiry-aware allowlist, enrollment/revocation, updater, supervision and governance restoration.
 - Exclusions: no mb17 deployment, live issuance, remote update, Herdr parsing, writes, subscriptions, healthy Current, actions, passthrough or automatic retry.
 - Residual risk: same-source checksum provenance, published Linux CI/artifact provenance, restart-persistent authorization and P6 lifecycle/rebind evidence remain open.
-- Next dependency: run the replacement fresh read-only acceptance review, then checkpoint in Core, Relay, App-iOS and parent order if no P0-P2 findings remain.
+- Next dependency: keep P6 planned and inactive until separate deployment authorization; do not claim live issuance, mb17 deployment or P6 lifecycle evidence.
+
+[checkpointed](1-207) 2026-08-24 | QRM-PROD-1 P4 local validation checkpointed
+- Repository state: Relay implementation and restored governance sources are checkpointed at `074d84d`; no push; unrelated parent/Core/App-iOS/Herdr content remains preserved.
+- Review: fresh GLM-5.3 security review found no P0-P3 issues; governance review's table-shape P3 was corrected and the narrow GLM-5.3 re-review found no P0-P3 issues.
+- Validation: macOS passed 82 Relay tests (79 library plus 3 binary) and native Ubuntu 24.04 x86_64 passed 81 (78 library plus 3 binary), with locked quality, rustdoc, release/archive/checksum, supervision and version checks.
+- Scope: local protected material, enrollment/allowlist, updater, supervision, governance restoration and cross-platform evidence only.
+- Exclusions: no mb17 deployment, live issuance, remote update, Herdr mutation/parsing, writes, subscriptions, healthy Current, actions, passthrough or automatic retry.
+- Residual risk: same-source checksum provenance, published Linux CI/artifact provenance, restart-persistent authorization and P6 lifecycle/rebind evidence remain open.
+- Next dependency: keep P6 planned and inactive until separate deployment authorization; do not claim live issuance, mb17 deployment or P6 lifecycle evidence.

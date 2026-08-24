@@ -12,7 +12,7 @@ dateCreated: 2026-08-22T00:10:00+08:00
 
 ## Current status
 
-Status: `active` for QRM-PROD-1 P4 local cross-platform validation. QRM-1 Q4/Q5 security evidence and P2/P3 checkpoints remain preserved. P4 validates local verified enrollment/revocation, independent quota/no-forward boundaries, updater rollback, and disposable user-service behavior; live deployment and P6 lifecycle evidence remain open.
+Status: `checkpointed` for QRM-PROD-1 P4 local cross-platform validation at Relay `074d84d`. QRM-1 Q4/Q5 security evidence and P2/P3 checkpoints remain preserved. P4 validates local verified enrollment/revocation, independent quota/no-forward boundaries, updater rollback, and disposable user-service behavior; live deployment and P6 lifecycle evidence remain open, with P6 planned/inactive.
 
 ## Required security
 
@@ -128,4 +128,13 @@ QRM tests must cover wrong certificate, missing client identity, wrong ALPN, mal
 - Scope: local protected material, allowlist/revocation, enrollment, updater and supervision security evidence only.
 - Exclusions: no mb17 mutation, remote update, Herdr parsing, writes, subscriptions, healthy Current, actions, passthrough or automatic retry.
 - Residual risk: same-source checksum provenance, published Linux CI/artifact provenance, restart-persistent authorization and P6 lifecycle evidence remain open.
-- Next dependency: complete the replacement fresh review and selective checkpoint validation; do not activate P6.
+- Next dependency: keep P6 planned and inactive until separate deployment authorization; do not claim live issuance, mb17 deployment or P6 lifecycle evidence.
+
+[checkpointed](1-140) 2026-08-24 | QRM-PROD-1 P4 local validation checkpointed
+- Repository state: Relay implementation and restored governance sources are checkpointed at `074d84d`; no push; unrelated parent/Core/App-iOS/Herdr content remains preserved.
+- Review: fresh GLM-5.3 security review found no P0-P3 issues; governance review's table-shape P3 was corrected and the narrow GLM-5.3 re-review found no P0-P3 issues.
+- Validation: macOS passed 82 Relay tests (79 library plus 3 binary) and native Ubuntu 24.04 x86_64 passed 81 (78 library plus 3 binary), with locked quality, rustdoc, release/archive/checksum, supervision and version checks.
+- Scope: local protected material, enrollment/allowlist, updater, supervision, governance restoration and cross-platform evidence only.
+- Exclusions: no mb17 deployment, live issuance, remote update, Herdr mutation/parsing, writes, subscriptions, healthy Current, actions, passthrough or automatic retry.
+- Residual risk: same-source checksum provenance, published Linux CI/artifact provenance, restart-persistent authorization and P6 lifecycle/rebind evidence remain open.
+- Next dependency: keep P6 planned and inactive until separate deployment authorization; do not claim live issuance, mb17 deployment or P6 lifecycle evidence.

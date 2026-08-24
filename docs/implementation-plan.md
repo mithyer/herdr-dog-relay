@@ -12,7 +12,7 @@ dateCreated: 2026-08-22T00:10:00+08:00
 
 ## Current status
 
-Status: `active` for QRM-PROD-1 P4 local cross-platform validation. P4 activation/baseline checkpoints are Core `413c5c0`/`1c0371e`, Relay `a244ba0`/`07b1be3`, App-iOS `e58eb3f`/`fe3c62a`, and parent `52fbe34`/`484d806`. The current Relay worktree corrects the unrecorded `0fc3563` removal of Relay governance documents while validating local enrollment, updater, and supervision behavior. Q4 weak-network, Q5 mb17 one-port/two-session read-only evidence, Q6 App/embedded Core integration and Q7 cleanup remain checkpointed; Herdr parsing, writes, subscriptions, healthy Current, actions, passthrough and automatic retry remain excluded.
+Status: `checkpointed` for QRM-PROD-1 P4 local cross-platform validation at Relay `074d84d`. P4 activation/baseline checkpoints are Core `413c5c0`/`1c0371e`, Relay `a244ba0`/`07b1be3`, App-iOS `e58eb3f`/`fe3c62a`, and parent `52fbe34`/`484d806`. The checkpoint corrects the unrecorded `0fc3563` removal of Relay governance documents while recording local enrollment, updater and supervision evidence. Q4 weak-network, Q5 mb17 one-port/two-session read-only evidence, Q6 App/embedded Core integration and Q7 cleanup remain checkpointed; Herdr parsing, writes, subscriptions, healthy Current, actions, passthrough and automatic retry remain excluded. P6 is planned and inactive.
 
 ## Architecture
 
@@ -424,4 +424,13 @@ Block QRM-PROD-1 when normal QRM lacks TLS/active allowlist enforcement, enrollm
 - Scope: local protected material, expiry-aware allowlist, enrollment/revocation, updater, supervision, governance restoration and cross-platform fixture evidence.
 - Exclusions: no mb17 deployment, live issuance, remote update, Herdr configuration mutation, writes, subscriptions, healthy Current, actions, passthrough or automatic retry.
 - Residual risk: same-source checksum provenance, published Linux CI/artifact provenance, restart-persistent authorization and P6 GOAWAY/drain/restart/readiness/rebind evidence remain open.
-- Next dependency: complete replacement fresh review and selective checkpoint validation; keep P4 active and do not enter P6.
+- Next dependency: keep P6 planned and inactive until separate deployment authorization; do not claim live issuance, mb17 deployment or P6 lifecycle evidence.
+
+[checkpointed](1-436) 2026-08-24 | QRM-PROD-1 P4 local validation checkpointed
+- Repository state: Relay implementation and restored governance sources are checkpointed at `074d84d`; no push; unrelated parent/Core/App-iOS/Herdr content remains preserved.
+- Review: fresh GLM-5.3 security review found no P0-P3 issues; governance review's table-shape P3 was corrected and the narrow GLM-5.3 re-review found no P0-P3 issues.
+- Validation: macOS passed 82 Relay tests (79 library plus 3 binary) and native Ubuntu 24.04 x86_64 passed 81 (78 library plus 3 binary), with locked quality, rustdoc, release/archive/checksum, supervision and version checks.
+- Scope: local protected material, enrollment/allowlist, updater, supervision, governance restoration and cross-platform evidence only.
+- Exclusions: no mb17 deployment, live issuance, remote update, Herdr mutation/parsing, writes, subscriptions, healthy Current, actions, passthrough or automatic retry.
+- Residual risk: same-source checksum provenance, published Linux CI/artifact provenance, restart-persistent authorization and P6 lifecycle/rebind evidence remain open.
+- Next dependency: keep P6 planned and inactive until separate deployment authorization; do not claim live issuance, mb17 deployment or P6 lifecycle evidence.
