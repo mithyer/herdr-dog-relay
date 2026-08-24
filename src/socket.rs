@@ -237,19 +237,16 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::UnixListener;
 
-    /// Creates an isolated socket path for one test process.
+    /// Creates an isolated socket path under an owner-only parent for one test process.
     fn test_socket_path(label: &str) -> PathBuf {
-        let nonce = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("system clock after Unix epoch")
-            .as_nanos();
-        let short_label: String = label.chars().take(4).collect();
-        std::fs::canonicalize(std::env::temp_dir())
-            .expect("canonicalize temporary directory")
-            .join(format!(
-                "hd-r-{short_label}-{}-{nonce}.sock",
-                std::process::id()
-            ))
+        test_directory_path(&format!("socket-{label}")).join("herdr.sock")
+    }
+
+    /// Removes a socket or symlink and its private test-only parent directory.
+    fn remove_test_socket_path(path: &Path) {
+        let _ = fs::remove_file(path);
+        let parent = path.parent().expect("socket test parent");
+        fs::remove_dir_all(parent).expect("remove socket test parent");
     }
 
     /// Creates an isolated directory with private permissions for path-boundary tests.
@@ -292,7 +289,7 @@ mod tests {
         let mut stream = connector.connect().await.expect("connect socket");
         stream.write_all(b"x").await.expect("write byte");
         assert_eq!(accept.await.expect("join accept task"), b'x');
-        fs::remove_file(path).expect("remove test socket");
+        remove_test_socket_path(&path);
     }
 
     // TEST:relay/src/socket.rs[tests::non_socket_path_is_rejected]
@@ -315,7 +312,7 @@ mod tests {
             .validate()
             .expect_err("regular file must be rejected");
         assert!(error.to_string().contains("not a Unix socket"));
-        fs::remove_file(path).expect("remove regular file");
+        remove_test_socket_path(&path);
     }
 
     // TEST:relay/src/socket.rs[tests::symlink_path_is_rejected]
@@ -331,8 +328,8 @@ mod tests {
             .validate()
             .expect_err("socket symlink must be rejected");
         assert!(error.to_string().contains("not a Unix socket"));
-        fs::remove_file(path).expect("remove symlink");
-        fs::remove_file(target).expect("remove socket target");
+        remove_test_socket_path(&path);
+        remove_test_socket_path(&target);
     }
 
     // TEST:relay/src/socket.rs[tests::owner_and_mode_boundaries_are_rejected]
@@ -353,7 +350,7 @@ mod tests {
             .validate()
             .expect_err("broad mode must be rejected");
         assert!(broad_mode.to_string().contains("permissions"));
-        fs::remove_file(path).expect("remove test socket");
+        remove_test_socket_path(&path);
     }
 
     // TEST:relay/src/socket.rs[tests::intermediate_symlink_component_is_rejected]
@@ -410,13 +407,17 @@ mod tests {
         let old_root = root.with_extension("old");
         fs::rename(&root, &old_root).expect("move original parent");
         fs::create_dir(&root).expect("create replacement parent");
+        // Use a valid but distinct parent mode because some filesystems immediately reuse inode IDs.
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o750))
+            .expect("set replacement parent mode");
         let (replacement, _) = private_listener(&path);
-        drop(replacement);
+        // Keep the replacement listener alive until validation observes its new identity on Linux.
         let error = connector
             .connect_checked(expected)
             .await
             .expect_err("parent replacement must fail identity precondition");
         assert!(error.to_string().contains("identity changed"));
+        drop(replacement);
         fs::remove_file(path).expect("remove replacement parent socket");
         fs::remove_dir(root).expect("remove replacement parent");
         fs::remove_dir(old_root).expect("remove original parent");
@@ -432,12 +433,16 @@ mod tests {
         let expected = connector.validate().expect("capture socket identity");
         fs::remove_file(&path).expect("remove original socket");
         let (replacement, _) = private_listener(&path);
-        drop(replacement);
+        // Use a valid but distinct socket mode because some filesystems immediately reuse inode IDs.
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o700))
+            .expect("set replacement socket mode");
+        // Keep the replacement listener alive until validation observes its new identity on Linux.
         let error = connector
             .connect_checked(expected)
             .await
             .expect_err("replacement must fail identity precondition");
         assert!(error.to_string().contains("identity changed"));
-        fs::remove_file(path).expect("remove replacement socket");
+        drop(replacement);
+        remove_test_socket_path(&path);
     }
 }

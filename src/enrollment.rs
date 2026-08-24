@@ -5,6 +5,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -586,6 +587,11 @@ impl AllowlistEntry {
     pub const fn generation(&self) -> u64 {
         self.generation
     }
+
+    /// Return the certificate validity end epoch second.
+    pub const fn not_after_epoch_seconds(&self) -> u64 {
+        self.not_after_epoch_seconds
+    }
 }
 
 /// Result of a one-time enrollment fake.
@@ -764,19 +770,36 @@ impl AllowlistRegistry {
         Ok(generation)
     }
 
-    /// Check normal QRM admission for one certificate identity.
+    /// Check normal QRM admission for one certificate identity at the current wall-clock epoch.
     pub fn allows_qrm(&self, fingerprint: Fingerprint) -> bool {
+        self.allows_qrm_at(fingerprint, current_epoch_seconds())
+    }
+
+    /// Check normal QRM admission against an explicit epoch for deterministic tests.
+    pub fn allows_qrm_at(&self, fingerprint: Fingerprint, now_epoch_seconds: u64) -> bool {
         self.entries.values().any(|entry| {
-            entry.fingerprint() == fingerprint && entry.state() == AllowlistState::Active
+            entry.fingerprint() == fingerprint
+                && entry.state() == AllowlistState::Active
+                && entry.not_after_epoch_seconds() > now_epoch_seconds
         })
     }
 
-    /// Check stable-latest update authorization for one certificate identity.
+    /// Check stable-latest update authorization at the current wall-clock epoch.
     pub fn authorize_update(&self, fingerprint: Fingerprint) -> Result<(), EnrollmentError> {
+        self.authorize_update_at(fingerprint, current_epoch_seconds())
+    }
+
+    /// Check stable-latest update authorization against an explicit epoch for deterministic tests.
+    pub fn authorize_update_at(
+        &self,
+        fingerprint: Fingerprint,
+        now_epoch_seconds: u64,
+    ) -> Result<(), EnrollmentError> {
         if self.entries.values().any(|entry| {
             entry.fingerprint() == fingerprint
                 && entry.state() == AllowlistState::Active
                 && entry.role() == AllowlistRole::RelayUpdateAdmin
+                && entry.not_after_epoch_seconds() > now_epoch_seconds
         }) {
             Ok(())
         } else {
@@ -796,7 +819,12 @@ impl AllowlistRegistry {
 
     /// Validate a deserialized registry before it can authorize normal QRM.
     pub fn validate_persisted(&self) -> Result<(), EnrollmentError> {
-        if self.generation == 0 || self.entries.values().any(|entry| entry.generation() == 0) {
+        if self.generation == 0
+            || self
+                .entries
+                .values()
+                .any(|entry| entry.generation() == 0 || entry.not_after_epoch_seconds() == 0)
+        {
             return Err(EnrollmentError::AllowlistPersistence);
         }
         Ok(())
@@ -1160,10 +1188,28 @@ impl FakeUpdateWorker {
         request: &UpdateRequest,
         allowlist: &AllowlistRegistry,
     ) -> Result<UpdateStatus, EnrollmentError> {
+        self.start_at(request, allowlist, current_epoch_seconds())
+    }
+
+    /// Start one update against an explicit epoch for deterministic contract tests.
+    ///
+    /// # Parameters
+    /// * `request` - Bounded fixed-selector request.
+    /// * `allowlist` - Active certificate/role authority.
+    /// * `now_epoch_seconds` - Clock value used for certificate expiry.
+    ///
+    /// # Returns
+    /// Running status or sanitized authorization/busy failure.
+    pub fn start_at(
+        &mut self,
+        request: &UpdateRequest,
+        allowlist: &AllowlistRegistry,
+        now_epoch_seconds: u64,
+    ) -> Result<UpdateStatus, EnrollmentError> {
         if request.selector != UpdateSelector::StableLatest {
             return Err(EnrollmentError::UpdateUnauthorized);
         }
-        allowlist.authorize_update(request.caller)?;
+        allowlist.authorize_update_at(request.caller, now_epoch_seconds)?;
         if self.running {
             return Err(EnrollmentError::UpdateBusy);
         }
@@ -1179,6 +1225,13 @@ impl FakeUpdateWorker {
         self.running = false;
         Ok(self.next)
     }
+}
+
+/// Returns the current epoch second, failing closed to the maximum value on clock failure.
+fn current_epoch_seconds() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(u64::MAX, |duration| duration.as_secs())
 }
 
 /// Validate a bounded opaque Profile/Target identity.
@@ -1270,7 +1323,7 @@ mod tests {
         };
         assert_eq!(entry.app_id(), &app_id);
         assert_eq!(certificate.app_id(), &app_id);
-        assert!(fake.allowlist().allows_qrm(entry.fingerprint()));
+        assert!(fake.allowlist().allows_qrm_at(entry.fingerprint(), 1_001));
 
         let wrong_core = Fingerprint::from_bytes([4; AUTHORITY_BYTES]).unwrap();
         let other_challenge = fake
@@ -1329,8 +1382,8 @@ mod tests {
         let before = fake.allowlist().generation();
         let after = fake.allowlist_mut().revoke(&app_a).unwrap();
         assert!(after > before);
-        assert!(!fake.allowlist().allows_qrm(entry_a.fingerprint()));
-        assert!(fake.allowlist().allows_qrm(entry_b.fingerprint()));
+        assert!(!fake.allowlist().allows_qrm_at(entry_a.fingerprint(), 1_001));
+        assert!(fake.allowlist().allows_qrm_at(entry_b.fingerprint(), 1_001));
         assert_eq!(fake.allowlist().entry(&app_b).unwrap().generation(), after);
     }
 
@@ -1344,6 +1397,35 @@ mod tests {
         let debug = format!("{certificate:?}");
         assert!(!debug.contains("private-csr-bytes"));
         assert!(!debug.contains("private"));
+    }
+
+    // TEST:relay/src/enrollment.rs[tests::allowlist_expiry_denies_authority]
+    #[test]
+    fn allowlist_expiry_denies_authority() {
+        let (core_identity, app) = identities();
+        let mut fake =
+            FakeRelayEnrollment::new([2; AUTHORITY_BYTES], [3; AUTHORITY_BYTES]).unwrap();
+        let challenge = fake
+            .begin(core_identity, "pair-a", "target-a", app.clone(), 1, 1_000)
+            .unwrap();
+        let entry = match fake.accept(
+            submission(core_identity, challenge, &app, b"csr-expiry"),
+            1_001,
+        ) {
+            EnrollmentOutcome::Issued { entry, .. } => entry,
+            EnrollmentOutcome::Rejected(error) => panic!("unexpected rejection: {error}"),
+        };
+        let expiry = entry.not_after_epoch_seconds();
+        assert!(
+            fake.allowlist()
+                .allows_qrm_at(entry.fingerprint(), expiry - 1)
+        );
+        assert!(!fake.allowlist().allows_qrm_at(entry.fingerprint(), expiry));
+        assert_eq!(
+            fake.allowlist()
+                .authorize_update_at(entry.fingerprint(), expiry),
+            Err(EnrollmentError::UpdateUnauthorized)
+        );
     }
 
     // TEST:relay/src/enrollment.rs[tests::update_admin_and_lock]
@@ -1367,17 +1449,17 @@ mod tests {
         };
         let mut worker = FakeUpdateWorker::new();
         assert_eq!(
-            worker.start(&request, fake.allowlist()),
+            worker.start_at(&request, fake.allowlist(), 1_001),
             Ok(UpdateStatus::Running)
         );
         assert_eq!(
-            worker.start(&request, fake.allowlist()),
+            worker.start_at(&request, fake.allowlist(), 1_001),
             Err(EnrollmentError::UpdateBusy)
         );
         assert_eq!(worker.complete(), Ok(UpdateStatus::Succeeded));
         fake.allowlist_mut().revoke(&app).unwrap();
         assert_eq!(
-            worker.start(&request, fake.allowlist()),
+            worker.start_at(&request, fake.allowlist(), 1_001),
             Err(EnrollmentError::UpdateUnauthorized)
         );
     }

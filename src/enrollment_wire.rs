@@ -220,7 +220,7 @@ pub struct EnrollmentChallengePayload {
 }
 
 /// Core-authorized enrollment submission payload.
-#[derive(Clone, Deserialize)]
+#[derive(Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct EnrollmentSubmitPayload {
     /// App installation identity.
@@ -246,7 +246,7 @@ pub struct EnrollmentSubmitPayload {
 }
 
 /// Public certificate issuance response payload.
-#[derive(Clone, Serialize)]
+#[derive(Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct EnrollmentIssuedPayload {
     /// Public DER leaf and Intermediate chain.

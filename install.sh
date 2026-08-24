@@ -2,8 +2,8 @@
 # Install the pinned Herdr-dog Relay release into a user-owned bin directory.
 set -eu
 
-# GitHub repository containing the signed release archives.
-REPOSITORY="${HERDRDOGRELAY_REPOSITORY:-mithyer/herdr-dog-relay}"
+# Fixed GitHub repository containing same-source checksummed release archives.
+REPOSITORY="mithyer/herdr-dog-relay"
 # Optional exact release tag; the latest release is used when it is omitted.
 RELEASE_VERSION="${HERDRDOGRELAY_VERSION:-}"
 # User-owned destination; no sudo or system directory writes are used.
@@ -21,7 +21,6 @@ print_help() {
 Usage: install.sh [--version TAG] [--bin-dir PATH]
 
 Environment:
-  HERDRDOGRELAY_REPOSITORY  GitHub owner/repository override.
   HERDRDOGRELAY_VERSION     Exact release tag override.
   HERDRDOGRELAY_BIN_DIR     User-owned installation directory override.
 HELP
@@ -73,6 +72,9 @@ command -v curl >/dev/null 2>&1 || fail "curl is required"
 command -v tar >/dev/null 2>&1 || fail "tar is required"
 command -v install >/dev/null 2>&1 || fail "install is required"
 command -v awk >/dev/null 2>&1 || fail "awk is required"
+command -v od >/dev/null 2>&1 || fail "od is required"
+command -v tr >/dev/null 2>&1 || fail "tr is required"
+command -v cp >/dev/null 2>&1 || fail "cp is required"
 if command -v sha256sum >/dev/null 2>&1; then
     CHECKSUM_TOOL="sha256sum"
 elif command -v shasum >/dev/null 2>&1; then
@@ -116,6 +118,41 @@ else
 fi
 [ "$EXPECTED_CHECKSUM" = "$ACTUAL_CHECKSUM" ] || fail "release checksum does not match"
 
+# Reject scripts and data files before any executable is installed or started.
+validate_native_binary() {
+    MAGIC=$(od -An -tx1 -N4 "$1" 2>/dev/null | tr -d ' \n') || fail "native executable header could not be read"
+    case "$ARCHIVE_OS" in
+        macos)
+            case "$MAGIC" in
+                feedface|feedfacf|cefaedfe|cffaedfe|cafebabe|cafebabf|bebafeca|bfbafeca) ;;
+                *) fail "release does not contain a supported macOS executable" ;;
+            esac
+            ;;
+        linux)
+            [ "$MAGIC" = "7f454c46" ] || fail "release does not contain a supported Linux executable"
+            ;;
+    esac
+}
+
+# Run the fixed startup probe without allowing a downloaded process to outlive the installer.
+probe_native_binary() {
+    "$1" --version >/dev/null 2>&1 &
+    PROBE_PID=$!
+    PROBE_TICKS=0
+    while kill -0 "$PROBE_PID" 2>/dev/null; do
+        [ "$PROBE_TICKS" -lt 50 ] || {
+            kill "$PROBE_PID" 2>/dev/null || :
+            wait "$PROBE_PID" 2>/dev/null || :
+            fail "release executable startup probe timed out"
+        }
+        sleep 0.1
+        PROBE_TICKS=$((PROBE_TICKS + 1))
+    done
+    if ! wait "$PROBE_PID"; then
+        fail "release executable startup probe failed"
+    fi
+}
+
 # Extract the verified archive into a private temporary directory and require the expected file.
 EXTRACT_DIRECTORY="$TEMP_DIRECTORY/extracted"
 mkdir -m 700 "$EXTRACT_DIRECTORY"
@@ -126,13 +163,50 @@ ARCHIVE_TYPES=$(tar -tvzf "$ARCHIVE_PATH") || fail "release archive metadata is 
 printf '%s\n' "$ARCHIVE_TYPES" | awk 'NF && substr($1, 1, 1) == "-" && $NF == "herdogrelay" { count++ } END { exit !(count == 1) }' || fail "release archive entry is not a regular executable"
 tar -xzf "$ARCHIVE_PATH" --no-same-owner --no-same-permissions -C "$EXTRACT_DIRECTORY"
 [ -f "$EXTRACT_DIRECTORY/herdogrelay" ] || fail "release archive has no herdogrelay binary"
+validate_native_binary "$EXTRACT_DIRECTORY/herdogrelay"
+probe_native_binary "$EXTRACT_DIRECTORY/herdogrelay"
 
 # Create the destination only when needed, preserving an existing custom directory mode.
 if [ ! -d "$INSTALL_DIRECTORY" ]; then
     mkdir -p "$INSTALL_DIRECTORY"
     chmod 755 "$INSTALL_DIRECTORY"
 fi
-install -m 755 "$EXTRACT_DIRECTORY/herdogrelay" "$INSTALL_DIRECTORY/herdogrelay"
+INSTALL_PATH="$INSTALL_DIRECTORY/herdogrelay"
+BACKUP_PATH="$TEMP_DIRECTORY/previous-herdogrelay"
+HAD_PREVIOUS_BINARY=0
+INSTALL_STARTED=0
+INSTALL_COMPLETED=0
+if [ -L "$INSTALL_PATH" ] 2>/dev/null || [ -h "$INSTALL_PATH" ] 2>/dev/null; then
+    fail "installation destination must not be a symlink"
+fi
+if [ -e "$INSTALL_PATH" ]; then
+    [ -f "$INSTALL_PATH" ] || fail "installation destination is not a regular file"
+    cp "$INSTALL_PATH" "$BACKUP_PATH" || fail "existing Relay binary could not be backed up"
+    chmod 755 "$BACKUP_PATH"
+    HAD_PREVIOUS_BINARY=1
+fi
+
+# Restore the previous binary if installation or its post-install probe fails.
+rollback_install() {
+    if [ "$INSTALL_STARTED" -eq 1 ] && [ "$INSTALL_COMPLETED" -eq 0 ]; then
+        if [ "$HAD_PREVIOUS_BINARY" -eq 1 ]; then
+            if ! install -m 755 "$BACKUP_PATH" "$INSTALL_PATH"; then
+                printf '%s\n' "herdogrelay installer: rollback failed; inspect the installation directory" >&2
+            fi
+        else
+            rm -f "$INSTALL_PATH"
+        fi
+    fi
+    rm -rf "$TEMP_DIRECTORY"
+}
+trap rollback_install EXIT HUP INT TERM
+
+# Replace only after native-header and bounded startup checks have passed.
+INSTALL_STARTED=1
+install -m 755 "$EXTRACT_DIRECTORY/herdogrelay" "$INSTALL_PATH" || fail "Relay binary installation failed"
+validate_native_binary "$INSTALL_PATH"
+probe_native_binary "$INSTALL_PATH"
+INSTALL_COMPLETED=1
 
 # Report the stable install location and leave configuration untouched.
 printf 'Installed herdogrelay %s to %s/herdogrelay\n' "$RELEASE_VERSION" "$INSTALL_DIRECTORY"

@@ -220,6 +220,9 @@ async fn update(config_path: PathBuf) -> Result<(), CliError> {
     let staged = updater
         .extract_verified(&archive)
         .map_err(CliError::Relay)?;
+    updater
+        .verify_staged_startup(&staged)
+        .map_err(CliError::Relay)?;
     let installed = std::env::current_exe()
         .map_err(|_| CliError::Usage("current executable path is unavailable".to_owned()))?;
     let backup = installed.with_extension("previous");
@@ -236,11 +239,7 @@ async fn update(config_path: PathBuf) -> Result<(), CliError> {
 fn revoke(config_path: PathBuf, app_id: String) -> Result<(), CliError> {
     let config = RelayConfig::from_path(&config_path).map_err(CliError::Relay)?;
     require_verified_security(&config)?;
-    if !config.enrollment().enabled() {
-        return Err(CliError::Usage(
-            "enrollment allowlist is disabled".to_owned(),
-        ));
-    }
+    // Revocation is a local allowlist operation and remains available even when new enrollment is disabled.
     let app_id = herdr_dog_relay::enrollment::AppId::new(app_id)
         .map_err(|_| CliError::Usage("--app-id is invalid".to_owned()))?;
     let uid = herdr_dog_relay::material::current_uid().map_err(CliError::Relay)?;

@@ -281,9 +281,13 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .expect("system clock after Unix epoch")
             .as_nanos();
-        let path = fs::canonicalize(std::env::temp_dir())
+        let directory = fs::canonicalize(std::env::temp_dir())
             .expect("canonicalize temporary directory")
-            .join(format!("hd-r-int-{}-{nonce}.sock", std::process::id()));
+            .join(format!("hd-r-int-{}-{nonce}", std::process::id()));
+        fs::create_dir(&directory).expect("create private integration directory");
+        fs::set_permissions(&directory, fs::Permissions::from_mode(0o700))
+            .expect("set private integration directory mode");
+        let path = directory.join("herdr.sock");
         let listener = tokio::net::UnixListener::bind(&path).expect("bind integration socket");
         fs::set_permissions(&path, fs::Permissions::from_mode(0o600))
             .expect("set integration socket mode");
@@ -334,7 +338,8 @@ mod tests {
         server.await.expect("join integration server");
         assert_eq!(outcome.network_to_unix_bytes, 5);
         assert_eq!(outcome.unix_to_network_bytes, 5);
-        fs::remove_file(path).expect("remove integration socket");
+        fs::remove_file(&path).expect("remove integration socket");
+        fs::remove_dir(directory).expect("remove integration directory");
     }
 
     // TEST:relay/src/bridge.rs[tests::bridge_propagates_write_errors]

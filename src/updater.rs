@@ -20,7 +20,9 @@ use std::{
     io::Read,
     os::unix::fs::{OpenOptionsExt, PermissionsExt},
     path::{Component, Path, PathBuf},
-    process::Command,
+    process::{Command, Stdio},
+    thread,
+    time::{Duration, Instant},
 };
 use tar::{Archive, EntryType};
 
@@ -30,6 +32,8 @@ pub const STABLE_REPOSITORY: &str = "mithyer/herdr-dog-relay";
 pub const STABLE_CHANNEL: &str = "stable-latest";
 /// Expected executable name inside every archive.
 pub const EXPECTED_BINARY_NAME: &str = "herdogrelay";
+/// Maximum time allowed for a fixed-argument staged-binary startup probe.
+const STARTUP_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Process-local/external update lock held for one explicit replacement.
 pub struct UpdateLock {
@@ -113,8 +117,8 @@ impl FixedSourceUpdater {
                 });
             }
         };
-        let normalized_arch = match arch {
-            "arm64" | "x86_64" => arch,
+        let normalized_arch = match (normalized_os, arch) {
+            ("macos", "arm64" | "x86_64") | ("linux", "x86_64") => arch,
             _ => {
                 return Err(RelayError::Update {
                     operation: "selecting release asset",
@@ -384,13 +388,111 @@ impl FixedSourceUpdater {
         Ok(binary)
     }
 
+    /// Verifies that one staged executable can start with the fixed `--version` argument.
+    ///
+    /// The probe inherits no caller-provided arguments and discards child I/O so a bad release
+    /// cannot leak data into Relay logs. A failed or timed-out probe returns before replacement,
+    /// leaving the currently installed executable untouched.
+    ///
+    /// # Parameters
+    /// * `staged` - Absolute owner-controlled executable extracted from a verified archive.
+    ///
+    /// # Returns
+    /// `Ok(())` only when the bounded startup probe exits successfully.
+    // TEST:relay/src/updater.rs[tests::startup_probe_failure_preserves_installed_binary]
+    pub fn verify_staged_startup(&self, staged: &Path) -> RelayResult<()> {
+        if !staged.is_absolute() {
+            return Err(RelayError::Update {
+                operation: "probing staged Relay binary",
+                reason: "staged executable path is not absolute",
+            });
+        }
+        let uid = current_uid().map_err(|_| RelayError::Update {
+            operation: "probing staged Relay binary",
+            reason: "current owner UID is unavailable",
+        })?;
+        let metadata = fs::symlink_metadata(staged).map_err(|_| RelayError::Update {
+            operation: "probing staged Relay binary",
+            reason: "staged executable is unavailable",
+        })?;
+        validate_file_metadata(
+            &metadata,
+            uid,
+            ProtectedFileKind::Public,
+            self.config.max_extracted_bytes(),
+        )
+        .map_err(|_| RelayError::Update {
+            operation: "probing staged Relay binary",
+            reason: "staged executable ownership or mode is unsafe",
+        })?;
+        // Reject scripts and data files before process creation so a downloaded shell payload is never run.
+        validate_native_executable(staged)?;
+        let _digest = hash_file(staged, self.config.max_extracted_bytes())?;
+        let mut child = Command::new(staged)
+            .arg("--version")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .map_err(|_| RelayError::Update {
+                operation: "probing staged Relay binary",
+                reason: "staged executable could not be started",
+            })?;
+        let started = Instant::now();
+        loop {
+            match child.try_wait() {
+                Ok(Some(status)) if status.success() => return Ok(()),
+                Ok(Some(_)) => {
+                    return Err(RelayError::Update {
+                        operation: "probing staged Relay binary",
+                        reason: "staged executable startup check failed",
+                    });
+                }
+                Ok(None) if started.elapsed() < STARTUP_PROBE_TIMEOUT => {
+                    thread::sleep(Duration::from_millis(10));
+                }
+                Ok(None) | Err(_) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(RelayError::Update {
+                        operation: "probing staged Relay binary",
+                        reason: "staged executable startup check timed out",
+                    });
+                }
+            }
+        }
+    }
+
     /// Atomically replaces the installed executable while retaining a local rollback copy.
+    ///
+    /// # Parameters
+    /// * `staged` - Absolute protected executable extracted from a verified archive.
+    /// * `installed` - Absolute current executable path.
+    /// * `backup` - Absolute local rollback path in the installed executable's directory.
+    ///
+    /// # Returns
+    /// `Ok(())` after the installed file is revalidated against the staged digest.
+    // TEST:relay/src/updater.rs[tests::staged_source_swap_restores_previous_binary]
     pub fn replace_binary(
         &self,
         staged: &Path,
         installed: &Path,
         backup: &Path,
     ) -> RelayResult<()> {
+        self.replace_binary_with_pre_rename(staged, installed, backup, || {})
+    }
+
+    /// Performs the replacement after a private test hook that models a source-path race.
+    fn replace_binary_with_pre_rename<F>(
+        &self,
+        staged: &Path,
+        installed: &Path,
+        backup: &Path,
+        pre_rename: F,
+    ) -> RelayResult<()>
+    where
+        F: FnOnce(),
+    {
         if !staged.is_absolute() || !installed.is_absolute() || !backup.is_absolute() {
             return Err(RelayError::Update {
                 operation: "replacing Relay binary",
@@ -423,36 +525,93 @@ impl FixedSourceUpdater {
             operation: "replacing Relay binary",
             reason: "staged executable ownership or mode is unsafe",
         })?;
-        let _staged_digest = hash_file(staged, self.config.max_extracted_bytes())?;
-        let installed_metadata = fs::metadata(staged).map_err(|_| RelayError::Update {
-            operation: "replacing Relay binary",
-            reason: "staged executable is unavailable",
-        })?;
-        if !installed_metadata.is_file() {
-            return Err(RelayError::Update {
-                operation: "replacing Relay binary",
-                reason: "staged executable is not a regular file",
-            });
-        }
-        if installed.exists() {
+        let staged_digest = hash_file(staged, self.config.max_extracted_bytes())?;
+
+        // Capture the old executable identity and digest before moving it into rollback storage.
+        let previous_metadata = match fs::symlink_metadata(installed) {
+            Ok(metadata) => Some(metadata),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(_) => {
+                return Err(RelayError::Update {
+                    operation: "replacing Relay binary",
+                    reason: "installed executable metadata is unavailable",
+                });
+            }
+        };
+        let had_previous_binary = previous_metadata.is_some();
+        let previous_digest = if let Some(metadata) = previous_metadata.as_ref() {
+            validate_file_metadata(
+                metadata,
+                uid,
+                ProtectedFileKind::Public,
+                self.config.max_extracted_bytes(),
+            )?;
+            Some(hash_file(installed, self.config.max_extracted_bytes())?)
+        } else {
+            None
+        };
+
+        // Test-only callers can replace the staged path here; every failed rename or verification
+        // must restore and verify the old binary before returning an update error.
+        pre_rename();
+        if had_previous_binary {
             fs::rename(installed, backup).map_err(|_| RelayError::Update {
                 operation: "replacing Relay binary",
                 reason: "previous executable could not be backed up",
             })?;
-            sync_parent(installed)?;
-        }
-        if let Err(error) = fs::rename(staged, installed) {
-            if backup.exists() {
-                let _ = fs::rename(backup, installed);
-                let _ = sync_parent(installed);
+            if sync_parent(installed).is_err() {
+                return rollback_update_error(
+                    installed,
+                    backup,
+                    had_previous_binary,
+                    previous_digest,
+                    self.config.max_extracted_bytes(),
+                    "previous executable backup could not be synchronized",
+                );
             }
-            let _ = error;
-            return Err(RelayError::Update {
-                operation: "replacing Relay binary",
-                reason: "staged executable could not be installed",
-            });
         }
-        sync_parent(installed)?;
+        if fs::rename(staged, installed).is_err() {
+            return rollback_update_error(
+                installed,
+                backup,
+                had_previous_binary,
+                previous_digest,
+                self.config.max_extracted_bytes(),
+                "staged executable could not be installed",
+            );
+        }
+        let installed_metadata = match fs::symlink_metadata(installed) {
+            Ok(metadata) => metadata,
+            Err(_) => {
+                return rollback_update_error(
+                    installed,
+                    backup,
+                    had_previous_binary,
+                    previous_digest,
+                    self.config.max_extracted_bytes(),
+                    "installed executable is unavailable",
+                );
+            }
+        };
+        let installed_digest = validate_file_metadata(
+            &installed_metadata,
+            uid,
+            ProtectedFileKind::Public,
+            self.config.max_extracted_bytes(),
+        )
+        .and_then(|_| hash_file(installed, self.config.max_extracted_bytes()));
+        let installed_is_verified =
+            matches!(installed_digest, Ok(digest) if digest == staged_digest);
+        if !installed_is_verified || sync_parent(installed).is_err() {
+            return rollback_update_error(
+                installed,
+                backup,
+                had_previous_binary,
+                previous_digest,
+                self.config.max_extracted_bytes(),
+                "installed executable failed post-replacement verification",
+            );
+        }
         Ok(())
     }
 }
@@ -529,6 +688,138 @@ fn hash_file(path: &Path, max_bytes: u64) -> RelayResult<[u8; 32]> {
     Ok(hasher.finalize().into())
 }
 
+/// Requires the staged file to begin with a supported macOS Mach-O or Linux ELF executable magic.
+fn validate_native_executable(path: &Path) -> RelayResult<()> {
+    let mut header = [0_u8; 4];
+    File::open(path)
+        .and_then(|mut file| file.read_exact(&mut header))
+        .map_err(|_| RelayError::Update {
+            operation: "probing staged Relay binary",
+            reason: "staged executable header could not be read",
+        })?;
+    let is_native = if cfg!(target_os = "macos") {
+        matches!(
+            header,
+            [0xfe, 0xed, 0xfa, 0xce]
+                | [0xfe, 0xed, 0xfa, 0xcf]
+                | [0xce, 0xfa, 0xed, 0xfe]
+                | [0xcf, 0xfa, 0xed, 0xfe]
+                | [0xca, 0xfe, 0xba, 0xbe]
+                | [0xca, 0xfe, 0xba, 0xbf]
+                | [0xbe, 0xba, 0xfe, 0xca]
+                | [0xbf, 0xba, 0xfe, 0xca]
+        )
+    } else if cfg!(target_os = "linux") {
+        header == [0x7f, b'E', b'L', b'F']
+    } else {
+        false
+    };
+    if is_native {
+        Ok(())
+    } else {
+        Err(RelayError::Update {
+            operation: "probing staged Relay binary",
+            reason: "staged executable is not a supported native binary",
+        })
+    }
+}
+
+/// Restores and verifies the prior executable after a failed replacement.
+fn restore_previous_binary(
+    installed: &Path,
+    backup: &Path,
+    had_previous_binary: bool,
+    expected_digest: Option<[u8; 32]>,
+    max_bytes: u64,
+) -> RelayResult<()> {
+    if had_previous_binary {
+        if !backup.exists() {
+            return Err(RelayError::Update {
+                operation: "rolling back Relay binary",
+                reason: "rollback copy is unavailable",
+            });
+        }
+        if installed.exists() {
+            fs::remove_file(installed).map_err(|_| RelayError::Update {
+                operation: "rolling back Relay binary",
+                reason: "failed replacement could not be removed",
+            })?;
+        }
+        fs::rename(backup, installed).map_err(|_| RelayError::Update {
+            operation: "rolling back Relay binary",
+            reason: "rollback copy could not be restored",
+        })?;
+        sync_parent(installed)?;
+        let metadata = fs::symlink_metadata(installed).map_err(|_| RelayError::Update {
+            operation: "rolling back Relay binary",
+            reason: "restored executable is unavailable",
+        })?;
+        validate_file_metadata(
+            &metadata,
+            current_uid().map_err(|_| RelayError::Update {
+                operation: "rolling back Relay binary",
+                reason: "current owner UID is unavailable",
+            })?,
+            ProtectedFileKind::Public,
+            max_bytes,
+        )
+        .map_err(|_| RelayError::Update {
+            operation: "rolling back Relay binary",
+            reason: "restored executable metadata is unsafe",
+        })?;
+        if let Some(expected_digest) = expected_digest
+            && hash_file(installed, max_bytes)? != expected_digest
+        {
+            return Err(RelayError::Update {
+                operation: "rolling back Relay binary",
+                reason: "restored executable digest does not match the prior binary",
+            });
+        }
+    } else {
+        if installed.exists() {
+            fs::remove_file(installed).map_err(|_| RelayError::Update {
+                operation: "rolling back Relay binary",
+                reason: "failed replacement could not be removed",
+            })?;
+        }
+        sync_parent(installed)?;
+        if installed.exists() {
+            return Err(RelayError::Update {
+                operation: "rolling back Relay binary",
+                reason: "failed replacement remains installed",
+            });
+        }
+    }
+    Ok(())
+}
+
+/// Converts a primary replacement failure into a fail-closed rollback result.
+fn rollback_update_error(
+    installed: &Path,
+    backup: &Path,
+    had_previous_binary: bool,
+    previous_digest: Option<[u8; 32]>,
+    max_bytes: u64,
+    primary_reason: &'static str,
+) -> RelayResult<()> {
+    match restore_previous_binary(
+        installed,
+        backup,
+        had_previous_binary,
+        previous_digest,
+        max_bytes,
+    ) {
+        Ok(()) => Err(RelayError::Update {
+            operation: "replacing Relay binary",
+            reason: primary_reason,
+        }),
+        Err(_) => Err(RelayError::Update {
+            operation: "replacing Relay binary",
+            reason: "replacement failed and rollback verification failed",
+        }),
+    }
+}
+
 /// Synchronizes the parent directory after an atomic replacement.
 fn sync_parent(path: &Path) -> RelayResult<()> {
     let parent = path.parent().ok_or(RelayError::Update {
@@ -562,12 +853,16 @@ fn validate_archive_path(path: &Path) -> RelayResult<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use flate2::{Compression, write::GzEncoder};
+    use sha2::{Digest, Sha256};
     use std::{
-        fs,
+        fs::{self, File},
         io::Write,
-        path::PathBuf,
+        os::unix::fs::PermissionsExt,
+        path::{Path, PathBuf},
         time::{SystemTime, UNIX_EPOCH},
     };
+    use tar::{Builder, EntryType, Header};
 
     /// Builds one enabled updater policy rooted in an isolated temporary directory.
     fn updater() -> (FixedSourceUpdater, PathBuf) {
@@ -577,8 +872,244 @@ mod tests {
             .as_nanos();
         let directory = std::env::temp_dir().join(format!("herdr-dog-updater-{suffix}"));
         fs::create_dir(&directory).expect("directory");
+        fs::set_permissions(&directory, fs::Permissions::from_mode(0o700)).expect("directory mode");
         let config = UpdateConfig::from_toml_for_test(directory.clone());
         (FixedSourceUpdater::new(config).expect("updater"), directory)
+    }
+
+    /// Creates one valid single-entry archive using an explicitly supplied entry name.
+    fn create_archive_entry(
+        directory: &Path,
+        archive_name: &str,
+        entry_name: &str,
+        content: &[u8],
+    ) -> PathBuf {
+        let archive_path = directory.join(archive_name);
+        let file = File::create(&archive_path).expect("archive file");
+        let encoder = GzEncoder::new(file, Compression::default());
+        let mut builder = Builder::new(encoder);
+        let mut header = Header::new_gnu();
+        header.set_size(content.len() as u64);
+        header.set_mode(0o700);
+        header.set_mtime(0);
+        header.set_cksum();
+        builder
+            .append_data(&mut header, entry_name, content)
+            .expect("archive entry");
+        builder
+            .into_inner()
+            .expect("tar encoder")
+            .finish()
+            .expect("gzip archive");
+        archive_path
+    }
+
+    /// Creates one valid single-binary release archive for local updater tests.
+    fn create_archive(directory: &Path, archive_name: &str, content: &[u8]) -> PathBuf {
+        create_archive_entry(directory, archive_name, EXPECTED_BINARY_NAME, content)
+    }
+
+    /// Reads a native utility that accepts the updater's fixed `--version` probe argument.
+    fn native_version_fixture() -> Vec<u8> {
+        fs::read("/usr/bin/true").expect("native version fixture")
+    }
+
+    /// Creates a link entry to prove the archive validator rejects non-regular files.
+    fn create_link_archive(directory: &Path, archive_name: &str, entry_type: EntryType) -> PathBuf {
+        let archive_path = directory.join(archive_name);
+        let file = File::create(&archive_path).expect("link archive file");
+        let encoder = GzEncoder::new(file, Compression::default());
+        let mut builder = Builder::new(encoder);
+        let mut header = Header::new_gnu();
+        header.set_entry_type(entry_type);
+        header.set_size(0);
+        builder
+            .append_link(&mut header, EXPECTED_BINARY_NAME, "outside")
+            .expect("link archive entry");
+        builder
+            .into_inner()
+            .expect("link tar encoder")
+            .finish()
+            .expect("link gzip archive");
+        archive_path
+    }
+
+    // TEST:relay/src/updater.rs[tests::archive_validator_rejects_malicious_entries]
+    #[test]
+    fn archive_validator_rejects_malicious_entries() {
+        let (updater, directory) = updater();
+        let unexpected = create_archive_entry(
+            &directory,
+            "unexpected.tar.gz",
+            "unexpected-file",
+            b"unexpected",
+        );
+        assert!(updater.validate_archive(&unexpected).is_err());
+        let symlink = create_link_archive(&directory, "symlink.tar.gz", EntryType::Symlink);
+        assert!(updater.validate_archive(&symlink).is_err());
+        let hardlink = create_link_archive(&directory, "hardlink.tar.gz", EntryType::Link);
+        assert!(updater.validate_archive(&hardlink).is_err());
+        let compressed = create_archive(&directory, "compressed.tar.gz", &vec![0_u8; 512 * 1024]);
+        assert!(updater.validate_archive(&compressed).is_err());
+        let valid = create_archive(&directory, "valid.tar.gz", b"complete archive");
+        let partial = directory.join("partial.tar.gz");
+        let bytes = fs::read(&valid).expect("valid archive bytes");
+        fs::write(&partial, &bytes[..bytes.len() / 2]).expect("partial archive");
+        assert!(updater.validate_archive(&partial).is_err());
+        fs::remove_dir_all(directory).expect("cleanup");
+    }
+
+    // TEST:relay/src/updater.rs[tests::staged_source_swap_restores_previous_binary]
+    #[test]
+    fn staged_source_swap_restores_previous_binary() {
+        let (updater, directory) = updater();
+        let install_directory = directory.join("install");
+        fs::create_dir(&install_directory).expect("install directory");
+        fs::set_permissions(&install_directory, fs::Permissions::from_mode(0o700))
+            .expect("install mode");
+        let installed = install_directory.join(EXPECTED_BINARY_NAME);
+        let backup = install_directory.join("herdogrelay.previous");
+        let staged = directory.join("staged-herdogrelay");
+        fs::write(&installed, b"prior verified binary").expect("installed binary");
+        fs::write(&staged, b"verified staged binary").expect("staged binary");
+        for path in [&installed, &staged] {
+            fs::set_permissions(path, fs::Permissions::from_mode(0o700)).expect("binary mode");
+        }
+        assert!(
+            updater
+                .replace_binary_with_pre_rename(&staged, &installed, &backup, || {
+                    fs::write(&staged, b"swapped staged binary").expect("source swap");
+                })
+                .is_err()
+        );
+        assert_eq!(
+            fs::read(&installed).expect("restored installed binary"),
+            b"prior verified binary"
+        );
+        assert!(!backup.exists());
+        fs::remove_dir_all(directory).expect("cleanup");
+    }
+
+    // TEST:relay/src/updater.rs[tests::archive_extract_and_replace_preserve_rollback]
+    #[test]
+    fn archive_extract_and_replace_preserve_rollback() {
+        let (updater, directory) = updater();
+        let archive = create_archive(
+            &directory,
+            "herdogrelay-macos-arm64.tar.gz",
+            b"new relay binary",
+        );
+        updater
+            .validate_archive(&archive)
+            .expect("archive validation");
+        let staged = updater
+            .extract_verified(&archive)
+            .expect("archive extraction");
+        let install_directory = directory.join("install");
+        fs::create_dir(&install_directory).expect("install directory");
+        fs::set_permissions(&install_directory, fs::Permissions::from_mode(0o700))
+            .expect("install mode");
+        let installed = install_directory.join(EXPECTED_BINARY_NAME);
+        let backup = install_directory.join("herdogrelay.previous");
+        fs::write(&installed, b"old relay binary").expect("old binary");
+        fs::set_permissions(&installed, fs::Permissions::from_mode(0o700))
+            .expect("old binary mode");
+        updater
+            .replace_binary(&staged, &installed, &backup)
+            .expect("atomic replacement");
+        assert_eq!(
+            fs::read(&installed).expect("installed binary"),
+            b"new relay binary"
+        );
+        assert_eq!(
+            fs::read(&backup).expect("rollback binary"),
+            b"old relay binary"
+        );
+        assert!(!staged.exists());
+        assert!(
+            updater
+                .replace_binary(
+                    &directory.join("missing-staged-binary"),
+                    &installed,
+                    &backup,
+                )
+                .is_err()
+        );
+        assert_eq!(
+            fs::read(&installed).expect("installed after rejected replacement"),
+            b"new relay binary"
+        );
+        fs::remove_dir_all(directory).expect("cleanup");
+    }
+
+    // TEST:relay/src/updater.rs[tests::startup_probe_failure_preserves_installed_binary]
+    #[test]
+    fn startup_probe_failure_preserves_installed_binary() {
+        let (updater, directory) = updater();
+        let install_directory = directory.join("install");
+        fs::create_dir(&install_directory).expect("install directory");
+        fs::set_permissions(&install_directory, fs::Permissions::from_mode(0o700))
+            .expect("install mode");
+        let installed = install_directory.join(EXPECTED_BINARY_NAME);
+        fs::write(&installed, b"known working binary").expect("installed binary");
+        fs::set_permissions(&installed, fs::Permissions::from_mode(0o700)).expect("installed mode");
+
+        // A native fixture proves the probe uses the fixed `--version` argument without a shell.
+        let good_archive = create_archive(
+            &directory,
+            "good-herdogrelay.tar.gz",
+            &native_version_fixture(),
+        );
+        let good_staged = updater
+            .extract_verified(&good_archive)
+            .expect("good extraction");
+        updater
+            .verify_staged_startup(&good_staged)
+            .expect("fixed startup probe");
+        fs::remove_dir_all(good_staged.parent().expect("stage parent")).expect("stage cleanup");
+
+        let marker = directory.join("script-executed");
+        let script = format!("#!/bin/sh\ntouch {}\n", marker.display());
+        let failing_archive =
+            create_archive(&directory, "failing-herdogrelay.tar.gz", script.as_bytes());
+        let failing_staged = updater
+            .extract_verified(&failing_archive)
+            .expect("failing extraction");
+        // The script must be rejected by native-header validation before it can create the marker.
+        assert!(updater.verify_staged_startup(&failing_staged).is_err());
+        assert!(!marker.exists());
+        assert_eq!(
+            fs::read(&installed).expect("installed after failed probe"),
+            b"known working binary"
+        );
+        fs::remove_dir_all(directory).expect("cleanup");
+    }
+
+    // TEST:relay/src/updater.rs[tests::release_matrix_is_explicit]
+    #[test]
+    fn release_matrix_is_explicit() {
+        let (updater, directory) = updater();
+        for (os, arch) in [("macos", "arm64"), ("macos", "x86_64"), ("linux", "x86_64")] {
+            let name = updater.archive_name(os, arch).expect("release asset");
+            let archive = create_archive(&directory, &name, b"disposable relay artifact");
+            let checksums = directory.join(format!("{name}.checksums"));
+            let digest = Sha256::digest(fs::read(&archive).expect("archive bytes"));
+            let mut manifest = File::create(&checksums).expect("checksums");
+            writeln!(manifest, "{digest:x}  {name}").expect("checksum entry");
+            updater
+                .verify_checksum(&archive, &checksums)
+                .expect("archive checksum");
+            updater.validate_archive(&archive).expect("archive shape");
+            assert!(
+                updater
+                    .archive_url(os, arch)
+                    .expect("release URL")
+                    .starts_with(
+                        "https://github.com/mithyer/herdr-dog-relay/releases/latest/download/"
+                    )
+            );
+        }
+        fs::remove_dir_all(directory).expect("cleanup");
     }
 
     // TEST:relay/src/updater.rs[tests::fixed_source_and_selector_are_bounded]
@@ -590,6 +1121,8 @@ mod tests {
             "https://github.com/mithyer/herdr-dog-relay/releases/latest/download/herdogrelay-macos-arm64.tar.gz"
         );
         assert!(updater.archive_name("windows", "x86_64").is_err());
+        // Linux arm64 has no published release artifact and must fail rather than request one.
+        assert!(updater.archive_name("linux", "arm64").is_err());
         fs::remove_dir_all(directory).expect("cleanup");
     }
 

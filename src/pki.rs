@@ -124,8 +124,13 @@ pub fn issue_certificate(
     )
     .map_err(|_| EnrollmentError::InvalidMetadata)?;
     let issuer_certificate = first_pem_certificate(&intermediate_certificate)?;
+    let root_certificate = first_pem_certificate(&root_certificate)?;
     let (_, parsed_intermediate) = x509_parser::parse_x509_certificate(issuer_certificate.as_ref())
         .map_err(|_| EnrollmentError::InvalidMetadata)?;
+    let (_, parsed_root) = x509_parser::parse_x509_certificate(root_certificate.as_ref())
+        .map_err(|_| EnrollmentError::InvalidMetadata)?;
+    // Verify the configured device Intermediate is a currently valid CA signed by the configured Root.
+    validate_device_intermediate_chain(&parsed_intermediate, &parsed_root)?;
     let issuer_key = KeyPair::from_pem(
         std::str::from_utf8(&intermediate_key).map_err(|_| EnrollmentError::InvalidMetadata)?,
     )
@@ -175,7 +180,6 @@ pub fn issue_certificate(
         .map_err(|_| EnrollmentError::InvalidMetadata)?;
     let not_after_epoch_seconds = u64::try_from(request.params.not_after.unix_timestamp())
         .map_err(|_| EnrollmentError::InvalidMetadata)?;
-    let _root_certificate = first_pem_certificate(&root_certificate)?;
     if csr_metadata.byte_len() != csr_bytes.len() {
         return Err(EnrollmentError::InvalidMetadata);
     }
@@ -186,6 +190,40 @@ pub fn issue_certificate(
         not_before_epoch_seconds,
         not_after_epoch_seconds,
     })
+}
+
+/// Validates the configured Root and device Intermediate CA chain before any App leaf is issued.
+fn validate_device_intermediate_chain(
+    intermediate: &x509_parser::certificate::X509Certificate<'_>,
+    root: &x509_parser::certificate::X509Certificate<'_>,
+) -> Result<(), EnrollmentError> {
+    let is_valid_ca = |certificate: &x509_parser::certificate::X509Certificate<'_>| {
+        certificate.validity().is_valid()
+            && certificate
+                .tbs_certificate
+                .basic_constraints()
+                .ok()
+                .flatten()
+                .is_some_and(|extension| extension.value.ca)
+            && certificate
+                .tbs_certificate
+                .key_usage()
+                .ok()
+                .flatten()
+                .is_some_and(|extension| extension.value.key_cert_sign())
+    };
+    if !is_valid_ca(intermediate)
+        || !is_valid_ca(root)
+        || intermediate.tbs_certificate.issuer != root.tbs_certificate.subject
+        || intermediate
+            .verify_signature(Some(root.public_key()))
+            .is_err()
+        || root.tbs_certificate.issuer != root.tbs_certificate.subject
+        || root.verify_signature(Some(root.public_key())).is_err()
+    {
+        return Err(EnrollmentError::InvalidMetadata);
+    }
+    Ok(())
 }
 
 /// Extracts the first certificate from a bounded PEM chain.
@@ -207,7 +245,9 @@ pub fn current_epoch_seconds() -> Result<u64, EnrollmentError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rcgen::{CertificateParams, KeyPair};
+    use rcgen::{
+        BasicConstraints, CertificateParams, CertifiedIssuer, IsCa, KeyPair, KeyUsagePurpose,
+    };
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
     // TEST:relay/src/pki.rs[tests::csr_identity_is_bound]
@@ -233,26 +273,47 @@ mod tests {
         std::fs::create_dir(&directory).expect("directory");
         std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700)).expect("mode");
         let uid = std::fs::metadata(&directory).expect("metadata").uid();
-        let intermediate =
-            rcgen::generate_simple_self_signed(vec!["device-intermediate".to_owned()])
-                .expect("intermediate");
+        let mut root_params = CertificateParams::new(Vec::<String>::new()).expect("root params");
+        root_params
+            .distinguished_name
+            .push(DnType::CommonName, "deployment-root");
+        root_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        root_params.key_usages = vec![
+            KeyUsagePurpose::KeyCertSign,
+            KeyUsagePurpose::DigitalSignature,
+        ];
         let root =
-            rcgen::generate_simple_self_signed(vec!["deployment-root".to_owned()]).expect("root");
+            CertifiedIssuer::self_signed(root_params, KeyPair::generate().expect("root key"))
+                .expect("root");
+        let intermediate_signing_key = KeyPair::generate().expect("intermediate key");
+        let mut intermediate_params =
+            CertificateParams::new(Vec::<String>::new()).expect("intermediate params");
+        intermediate_params
+            .distinguished_name
+            .push(DnType::CommonName, "device-intermediate");
+        intermediate_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        intermediate_params.key_usages = vec![
+            KeyUsagePurpose::KeyCertSign,
+            KeyUsagePurpose::DigitalSignature,
+        ];
+        let intermediate = intermediate_params
+            .signed_by(&intermediate_signing_key, &root)
+            .expect("intermediate");
         let intermediate_cert = directory.join("intermediate.pem");
-        let intermediate_key = directory.join("intermediate.key");
+        let intermediate_key_path = directory.join("intermediate.key");
         let root_cert = directory.join("root.pem");
         crate::material::write_protected_file(
             &intermediate_cert,
             uid,
-            intermediate.cert.pem().as_bytes(),
+            intermediate.pem().as_bytes(),
             ProtectedFileKind::Public,
             MAX_PUBLIC_MATERIAL_BYTES,
         )
         .expect("intermediate cert");
         crate::material::write_protected_file(
-            &intermediate_key,
+            &intermediate_key_path,
             uid,
-            intermediate.signing_key.serialize_pem().as_bytes(),
+            intermediate_signing_key.serialize_pem().as_bytes(),
             ProtectedFileKind::Private,
             MAX_PRIVATE_MATERIAL_BYTES,
         )
@@ -260,16 +321,17 @@ mod tests {
         crate::material::write_protected_file(
             &root_cert,
             uid,
-            root.cert.pem().as_bytes(),
+            root.pem().as_bytes(),
             ProtectedFileKind::Public,
             MAX_PUBLIC_MATERIAL_BYTES,
         )
         .expect("root cert");
         let config = crate::config::RelayConfig::from_toml_str(&format!(
-            "[listener]\nlisten_address=\"127.0.0.1\"\nport=18743\n[security]\nmode=\"verified\"\nserver_certificate=\"/tmp/server.pem\"\nserver_private_key=\"/tmp/server.key\"\ntrusted_client_ca=\"/tmp/client-ca.pem\"\ndevice_intermediate_certificate=\"{}\"\ndevice_intermediate_private_key=\"{}\"\npublic_root_certificate=\"{}\"\n[limits]\nmax_connections=64\nmax_sessions_per_connection=64\nmax_control_frame_bytes=65536\nbuffer_bytes=65536\nhandshake_timeout_secs=5\nidle_timeout_secs=900\n",
+            "[listener]\nlisten_address=\"127.0.0.1\"\nport=18743\n[security]\nmode=\"verified\"\nserver_certificate=\"/tmp/server.pem\"\nserver_private_key=\"/tmp/server.key\"\ntrusted_client_ca=\"/tmp/client-ca.pem\"\ndevice_intermediate_certificate=\"{}\"\ndevice_intermediate_private_key=\"{}\"\npublic_root_certificate=\"{}\"\n[enrollment]\nenabled=false\nallowlist_path=\"{}\"\n[limits]\nmax_connections=64\nmax_sessions_per_connection=64\nmax_control_frame_bytes=65536\nbuffer_bytes=65536\nhandshake_timeout_secs=5\nidle_timeout_secs=900\n",
             intermediate_cert.display(),
-            intermediate_key.display(),
+            intermediate_key_path.display(),
             root_cert.display(),
+            directory.join("allowlist.json").display(),
         ))
         .expect("config");
         let app_key = KeyPair::generate().expect("app key");
@@ -285,6 +347,41 @@ mod tests {
         )
         .expect("issued");
         assert_eq!(issued.certificate_chain().len(), 2);
+
+        // A different CA may be syntactically valid but must not authorize this device Intermediate.
+        let mut unrelated_params =
+            CertificateParams::new(Vec::<String>::new()).expect("unrelated root params");
+        unrelated_params
+            .distinguished_name
+            .push(DnType::CommonName, "unrelated-root");
+        unrelated_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        unrelated_params.key_usages = vec![
+            KeyUsagePurpose::KeyCertSign,
+            KeyUsagePurpose::DigitalSignature,
+        ];
+        let unrelated_root = CertifiedIssuer::self_signed(
+            unrelated_params,
+            KeyPair::generate().expect("unrelated root key"),
+        )
+        .expect("unrelated root");
+        crate::material::write_protected_file(
+            &root_cert,
+            uid,
+            unrelated_root.pem().as_bytes(),
+            ProtectedFileKind::Public,
+            MAX_PUBLIC_MATERIAL_BYTES,
+        )
+        .expect("replace root");
+        assert!(
+            issue_certificate(
+                config.security(),
+                uid,
+                AppId::new("app-a").expect("app"),
+                csr.der(),
+                2,
+            )
+            .is_err()
+        );
         std::fs::remove_dir_all(directory).expect("cleanup");
     }
 }

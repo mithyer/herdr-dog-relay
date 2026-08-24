@@ -18,6 +18,20 @@ use std::{
     path::{Path, PathBuf},
 };
 
+/// Explicit sidecar-lock guard that releases advisory ownership on every return path.
+struct AllowlistLock {
+    /// The exclusively locked sidecar file.
+    file: File,
+}
+
+impl Drop for AllowlistLock {
+    /// Releases the advisory lock before closing the sidecar file.
+    fn drop(&mut self) {
+        // Ignore cleanup failure because the enclosing operation already has its primary result.
+        let _ = self.file.unlock();
+    }
+}
+
 /// One owner-validated, atomically persisted allowlist.
 #[derive(Clone, Debug)]
 pub struct PersistentAllowlist {
@@ -59,7 +73,7 @@ impl PersistentAllowlist {
     }
 
     /// Opens and exclusively locks the sidecar file for one cross-process transaction.
-    fn lock_file(&self) -> RelayResult<File> {
+    fn lock_file(&self) -> RelayResult<AllowlistLock> {
         validate_protected_path(&self.path, self.expected_uid)?;
         let parent = self.path.parent().ok_or(RelayError::ConfigurationRead)?;
         let name = self
@@ -77,7 +91,7 @@ impl PersistentAllowlist {
             .map_err(|_| RelayError::ConfigurationRead)?;
         lock.try_lock_exclusive()
             .map_err(|_| RelayError::ConfigurationRead)?;
-        Ok(lock)
+        Ok(AllowlistLock { file: lock })
     }
 
     /// Loads the current JSON registry after the caller holds the sidecar lock.
@@ -118,14 +132,29 @@ impl PersistentAllowlist {
         self.registry.generation()
     }
 
-    /// Checks whether one certificate fingerprint may enter normal QRM.
+    /// Checks whether one certificate fingerprint may enter normal QRM at the current epoch.
     pub fn allows_qrm(&self, fingerprint: Fingerprint) -> bool {
         self.registry.allows_qrm(fingerprint)
     }
 
-    /// Checks whether one certificate fingerprint may request stable-latest update.
+    /// Checks normal-QRM admission against an explicit epoch for deterministic tests.
+    pub fn allows_qrm_at(&self, fingerprint: Fingerprint, now_epoch_seconds: u64) -> bool {
+        self.registry.allows_qrm_at(fingerprint, now_epoch_seconds)
+    }
+
+    /// Checks whether one certificate fingerprint may request stable-latest update at the current epoch.
     pub fn authorize_update(&self, fingerprint: Fingerprint) -> Result<(), EnrollmentError> {
         self.registry.authorize_update(fingerprint)
+    }
+
+    /// Checks update authorization against an explicit epoch for deterministic tests.
+    pub fn authorize_update_at(
+        &self,
+        fingerprint: Fingerprint,
+        now_epoch_seconds: u64,
+    ) -> Result<(), EnrollmentError> {
+        self.registry
+            .authorize_update_at(fingerprint, now_epoch_seconds)
     }
 
     /// Returns an entry by App identity for local operator commands.
@@ -236,11 +265,11 @@ mod tests {
         let certificate = authority.issue(&csr, 2, 1).expect("certificate");
         let fingerprint = certificate.fingerprint();
         store.enroll(certificate).expect("enroll");
-        assert!(store.allows_qrm(fingerprint));
+        assert!(store.allows_qrm_at(fingerprint, 2));
         store.revoke(&app).expect("revoke");
         drop(store);
         let reloaded = PersistentAllowlist::open(&path, uid).expect("reload");
-        assert!(!reloaded.allows_qrm(fingerprint));
+        assert!(!reloaded.allows_qrm_at(fingerprint, 2));
         fs::remove_dir_all(directory).expect("cleanup");
     }
 

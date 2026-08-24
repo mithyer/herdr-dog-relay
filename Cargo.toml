@@ -11,6 +11,7 @@ path = "src/lib.rs"
 
 [dependencies]
 ipnet = { version = "2.11", features = ["serde"] }
+libc = "0.2"
 rand = "0.9"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 rustls-pemfile = "2.2"

@@ -544,6 +544,8 @@ impl RelayConfig {
                 "security.trusted_client_ca",
                 &self.security.trusted_client_ca,
             )?;
+            // Normal QRM must always load an allowlist, even when new enrollment is disabled.
+            validate_absolute_path("enrollment.allowlist_path", &self.enrollment.allowlist_path)?;
             if self.enrollment.enabled {
                 validate_absolute_path(
                     "security.trusted_core_enrollment_ca",
@@ -664,5 +666,18 @@ idle_timeout_secs = 900
     fn plaintext_mode_is_not_a_value() {
         let invalid = VALID.replace("development_unverified", "tls_off");
         assert!(RelayConfig::from_toml_str(&invalid).is_err());
+    }
+
+    // TEST:relay/src/config.rs[tests::verified_mode_requires_allowlist_even_when_enrollment_is_disabled]
+    #[test]
+    fn verified_mode_requires_allowlist_even_when_enrollment_is_disabled() {
+        let verified_without_allowlist = VALID.replace("development_unverified", "verified");
+        assert!(RelayConfig::from_toml_str(&verified_without_allowlist).is_err());
+        // Disabling enrollment only removes the enrollment ALPN; it cannot weaken normal QRM admission.
+        let verified_with_allowlist = verified_without_allowlist.replace(
+            "[limits]",
+            "[enrollment]\nenabled = false\nallowlist_path = \"/tmp/allowlist.json\"\n\n[limits]",
+        );
+        assert!(RelayConfig::from_toml_str(&verified_with_allowlist).is_ok());
     }
 }

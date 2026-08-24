@@ -350,6 +350,7 @@ dependencies = [
  "flate2",
  "fs2",
  "ipnet",
+ "libc",
  "quinn",
  "rand 0.9.5",
  "rcgen",

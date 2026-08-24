@@ -8,7 +8,7 @@ use crate::{
     error::{RelayError, RelayResult},
 };
 use std::{
-    fs::{self, File, OpenOptions},
+    fs::{self, OpenOptions},
     io::{Read, Write},
     os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt},
     path::Path,
@@ -53,14 +53,26 @@ pub fn read_protected_file(
     max_bytes: u64,
 ) -> RelayResult<Vec<u8>> {
     validate_protected_path(path, expected_uid)?;
-    let metadata = fs::symlink_metadata(path).map_err(|_| RelayError::ConfigurationRead)?;
-    validate_file_metadata(&metadata, expected_uid, kind, max_bytes)?;
-    let mut file = File::open(path).map_err(|_| RelayError::ConfigurationRead)?;
-    let capacity = usize::try_from(metadata.len()).map_err(|_| RelayError::ConfigurationRead)?;
+    let expected_metadata =
+        fs::symlink_metadata(path).map_err(|_| RelayError::ConfigurationRead)?;
+    validate_file_metadata(&expected_metadata, expected_uid, kind, max_bytes)?;
+    // O_NOFOLLOW prevents a final-path symlink substitution between validation and open.
+    let mut options = OpenOptions::new();
+    options.read(true).custom_flags(libc::O_NOFOLLOW);
+    let mut file = options
+        .open(path)
+        .map_err(|_| RelayError::ConfigurationRead)?;
+    let opened_metadata = file.metadata().map_err(|_| RelayError::ConfigurationRead)?;
+    validate_file_metadata(&opened_metadata, expected_uid, kind, max_bytes)?;
+    if !same_file_identity(&expected_metadata, &opened_metadata) {
+        return Err(RelayError::ConfigurationRead);
+    }
+    let capacity =
+        usize::try_from(opened_metadata.len()).map_err(|_| RelayError::ConfigurationRead)?;
     let mut bytes = Vec::with_capacity(capacity);
     file.read_to_end(&mut bytes)
         .map_err(|_| RelayError::ConfigurationRead)?;
-    if bytes.len() as u64 != metadata.len() || bytes.len() as u64 > max_bytes {
+    if bytes.len() as u64 != opened_metadata.len() || bytes.len() as u64 > max_bytes {
         return Err(RelayError::ConfigurationRead);
     }
     Ok(bytes)
@@ -106,23 +118,60 @@ pub fn write_protected_file(
     Ok(())
 }
 
-/// Validates an absolute path and rejects symlink components before file access.
+/// Validates an absolute path and rejects final or non-root-owned symlink components before file access.
 pub fn validate_protected_path(path: &Path, expected_uid: u32) -> RelayResult<()> {
     validate_absolute_path("protected.file", path)?;
+    let components: Vec<_> = path.components().collect();
+    if components.iter().any(|component| {
+        matches!(
+            component,
+            std::path::Component::CurDir | std::path::Component::ParentDir
+        )
+    }) {
+        return Err(RelayError::InvalidConfiguration {
+            field: "protected.file",
+            reason: "path contains dot components",
+        });
+    }
+    let mut current = Path::new("/").to_path_buf();
+    for (index, component) in components.iter().enumerate() {
+        let std::path::Component::Normal(name) = component else {
+            continue;
+        };
+        current.push(name);
+        let is_final = index + 1 == components.len();
+        match fs::symlink_metadata(&current) {
+            Ok(metadata) => {
+                if metadata.file_type().is_symlink() && (is_final || metadata.uid() != 0) {
+                    return Err(RelayError::InvalidConfiguration {
+                        field: "protected.file",
+                        reason: "path contains an unsafe symlink component",
+                    });
+                }
+                if !is_final && !metadata.is_dir() && !metadata.file_type().is_symlink() {
+                    return Err(RelayError::ConfigurationRead);
+                }
+            }
+            Err(error) if is_final && error.kind() == std::io::ErrorKind::NotFound => break,
+            Err(_) => return Err(RelayError::ConfigurationRead),
+        }
+    }
     let immediate_parent = path.parent().ok_or(RelayError::ConfigurationRead)?;
-    let canonical_parent =
-        fs::canonicalize(immediate_parent).map_err(|_| RelayError::ConfigurationRead)?;
-    validate_directory(&canonical_parent, expected_uid)?;
-    let mut component = canonical_parent.parent();
+    validate_directory(immediate_parent, expected_uid)?;
+    let mut component = immediate_parent.parent();
     while let Some(current) = component {
         if current == Path::new("/") {
             break;
         }
         let metadata = fs::symlink_metadata(current).map_err(|_| RelayError::ConfigurationRead)?;
         let mode = metadata.mode();
-        let safe_ancestor = metadata.is_dir()
-            && !metadata.file_type().is_symlink()
-            && (metadata.uid() == expected_uid || mode & 0o022 == 0 || mode & 0o1000 != 0);
+        let safe_ancestor = if metadata.file_type().is_symlink() {
+            // Platform aliases such as macOS /var are acceptable only when root-owned.
+            metadata.uid() == 0
+        } else {
+            metadata.is_dir()
+                && (metadata.uid() == expected_uid || mode & 0o022 == 0 || mode & 0o1000 != 0)
+        };
         if !safe_ancestor {
             return Err(RelayError::InvalidConfiguration {
                 field: "protected.file",
@@ -132,6 +181,15 @@ pub fn validate_protected_path(path: &Path, expected_uid: u32) -> RelayResult<()
         component = current.parent();
     }
     Ok(())
+}
+
+/// Compares the descriptor identity with the metadata captured before opening a path.
+fn same_file_identity(expected: &fs::Metadata, opened: &fs::Metadata) -> bool {
+    expected.dev() == opened.dev()
+        && expected.ino() == opened.ino()
+        && expected.uid() == opened.uid()
+        && expected.mode() == opened.mode()
+        && expected.len() == opened.len()
 }
 
 /// Validates one protected file's type, owner, mode, and bounded size.

@@ -97,7 +97,7 @@ jobs:
     needs: build
     runs-on: macos-14
     steps:
-      # Download both architecture-specific archives into one release directory.
+      # Download every supported architecture-specific archive into one release directory.
       - name: Download archives
         uses: actions/download-artifact@v4
         with:

@@ -6,8 +6,6 @@
 use std::{
     collections::BTreeMap,
     env,
-    fs::File,
-    io::BufReader,
     net::SocketAddr,
     path::{Path, PathBuf},
     pin::Pin,
@@ -39,7 +37,10 @@ use crate::{
         read_frame as read_enrollment_frame, write_frame as write_enrollment_frame,
     },
     error::{RelayError, RelayResult},
-    material::{MAX_PUBLIC_MATERIAL_BYTES, ProtectedFileKind, current_uid, read_protected_file},
+    material::{
+        MAX_PRIVATE_MATERIAL_BYTES, MAX_PUBLIC_MATERIAL_BYTES, ProtectedFileKind, current_uid,
+        read_protected_file,
+    },
     pki::{current_epoch_seconds, issue_certificate},
     quic_wire::{
         DeviceHelloAck, HdqmFrame, HdqmKind, HdqsBinding, HdqsReason, HdqsResponse, SessionOpenAck,
@@ -149,8 +150,12 @@ pub struct QuicRelayServer {
     enrollment_connections: Arc<Semaphore>,
     /// In-memory single-use Core authorization IDs invalidated on process restart.
     consumed_enrollment_authorizations: Arc<Mutex<BTreeMap<[u8; 16], u64>>>,
-    /// Optional protected App allowlist used by production admission.
+    /// Protected App allowlist required by every bound verified-QRM server.
+    ///
+    /// Contract-only and test-only unverified owners retain `None` because they never expose
+    /// production normal-QRM admission.
     allowlist: Option<Arc<Mutex<PersistentAllowlist>>>,
+
     /// Optional test-only socket override for deterministic Unix bridge tests.
     socket_override: Option<PathBuf>,
 }
@@ -320,7 +325,8 @@ impl QuicRelayServer {
         let endpoint = quinn::Endpoint::server(server_config, address)
             .map_err(|error| RelayError::io("binding QRM UDP listener", error))?;
         let relay_identity = load_relay_identity(&config)?;
-        let allowlist = if config.enrollment().enabled() {
+        // Enrollment may be disabled, but verified normal QRM still requires an active allowlist.
+        let allowlist = if config.security().mode() == SecurityMode::Verified {
             let uid = current_uid()?;
             Some(Arc::new(Mutex::new(PersistentAllowlist::open(
                 config.enrollment().allowlist_path(),
@@ -424,10 +430,16 @@ impl QuicRelayServer {
                 reason: "unsupported QRM ALPN",
             });
         }
-        if let (Some(allowlist), Some(fingerprint)) = (&self.allowlist, peer_fingerprint)
-            && !allowlist.lock().await.allows_qrm(fingerprint)
-        {
-            return Err(RelayError::QuicAuthentication);
+        if self.config.security().mode() == SecurityMode::Verified {
+            // A valid TLS chain alone never admits normal QRM; the active allowlist is mandatory.
+            let allowlist = self
+                .allowlist
+                .as_ref()
+                .ok_or(RelayError::QuicAuthentication)?;
+            let fingerprint = peer_fingerprint.ok_or(RelayError::QuicAuthentication)?;
+            if !allowlist.lock().await.allows_qrm(fingerprint) {
+                return Err(RelayError::QuicAuthentication);
+            }
         }
         let connection_epoch = rand::random::<u64>().max(1);
         let registry = Arc::new(Mutex::new(self.new_connection(connection_epoch)?));
@@ -470,6 +482,20 @@ impl QuicRelayServer {
         loop {
             tokio::select! {
                 _ = expiry_tick.tick() => {
+                    // Recheck the persistent allowlist independently of control traffic so a
+                    // local revoke closes an idle connection and all of its matching sessions.
+                    if let (Some(allowlist), Some(fingerprint)) = (&self.allowlist, peer_fingerprint) {
+                        let allowed = {
+                            let mut allowlist = allowlist.lock().await;
+                            allowlist.reload().is_ok() && allowlist.allows_qrm(fingerprint)
+                        };
+                        if !allowed {
+                            session_tasks.abort_all();
+                            while session_tasks.join_next().await.is_some() {}
+                            connection.close(0u32.into(), b"allowlist revoked");
+                            return Ok(());
+                        }
+                    }
                     let expired = registry.lock().await.reap_expired_handles(Instant::now());
                     for handle in expired {
                         self.cancel_session(&session_controls, handle).await;
@@ -887,7 +913,9 @@ impl QuicRelayServer {
             try_acquire(&self.enrollment_handshakes).ok_or(RelayError::ResourceLimit)?;
         let _connection_permit =
             try_acquire(&self.enrollment_connections).ok_or(RelayError::ResourceLimit)?;
-        let (mut send, mut recv) = timeout(self.handshake_timeout(), connection.accept_bi())
+        // The Relay opens the challenge stream so the challenge-first protocol cannot deadlock
+        // waiting for a client frame before the client has received the challenge.
+        let (mut send, mut recv) = timeout(self.handshake_timeout(), connection.open_bi())
             .await
             .map_err(|_| RelayError::QuicHandshake {
                 reason: "enrollment control stream timeout",
@@ -1080,6 +1108,13 @@ impl QuicRelayServer {
         send.finish().map_err(|_| RelayError::QuicProtocol {
             reason: "finishing enrollment connection",
         })?;
+        // Wait for the peer to acknowledge the terminal response before closing the QUIC
+        // connection; an immediate CONNECTION_CLOSE can discard the just-issued certificate.
+        let _ = timeout(
+            Duration::from_secs(self.config.enrollment().connection_lifetime_secs()),
+            send.stopped(),
+        )
+        .await;
         connection.close(0u32.into(), b"enrollment complete");
         Ok(())
     }
@@ -1104,6 +1139,12 @@ impl QuicRelayServer {
         send.finish().map_err(|_| RelayError::QuicProtocol {
             reason: "finishing enrollment rejection",
         })?;
+        // Preserve the bounded rejection payload before the terminal connection close.
+        let _ = timeout(
+            Duration::from_secs(self.config.enrollment().connection_lifetime_secs()),
+            send.stopped(),
+        )
+        .await;
         Ok(())
     }
 
@@ -1403,6 +1444,7 @@ fn perform_stable_latest_update(config: RelayConfig) -> RelayResult<()> {
     let (archive, checksums) = updater.download_latest(os, arch)?;
     updater.verify_checksum(&archive, &checksums)?;
     let staged = updater.extract_verified(&archive)?;
+    updater.verify_staged_startup(&staged)?;
     let installed = std::env::current_exe().map_err(|_| RelayError::Update {
         operation: "running stable-latest update",
         reason: "current executable path is unavailable",
@@ -1716,24 +1758,38 @@ fn load_relay_identity(config: &RelayConfig) -> RelayResult<[u8; 32]> {
     Ok(identity)
 }
 
-/// Loads all PEM certificates from a bounded deployment path.
+/// Loads all PEM certificates only after protected-file ownership and mode validation.
 fn load_certificates(path: &Path) -> RelayResult<Vec<rustls::pki_types::CertificateDer<'static>>> {
-    let file = File::open(path).map_err(|_| RelayError::TlsConfiguration {
-        reason: "certificate file could not be opened",
+    // Read the certificate chain through the same protected-file boundary as enrollment anchors.
+    let bytes = read_protected_file(
+        path,
+        current_uid()?,
+        ProtectedFileKind::Public,
+        MAX_PUBLIC_MATERIAL_BYTES,
+    )
+    .map_err(|_| RelayError::TlsConfiguration {
+        reason: "certificate material is unsafe",
     })?;
-    rustls_pemfile::certs(&mut BufReader::new(file))
+    rustls_pemfile::certs(&mut std::io::BufReader::new(bytes.as_slice()))
         .collect::<Result<Vec<_>, _>>()
         .map_err(|_| RelayError::TlsConfiguration {
             reason: "certificate PEM is invalid",
         })
 }
 
-/// Loads one PEM private key without retaining its source path in diagnostics.
+/// Loads one PEM private key only after owner-only protected-file validation.
 fn load_private_key(path: &Path) -> RelayResult<rustls::pki_types::PrivateKeyDer<'static>> {
-    let file = File::open(path).map_err(|_| RelayError::TlsConfiguration {
-        reason: "private-key file could not be opened",
+    // Private key bytes remain transient after the protected reader rejects unsafe paths and modes.
+    let bytes = read_protected_file(
+        path,
+        current_uid()?,
+        ProtectedFileKind::Private,
+        MAX_PRIVATE_MATERIAL_BYTES,
+    )
+    .map_err(|_| RelayError::TlsConfiguration {
+        reason: "private-key material is unsafe",
     })?;
-    rustls_pemfile::private_key(&mut BufReader::new(file))
+    rustls_pemfile::private_key(&mut std::io::BufReader::new(bytes.as_slice()))
         .map_err(|_| RelayError::TlsConfiguration {
             reason: "private-key PEM is invalid",
         })?
@@ -1764,14 +1820,26 @@ fn load_client_roots(path: &Path) -> RelayResult<rustls::RootCertStore> {
 mod tests {
     use super::*;
     use crate::config::RelayConfig;
-    use crate::quic_wire::{
-        HdqmFrame, HdqmKind, HdqsBinding, HdqsResponse, SessionName, SessionOpenAck,
-        SessionOpenRequest, SessionPrepareAck, SessionPrepareRequest,
+    use crate::{
+        enrollment_wire::{
+            EnrollmentChallengePayload, EnrollmentFrame, EnrollmentFrameKind,
+            EnrollmentIssuedPayload, EnrollmentSubmitPayload, read_frame as read_enrollment_frame,
+            write_frame as write_enrollment_frame,
+        },
+        quic_wire::{
+            HdqmFrame, HdqmKind, HdqsBinding, HdqsResponse, SessionName, SessionOpenAck,
+            SessionOpenRequest, SessionPrepareAck, SessionPrepareRequest,
+        },
+    };
+    use rcgen::{
+        BasicConstraints, Certificate as RcgenCertificate, CertificateParams, CertifiedIssuer,
+        DnType, ExtendedKeyUsagePurpose, IsCa, KeyPair, KeyUsagePurpose,
     };
     use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
     use std::{
         fs,
-        os::unix::fs::PermissionsExt,
+        os::unix::fs::{PermissionsExt, symlink},
+        path::Path,
         sync::Arc,
         time::{SystemTime, UNIX_EPOCH},
     };
@@ -1896,9 +1964,11 @@ idle_timeout_secs = 900
             rcgen::generate_simple_self_signed(vec!["localhost".to_owned()]).expect("server cert");
         let server_cert_path = root.join("server.pem");
         let server_key_path = root.join("server.key");
-        fs::write(&server_cert_path, server_cert.cert.pem()).expect("server cert file");
-        fs::write(&server_key_path, server_cert.signing_key.serialize_pem())
-            .expect("server key file");
+        write_test_material(&server_cert_path, server_cert.cert.pem().as_bytes());
+        write_test_material(
+            &server_key_path,
+            server_cert.signing_key.serialize_pem().as_bytes(),
+        );
         let socket_path = root.join("herdr.sock");
         let unix_listener = UnixListener::bind(&socket_path).expect("unix listener");
         fs::set_permissions(&socket_path, fs::Permissions::from_mode(0o600)).expect("socket mode");
@@ -2145,9 +2215,11 @@ idle_timeout_secs = 900
             rcgen::generate_simple_self_signed(vec!["localhost".to_owned()]).expect("server cert");
         let server_cert_path = root.join("server.pem");
         let server_key_path = root.join("server.key");
-        fs::write(&server_cert_path, server_cert.cert.pem()).expect("server cert file");
-        fs::write(&server_key_path, server_cert.signing_key.serialize_pem())
-            .expect("server key file");
+        write_test_material(&server_cert_path, server_cert.cert.pem().as_bytes());
+        write_test_material(
+            &server_key_path,
+            server_cert.signing_key.serialize_pem().as_bytes(),
+        );
         let port = std::net::UdpSocket::bind("127.0.0.1:0")
             .expect("free UDP port")
             .local_addr()
@@ -2216,9 +2288,11 @@ idle_timeout_secs = 900
             rcgen::generate_simple_self_signed(vec!["localhost".to_owned()]).expect("server cert");
         let server_cert_path = root.join("server.pem");
         let server_key_path = root.join("server.key");
-        fs::write(&server_cert_path, server_cert.cert.pem()).expect("server cert file");
-        fs::write(&server_key_path, server_cert.signing_key.serialize_pem())
-            .expect("server key file");
+        write_test_material(&server_cert_path, server_cert.cert.pem().as_bytes());
+        write_test_material(
+            &server_key_path,
+            server_cert.signing_key.serialize_pem().as_bytes(),
+        );
         let port = std::net::UdpSocket::bind("127.0.0.1:0")
             .expect("free UDP port")
             .local_addr()
@@ -2329,9 +2403,11 @@ idle_timeout_secs = 900
             rcgen::generate_simple_self_signed(vec!["localhost".to_owned()]).expect("server cert");
         let server_cert_path = root.join("server.pem");
         let server_key_path = root.join("server.key");
-        fs::write(&server_cert_path, server_cert.cert.pem()).expect("server cert file");
-        fs::write(&server_key_path, server_cert.signing_key.serialize_pem())
-            .expect("server key file");
+        write_test_material(&server_cert_path, server_cert.cert.pem().as_bytes());
+        write_test_material(
+            &server_key_path,
+            server_cert.signing_key.serialize_pem().as_bytes(),
+        );
         let port = std::net::UdpSocket::bind("127.0.0.1:0")
             .expect("free UDP port")
             .local_addr()
@@ -2407,9 +2483,11 @@ idle_timeout_secs = 900
             rcgen::generate_simple_self_signed(vec!["localhost".to_owned()]).expect("server cert");
         let server_cert_path = root.join("server.pem");
         let server_key_path = root.join("server.key");
-        fs::write(&server_cert_path, server_cert.cert.pem()).expect("server cert file");
-        fs::write(&server_key_path, server_cert.signing_key.serialize_pem())
-            .expect("server key file");
+        write_test_material(&server_cert_path, server_cert.cert.pem().as_bytes());
+        write_test_material(
+            &server_key_path,
+            server_cert.signing_key.serialize_pem().as_bytes(),
+        );
         let missing_socket = root.join("missing.sock");
         let port = std::net::UdpSocket::bind("127.0.0.1:0")
             .expect("free UDP port")
@@ -2528,10 +2606,13 @@ idle_timeout_secs = 900
         let client_cert =
             rcgen::generate_simple_self_signed(vec!["client".to_owned()]).expect("client cert");
         let client_cert_path = root.join("client.pem");
-        fs::write(&server_cert_path, server_cert.cert.pem()).expect("server cert file");
-        fs::write(&server_key_path, server_cert.signing_key.serialize_pem())
-            .expect("server key file");
-        fs::write(&client_cert_path, client_cert.cert.pem()).expect("client cert file");
+        let allowlist_path = root.join("allowlist.json");
+        write_test_material(&server_cert_path, server_cert.cert.pem().as_bytes());
+        write_test_material(
+            &server_key_path,
+            server_cert.signing_key.serialize_pem().as_bytes(),
+        );
+        write_test_material(&client_cert_path, client_cert.cert.pem().as_bytes());
         let socket_path = root.join("herdr.sock");
         let test_port = std::net::UdpSocket::bind("127.0.0.1:0")
             .expect("free UDP port")
@@ -2552,9 +2633,30 @@ idle_timeout_secs = 900
             stream.shutdown().await.expect("close Unix stream");
         });
         let config = RelayConfig::from_toml_str(&format!(
-            "[listener]\nlisten_address=\"127.0.0.1\"\nport={test_port}\n[security]\nmode=\"verified\"\nserver_certificate=\"{}\"\nserver_private_key=\"{}\"\ntrusted_client_ca=\"{}\"\n[limits]\nmax_connections=64\nmax_sessions_per_connection=64\nmax_control_frame_bytes=65536\nbuffer_bytes=65536\nhandshake_timeout_secs=5\nidle_timeout_secs=900\n",
-            server_cert_path.display(), server_key_path.display(), client_cert_path.display()
+            "[listener]\nlisten_address=\"127.0.0.1\"\nport={test_port}\n[security]\nmode=\"verified\"\nserver_certificate=\"{}\"\nserver_private_key=\"{}\"\ntrusted_client_ca=\"{}\"\n[enrollment]\nenabled=false\nallowlist_path=\"{}\"\n[limits]\nmax_connections=64\nmax_sessions_per_connection=64\nmax_control_frame_bytes=65536\nbuffer_bytes=65536\nhandshake_timeout_secs=5\nidle_timeout_secs=900\n",
+            server_cert_path.display(),
+            server_key_path.display(),
+            client_cert_path.display(),
+            allowlist_path.display(),
         )).expect("config");
+        // Populate the mandatory verified-QRM allowlist with this test client's exact leaf hash.
+        let client_fingerprint =
+            Fingerprint::from_bytes(Sha256::digest(client_cert.cert.der()).into())
+                .expect("client fingerprint");
+        let now = current_epoch_seconds().expect("test epoch");
+        let certificate = crate::enrollment::CertificateMetadata::new(
+            AppId::new("bridge-client").expect("App ID"),
+            client_fingerprint,
+            1,
+            1,
+            now,
+            now.checked_add(3600).expect("test expiry"),
+        )
+        .expect("allowlist certificate metadata");
+        let mut allowlist = PersistentAllowlist::open(&allowlist_path, current_uid().expect("UID"))
+            .expect("allowlist");
+        allowlist.enroll(certificate).expect("allowlist enrollment");
+        drop(allowlist);
         let server = QuicRelayServer::bind_with_socket_path(config, 7, socket_path)
             .await
             .expect("bind server");
@@ -2727,22 +2829,30 @@ idle_timeout_secs = 900
         fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).expect("root mode");
         let server =
             rcgen::generate_simple_self_signed(vec!["localhost".to_owned()]).expect("server cert");
-        let client_ca =
-            rcgen::generate_simple_self_signed(vec!["client-ca".to_owned()]).expect("client CA");
+        let client_ca = test_ca("client-ca");
+        let (unlisted_client, unlisted_client_key) =
+            test_client_certificate("unlisted-client", &client_ca);
         let server_cert_path = root.join("server.pem");
         let server_key_path = root.join("server.key");
         let client_ca_path = root.join("client-ca.pem");
-        fs::write(&server_cert_path, server.cert.pem()).expect("server cert");
-        fs::write(&server_key_path, server.signing_key.serialize_pem()).expect("server key");
-        fs::write(&client_ca_path, client_ca.cert.pem()).expect("client ca");
+        let allowlist_path = root.join("allowlist.json");
+        write_test_material(&server_cert_path, server.cert.pem().as_bytes());
+        write_test_material(
+            &server_key_path,
+            server.signing_key.serialize_pem().as_bytes(),
+        );
+        write_test_material(&client_ca_path, client_ca.pem().as_bytes());
         let port = std::net::UdpSocket::bind("127.0.0.1:0")
             .expect("free UDP port")
             .local_addr()
             .expect("UDP address")
             .port();
         let config = RelayConfig::from_toml_str(&format!(
-            "[listener]\nlisten_address=\"127.0.0.1\"\nport={port}\n[security]\nmode=\"verified\"\nserver_certificate=\"{}\"\nserver_private_key=\"{}\"\ntrusted_client_ca=\"{}\"\n[limits]\nmax_connections=64\nmax_sessions_per_connection=64\nmax_control_frame_bytes=65536\nbuffer_bytes=65536\nhandshake_timeout_secs=5\nidle_timeout_secs=900\n",
-            server_cert_path.display(), server_key_path.display(), client_ca_path.display()
+            "[listener]\nlisten_address=\"127.0.0.1\"\nport={port}\n[security]\nmode=\"verified\"\nserver_certificate=\"{}\"\nserver_private_key=\"{}\"\ntrusted_client_ca=\"{}\"\n[enrollment]\nenabled=false\nallowlist_path=\"{}\"\n[limits]\nmax_connections=64\nmax_sessions_per_connection=64\nmax_control_frame_bytes=65536\nbuffer_bytes=65536\nhandshake_timeout_secs=5\nidle_timeout_secs=900\n",
+            server_cert_path.display(),
+            server_key_path.display(),
+            client_ca_path.display(),
+            allowlist_path.display(),
         )).expect("verified config");
         let server_cert_der = server.cert.der().to_vec();
         let server = QuicRelayServer::bind(config, 9)
@@ -2785,6 +2895,25 @@ idle_timeout_secs = 900
                 assert!(!matches!(closed, quinn::ConnectionError::LocallyClosed));
             }
         }
+        // A trusted mTLS chain alone is insufficient: an unlisted App closes before QRM use.
+        let mut unlisted_endpoint =
+            quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).expect("unlisted endpoint");
+        unlisted_endpoint.set_default_client_config(test_client_config(
+            server_cert_der.clone(),
+            vec![unlisted_client.der().to_vec(), client_ca.der().to_vec()],
+            Some(unlisted_client_key.serialize_der()),
+            QRM_RELAY_ALPN,
+        ));
+        let unlisted_connection = unlisted_endpoint
+            .connect(address, "localhost")
+            .expect("unlisted connect")
+            .await
+            .expect("unlisted TLS transport");
+        tokio::time::timeout(Duration::from_secs(1), unlisted_connection.closed())
+            .await
+            .expect("unlisted App must close before QRM use");
+        unlisted_endpoint.close(0u32.into(), b"unlisted App test complete");
+
         let mut wrong_roots = rustls::RootCertStore::empty();
         wrong_roots
             .add(CertificateDer::from(server_cert_der))
@@ -2819,6 +2948,703 @@ idle_timeout_secs = 900
         }
         let _ = shutdown_tx.send(());
         task.await.expect("server task").expect("server result");
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    /// Build a protected test file with the owner-only mode required by Relay configuration.
+    fn write_test_material(path: &Path, bytes: &[u8]) {
+        fs::write(path, bytes).expect("material");
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600)).expect("material mode");
+    }
+
+    // TEST:relay/src/quic_server.rs[tests::verified_tls_loaders_reject_unsafe_server_material]
+    #[test]
+    fn verified_tls_loaders_reject_unsafe_server_material() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let root = fs::canonicalize(std::env::temp_dir())
+            .expect("temporary root")
+            .join(format!(
+                "qrm-unsafe-tls-material-{}-{nonce}",
+                std::process::id()
+            ));
+        fs::create_dir(&root).expect("root");
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).expect("root mode");
+        let identity =
+            rcgen::generate_simple_self_signed(vec!["localhost".to_owned()]).expect("identity");
+        let client_ca = test_ca("loader-client-ca");
+        let certificate = root.join("server.pem");
+        let private_key = root.join("server.key");
+        let trusted_client_ca = root.join("client-ca.pem");
+        let allowlist = root.join("allowlist.json");
+        write_test_material(&certificate, identity.cert.pem().as_bytes());
+        write_test_material(
+            &private_key,
+            identity.signing_key.serialize_pem().as_bytes(),
+        );
+        write_test_material(&trusted_client_ca, client_ca.pem().as_bytes());
+        let config_for = |server_certificate: &Path,
+                          server_private_key: &Path,
+                          client_ca: &Path| {
+            RelayConfig::from_toml_str(&format!(
+                "[listener]\nlisten_address=\"127.0.0.1\"\nport=18743\n[security]\nmode=\"verified\"\nserver_certificate=\"{}\"\nserver_private_key=\"{}\"\ntrusted_client_ca=\"{}\"\n[enrollment]\nenabled=false\nallowlist_path=\"{}\"\n[limits]\nmax_connections=64\nmax_sessions_per_connection=64\nmax_control_frame_bytes=65536\nbuffer_bytes=65536\nhandshake_timeout_secs=5\nidle_timeout_secs=900\n",
+                server_certificate.display(),
+                server_private_key.display(),
+                client_ca.display(),
+                allowlist.display(),
+            ))
+            .expect("configuration")
+        };
+        assert!(
+            build_server_config(&config_for(&certificate, &private_key, &trusted_client_ca,))
+                .is_ok()
+        );
+
+        fs::set_permissions(&certificate, fs::Permissions::from_mode(0o666))
+            .expect("unsafe certificate mode");
+        assert!(
+            build_server_config(&config_for(&certificate, &private_key, &trusted_client_ca,))
+                .is_err()
+        );
+        write_test_material(&certificate, identity.cert.pem().as_bytes());
+
+        fs::set_permissions(&private_key, fs::Permissions::from_mode(0o644))
+            .expect("unsafe private-key mode");
+        assert!(
+            build_server_config(&config_for(&certificate, &private_key, &trusted_client_ca,))
+                .is_err()
+        );
+        write_test_material(
+            &private_key,
+            identity.signing_key.serialize_pem().as_bytes(),
+        );
+
+        fs::set_permissions(&trusted_client_ca, fs::Permissions::from_mode(0o666))
+            .expect("unsafe client CA mode");
+        assert!(
+            build_server_config(&config_for(&certificate, &private_key, &trusted_client_ca,))
+                .is_err()
+        );
+        write_test_material(&trusted_client_ca, client_ca.pem().as_bytes());
+
+        let certificate_link = root.join("server-link.pem");
+        symlink(&certificate, &certificate_link).expect("certificate symlink");
+        assert!(
+            build_server_config(&config_for(
+                &certificate_link,
+                &private_key,
+                &trusted_client_ca,
+            ))
+            .is_err()
+        );
+
+        let unsafe_parent = root.join("unsafe-parent");
+        fs::create_dir(&unsafe_parent).expect("unsafe parent");
+        let unsafe_ca = unsafe_parent.join("client-ca.pem");
+        write_test_material(&unsafe_ca, client_ca.pem().as_bytes());
+        fs::set_permissions(&unsafe_parent, fs::Permissions::from_mode(0o777))
+            .expect("unsafe parent mode");
+        assert!(build_server_config(&config_for(&certificate, &private_key, &unsafe_ca)).is_err());
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    /// Create a disposable CA issuer whose private key never leaves the test process.
+    fn test_ca(name: &str) -> CertifiedIssuer<'static, KeyPair> {
+        let mut params = CertificateParams::new(Vec::<String>::new()).expect("CA params");
+        params.distinguished_name.push(DnType::CommonName, name);
+        params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        params.key_usages = vec![
+            KeyUsagePurpose::KeyCertSign,
+            KeyUsagePurpose::DigitalSignature,
+        ];
+        CertifiedIssuer::self_signed(params, KeyPair::generate().expect("CA key")).expect("CA")
+    }
+
+    /// Issue a disposable client certificate from a test CA with the requested client usage.
+    fn test_client_certificate(
+        name: &str,
+        issuer: &CertifiedIssuer<'_, KeyPair>,
+    ) -> (RcgenCertificate, KeyPair) {
+        let key = KeyPair::generate().expect("client key");
+        let mut params = CertificateParams::new(Vec::<String>::new()).expect("client params");
+        params.distinguished_name.push(DnType::CommonName, name);
+        params.is_ca = IsCa::NoCa;
+        params.key_usages = vec![KeyUsagePurpose::DigitalSignature];
+        params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ClientAuth];
+        let certificate = params.signed_by(&key, issuer).expect("client certificate");
+        (certificate, key)
+    }
+
+    /// Build a TLS 1.3 QUIC client config with optional mTLS identity and one ALPN.
+    fn test_client_config(
+        server_certificate: Vec<u8>,
+        client_chain: Vec<Vec<u8>>,
+        client_key: Option<Vec<u8>>,
+        alpn: &[u8],
+    ) -> quinn::ClientConfig {
+        let mut roots = rustls::RootCertStore::empty();
+        roots
+            .add(CertificateDer::from(server_certificate))
+            .expect("server root");
+        let builder = rustls::ClientConfig::builder_with_provider(Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_protocol_versions(&[&rustls::version::TLS13])
+        .expect("TLS 1.3")
+        .with_root_certificates(Arc::new(roots));
+        let mut tls = match client_key {
+            Some(client_key) => builder
+                .with_client_auth_cert(
+                    client_chain.into_iter().map(CertificateDer::from).collect(),
+                    PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(client_key)),
+                )
+                .expect("client identity"),
+            None => builder.with_no_client_auth(),
+        };
+        tls.alpn_protocols = vec![alpn.to_vec()];
+        quinn::ClientConfig::new(Arc::new(
+            quinn::crypto::rustls::QuicClientConfig::try_from(tls).expect("QUIC client TLS"),
+        ))
+    }
+
+    /// Enroll one App over the real terminal enrollment ALPN and return its public chain/key.
+    async fn enroll_test_app(
+        address: SocketAddr,
+        server_certificate: Vec<u8>,
+        core_chain: Vec<Vec<u8>>,
+        core_key: Vec<u8>,
+        core_identity: [u8; 32],
+        app_id: &str,
+        request_id: u8,
+    ) -> (Vec<Vec<u8>>, Vec<u8>, [u8; 32]) {
+        let app_key = KeyPair::generate().expect("App key");
+        let app_key_der = app_key.serialize_der();
+        let mut csr_params = CertificateParams::new(Vec::<String>::new()).expect("CSR params");
+        csr_params
+            .distinguished_name
+            .push(DnType::CommonName, app_id);
+        let csr = csr_params
+            .serialize_request(&app_key)
+            .expect("CSR")
+            .der()
+            .to_vec();
+        let mut endpoint = quinn::Endpoint::client("127.0.0.1:0".parse().expect("client bind"))
+            .expect("client endpoint");
+        endpoint.set_default_client_config(test_client_config(
+            server_certificate,
+            core_chain,
+            Some(core_key),
+            QRM_ENROLLMENT_ALPN,
+        ));
+        let connection = endpoint
+            .connect(address, "localhost")
+            .expect("enrollment connect")
+            .await
+            .expect("enrollment TLS");
+        let (mut send, mut recv) = connection.accept_bi().await.expect("enrollment stream");
+        let challenge_frame = read_enrollment_frame(&mut recv, 65_536)
+            .await
+            .expect("challenge frame");
+        let challenge: EnrollmentChallengePayload = challenge_frame
+            .parse_json(EnrollmentFrameKind::Challenge)
+            .expect("challenge payload");
+        let submission = EnrollmentFrame::json(
+            EnrollmentFrameKind::Submit,
+            &EnrollmentSubmitPayload {
+                app_id: app_id.to_owned(),
+                pairing_id: format!("pairing-{request_id}"),
+                target_id: format!("target-{request_id}"),
+                core_identity,
+                authorization_id: [request_id; 16],
+                challenge: challenge.challenge,
+                code_proof: [request_id.saturating_add(10); 32],
+                configuration_generation: 1,
+                expires_at_epoch_seconds: challenge.expires_at_epoch_seconds,
+                csr,
+            },
+            65_536,
+        )
+        .expect("submission frame");
+        write_enrollment_frame(&mut send, &submission, 65_536)
+            .await
+            .expect("submission");
+        let issued_frame = match read_enrollment_frame(&mut recv, 65_536).await {
+            Ok(frame) => frame,
+            Err(error) => {
+                let close_reason = connection.closed().await;
+                panic!("issued frame failed: {error:?}; close={close_reason:?}");
+            }
+        };
+        assert_eq!(
+            issued_frame.kind,
+            EnrollmentFrameKind::Issued,
+            "enrollment rejected: {:?}",
+            issued_frame.kind
+        );
+        let issued: EnrollmentIssuedPayload = issued_frame
+            .parse_json(EnrollmentFrameKind::Issued)
+            .expect("issued payload");
+        assert_eq!(issued.certificate_chain.len(), 2);
+        connection.close(0u32.into(), b"test enrollment complete");
+        endpoint.close(0u32.into(), b"test enrollment complete");
+        (issued.certificate_chain, app_key_der, issued.fingerprint)
+    }
+
+    /// Prove that a normal HDQM frame on the enrollment ALPN is rejected before QRM access.
+    async fn enrollment_rejects_normal_qrm_frame(
+        address: SocketAddr,
+        server_certificate: Vec<u8>,
+        core_chain: Vec<Vec<u8>>,
+        core_key: Vec<u8>,
+    ) {
+        let mut endpoint = quinn::Endpoint::client("127.0.0.1:0".parse().expect("client bind"))
+            .expect("client endpoint");
+        endpoint.set_default_client_config(test_client_config(
+            server_certificate,
+            core_chain,
+            Some(core_key),
+            QRM_ENROLLMENT_ALPN,
+        ));
+        let connection = endpoint
+            .connect(address, "localhost")
+            .expect("enrollment connect")
+            .await
+            .expect("enrollment TLS");
+        let (mut send, mut recv) = connection.accept_bi().await.expect("enrollment stream");
+        let challenge = read_enrollment_frame(&mut recv, 65_536)
+            .await
+            .expect("challenge");
+        assert_eq!(challenge.kind, EnrollmentFrameKind::Challenge);
+        let normal_frame = HdqmFrame {
+            kind: HdqmKind::DeviceHello,
+            request_id: [88; 16],
+            payload: Vec::new(),
+        }
+        .encode()
+        .expect("normal frame");
+        send.write_all(&normal_frame)
+            .await
+            .expect("normal frame write");
+        let rejection = read_enrollment_frame(&mut recv, 65_536)
+            .await
+            .expect("enrollment rejection");
+        assert_eq!(rejection.kind, EnrollmentFrameKind::Rejected);
+        tokio::time::timeout(Duration::from_secs(1), connection.closed())
+            .await
+            .expect("enrollment terminal close");
+        endpoint.close(0u32.into(), b"enrollment protocol boundary");
+    }
+
+    /// Hold one authenticated enrollment connection open until the quota test finishes.
+    async fn open_enrollment_hold(
+        address: SocketAddr,
+        server_certificate: Vec<u8>,
+        core_chain: Vec<Vec<u8>>,
+        core_key: Vec<u8>,
+    ) -> (
+        quinn::Endpoint,
+        quinn::Connection,
+        quinn::SendStream,
+        quinn::RecvStream,
+    ) {
+        let mut endpoint = quinn::Endpoint::client("127.0.0.1:0".parse().expect("client bind"))
+            .expect("client endpoint");
+        endpoint.set_default_client_config(test_client_config(
+            server_certificate,
+            core_chain,
+            Some(core_key),
+            QRM_ENROLLMENT_ALPN,
+        ));
+        let connection = endpoint
+            .connect(address, "localhost")
+            .expect("enrollment connect")
+            .await
+            .expect("enrollment TLS");
+        let (send, mut recv) = connection.accept_bi().await.expect("enrollment stream");
+        let challenge = read_enrollment_frame(&mut recv, 65_536)
+            .await
+            .expect("quota challenge");
+        assert_eq!(challenge.kind, EnrollmentFrameKind::Challenge);
+        (endpoint, connection, send, recv)
+    }
+
+    /// Prove a revoked certificate cannot re-enter normal QRM after reconnecting.
+    async fn assert_revoked_normal_qrm_rejected(
+        address: SocketAddr,
+        server_certificate: Vec<u8>,
+        client_chain: Vec<Vec<u8>>,
+        client_key: Vec<u8>,
+    ) {
+        let mut endpoint = quinn::Endpoint::client("127.0.0.1:0".parse().expect("client bind"))
+            .expect("client endpoint");
+        endpoint.set_default_client_config(test_client_config(
+            server_certificate,
+            client_chain,
+            Some(client_key),
+            QRM_RELAY_ALPN,
+        ));
+        let connection = endpoint
+            .connect(address, "localhost")
+            .expect("revoked reconnect")
+            .await
+            .expect("revoked TLS transport");
+        tokio::time::timeout(Duration::from_secs(1), connection.closed())
+            .await
+            .expect("revoked reconnect must close before QRM use");
+        endpoint.close(0u32.into(), b"revoked reconnect");
+    }
+
+    /// Prove the separate enrollment connection quota rejects a fifth held handshake.
+    async fn assert_enrollment_quota_exhausted(
+        address: SocketAddr,
+        server_certificate: Vec<u8>,
+        core_chain: Vec<Vec<u8>>,
+        core_key: Vec<u8>,
+    ) {
+        let mut held = Vec::new();
+        for _ in 0..4 {
+            held.push(
+                open_enrollment_hold(
+                    address,
+                    server_certificate.clone(),
+                    core_chain.clone(),
+                    core_key.clone(),
+                )
+                .await,
+            );
+        }
+        let mut endpoint = quinn::Endpoint::client("127.0.0.1:0".parse().expect("client bind"))
+            .expect("quota endpoint");
+        endpoint.set_default_client_config(test_client_config(
+            server_certificate,
+            core_chain,
+            Some(core_key),
+            QRM_ENROLLMENT_ALPN,
+        ));
+        let connection = endpoint
+            .connect(address, "localhost")
+            .expect("quota connect")
+            .await
+            .expect("quota TLS transport");
+        tokio::time::timeout(Duration::from_secs(1), connection.closed())
+            .await
+            .expect("fifth enrollment connection must close");
+        endpoint.close(0u32.into(), b"quota complete");
+        for (endpoint, connection, _send, _recv) in held {
+            connection.close(0u32.into(), b"quota release");
+            endpoint.close(0u32.into(), b"quota release");
+        }
+    }
+
+    /// Connect one enrolled App to normal QRM and complete the DeviceHello barrier.
+    async fn connect_normal_test_app(
+        address: SocketAddr,
+        server_certificate: Vec<u8>,
+        client_chain: Vec<Vec<u8>>,
+        client_key: Vec<u8>,
+    ) -> (
+        quinn::Endpoint,
+        quinn::Connection,
+        quinn::SendStream,
+        quinn::RecvStream,
+    ) {
+        let mut endpoint = quinn::Endpoint::client("127.0.0.1:0".parse().expect("client bind"))
+            .expect("client endpoint");
+        endpoint.set_default_client_config(test_client_config(
+            server_certificate,
+            client_chain,
+            Some(client_key),
+            QRM_RELAY_ALPN,
+        ));
+        let connection = endpoint
+            .connect(address, "localhost")
+            .expect("normal connect")
+            .await
+            .expect("normal TLS");
+        let (mut send, mut recv) = connection.open_bi().await.expect("control stream");
+        send_control_frame(
+            &mut send,
+            HdqmFrame {
+                kind: HdqmKind::DeviceHello,
+                request_id: [90; 16],
+                payload: Vec::new(),
+            },
+        )
+        .await
+        .expect("DeviceHello");
+        assert_eq!(
+            read_control_frame(&mut recv)
+                .await
+                .expect("DeviceHelloAck")
+                .kind,
+            HdqmKind::DeviceHelloAck
+        );
+        (endpoint, connection, send, recv)
+    }
+
+    // TEST:relay/src/quic_server.rs[tests::p4_verified_enrollment_and_revocation_isolation]
+    #[tokio::test(flavor = "current_thread")]
+    async fn p4_verified_enrollment_and_revocation_isolation() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let root = fs::canonicalize(std::env::temp_dir())
+            .expect("temporary root")
+            .join(format!("qrm-p4-enrollment-{}-{nonce}", std::process::id()));
+        fs::create_dir_all(&root).expect("root");
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).expect("root mode");
+        let server_identity =
+            rcgen::generate_simple_self_signed(vec!["localhost".to_owned()]).expect("server");
+        let core_ca = test_ca("p4-core-enrollment-root");
+        let device_ca = test_ca("p4-device-root");
+        let (core_certificate, core_key) = test_client_certificate("p4-core", &core_ca);
+        let device_key = KeyPair::generate().expect("device intermediate key");
+        let mut device_params =
+            CertificateParams::new(Vec::<String>::new()).expect("device params");
+        device_params
+            .distinguished_name
+            .push(DnType::CommonName, "p4-device-intermediate");
+        device_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        device_params.key_usages = vec![
+            KeyUsagePurpose::KeyCertSign,
+            KeyUsagePurpose::DigitalSignature,
+        ];
+        let device_certificate = device_params
+            .signed_by(&device_key, &device_ca)
+            .expect("device intermediate");
+
+        let server_certificate_path = root.join("server.pem");
+        let server_key_path = root.join("server.key");
+        let trusted_client_ca_path = root.join("device-intermediate.pem");
+        let trusted_core_ca_path = root.join("core-enrollment-root.pem");
+        let device_certificate_path = root.join("device-intermediate.pem");
+        let device_key_path = root.join("device-intermediate.key");
+        let public_root_path = root.join("device-root.pem");
+        let allowlist_path = root.join("allowlist.json");
+        write_test_material(
+            &server_certificate_path,
+            server_identity.cert.pem().as_bytes(),
+        );
+        write_test_material(
+            &server_key_path,
+            server_identity.signing_key.serialize_pem().as_bytes(),
+        );
+        write_test_material(&trusted_client_ca_path, device_certificate.pem().as_bytes());
+        write_test_material(&trusted_core_ca_path, core_ca.pem().as_bytes());
+        write_test_material(
+            &device_certificate_path,
+            device_certificate.pem().as_bytes(),
+        );
+        write_test_material(&device_key_path, device_key.serialize_pem().as_bytes());
+        write_test_material(&public_root_path, device_ca.pem().as_bytes());
+        let port = std::net::UdpSocket::bind("127.0.0.1:0")
+            .expect("free UDP port")
+            .local_addr()
+            .expect("UDP address")
+            .port();
+        let config = RelayConfig::from_toml_str(&format!(
+            "[listener]\nlisten_address=\"127.0.0.1\"\nport={port}\n[security]\nmode=\"verified\"\nserver_certificate=\"{}\"\nserver_private_key=\"{}\"\ntrusted_client_ca=\"{}\"\ntrusted_core_enrollment_ca=\"{}\"\ndevice_intermediate_certificate=\"{}\"\ndevice_intermediate_private_key=\"{}\"\npublic_root_certificate=\"{}\"\n[enrollment]\nenabled=true\nallowlist_path=\"{}\"\nmax_handshakes=4\nmax_connections=4\nmax_request_bytes=65536\nmax_csr_bytes=16384\nconnection_lifetime_secs=5\nchallenge_ttl_secs=300\n[limits]\nmax_connections=8\nmax_sessions_per_connection=8\nmax_control_frame_bytes=65536\nbuffer_bytes=65536\nhandshake_timeout_secs=5\nidle_timeout_secs=900\n",
+            server_certificate_path.display(),
+            server_key_path.display(),
+            trusted_client_ca_path.display(),
+            trusted_core_ca_path.display(),
+            device_certificate_path.display(),
+            device_key_path.display(),
+            public_root_path.display(),
+            allowlist_path.display(),
+        ))
+        .expect("verified P4 config");
+        // Keep the absolute Unix path short enough for macOS sockaddr_un limits.
+        let socket_path = root.join("s");
+        let unix_listener = UnixListener::bind(&socket_path).expect("Herdr socket");
+        fs::set_permissions(&socket_path, fs::Permissions::from_mode(0o600)).expect("socket mode");
+        let unix_task = tokio::spawn(async move {
+            let (_stream, _) = unix_listener.accept().await.expect("Herdr accept");
+            // Keep the accepted upstream stream idle so the test observes Relay-side revocation
+            // closing an active bridge rather than a prior Unix EOF ending it.
+            std::future::pending::<()>().await;
+        });
+        let server = QuicRelayServer::bind_with_socket_path(config, 77, socket_path)
+            .await
+            .expect("bind verified server");
+        let address = server.local_addr().expect("server address");
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let server_task = tokio::spawn(server.serve_until(async move {
+            let _ = shutdown_rx.await;
+        }));
+        let server_der = server_identity.cert.der().to_vec();
+        let core_chain = vec![core_certificate.der().to_vec(), core_ca.der().to_vec()];
+        let core_key_der = core_key.serialize_der();
+        let core_identity: [u8; 32] = Sha256::digest(core_certificate.der()).into();
+        let (app_a_chain, app_a_key, app_a_fingerprint) = enroll_test_app(
+            address,
+            server_der.clone(),
+            core_chain.clone(),
+            core_key_der.clone(),
+            core_identity,
+            "p4-app-a",
+            1,
+        )
+        .await;
+        let (app_b_chain, app_b_key, app_b_fingerprint) = enroll_test_app(
+            address,
+            server_der.clone(),
+            core_chain.clone(),
+            core_key_der.clone(),
+            core_identity,
+            "p4-app-b",
+            2,
+        )
+        .await;
+        let core_chain_for_quota = core_chain.clone();
+        let core_key_for_quota = core_key_der.clone();
+        enrollment_rejects_normal_qrm_frame(address, server_der.clone(), core_chain, core_key_der)
+            .await;
+        let uid = crate::material::current_uid().expect("uid");
+        let mut allowlist =
+            crate::allowlist::PersistentAllowlist::open(&allowlist_path, uid).expect("allowlist");
+        assert_eq!(allowlist.entries().count(), 2);
+        assert!(
+            allowlist
+                .authorize_update(
+                    crate::enrollment::Fingerprint::from_bytes(app_a_fingerprint)
+                        .expect("A fingerprint")
+                )
+                .is_ok()
+        );
+        assert!(
+            allowlist
+                .authorize_update(
+                    crate::enrollment::Fingerprint::from_bytes(app_b_fingerprint)
+                        .expect("B fingerprint")
+                )
+                .is_ok()
+        );
+        let app_a_chain_for_reconnect = app_a_chain.clone();
+        let app_a_key_for_reconnect = app_a_key.clone();
+        let (a_endpoint, a_connection, mut a_send, mut a_recv) =
+            connect_normal_test_app(address, server_der.clone(), app_a_chain, app_a_key).await;
+        let (_a_handle, _a_token, _a_session_send, mut a_session_recv) = open_test_session(
+            &a_connection,
+            &mut a_send,
+            &mut a_recv,
+            "default",
+            app_a_fingerprint,
+            11,
+        )
+        .await;
+        let (b_endpoint, _b_connection, mut b_send, mut b_recv) =
+            connect_normal_test_app(address, server_der.clone(), app_b_chain, app_b_key).await;
+        // Generation 4 is initial generation 1 plus two enrollments and one revocation.
+        let generation = allowlist
+            .revoke(&crate::enrollment::AppId::new("p4-app-a").expect("App A"))
+            .expect("revoke App A");
+        assert_eq!(generation, 4);
+        let reloaded = crate::allowlist::PersistentAllowlist::open(&allowlist_path, uid)
+            .expect("reopen allowlist");
+        assert!(!reloaded.allows_qrm(
+            crate::enrollment::Fingerprint::from_bytes(app_a_fingerprint).expect("A fingerprint")
+        ));
+        assert!(reloaded.allows_qrm(
+            crate::enrollment::Fingerprint::from_bytes(app_b_fingerprint).expect("B fingerprint")
+        ));
+        assert!(
+            reloaded
+                .authorize_update(
+                    crate::enrollment::Fingerprint::from_bytes(app_b_fingerprint)
+                        .expect("B fingerprint")
+                )
+                .is_ok()
+        );
+        assert_eq!(
+            reloaded.authorize_update(
+                crate::enrollment::Fingerprint::from_bytes(app_a_fingerprint)
+                    .expect("A fingerprint")
+            ),
+            Err(crate::enrollment::EnrollmentError::UpdateUnauthorized)
+        );
+        // Revocation must close an otherwise idle matching connection without requiring a
+        // peer-controlled heartbeat or other follow-up control frame.
+        let mut session_probe = [0_u8; 1];
+        let bridge_result = tokio::time::timeout(
+            Duration::from_secs(2),
+            a_session_recv.read(&mut session_probe),
+        )
+        .await
+        .expect("revoked active bridge closes");
+        assert!(
+            matches!(bridge_result, Ok(None) | Ok(Some(0)) | Err(_)),
+            "revoked active bridge remained readable: {bridge_result:?}"
+        );
+        tokio::time::timeout(Duration::from_secs(2), a_connection.closed())
+            .await
+            .expect("revoked idle connection closes");
+        assert_revoked_normal_qrm_rejected(
+            address,
+            server_der.clone(),
+            app_a_chain_for_reconnect,
+            app_a_key_for_reconnect,
+        )
+        .await;
+        assert_enrollment_quota_exhausted(
+            address,
+            server_der.clone(),
+            core_chain_for_quota,
+            core_key_for_quota,
+        )
+        .await;
+        send_control_frame(
+            &mut b_send,
+            HdqmFrame {
+                kind: HdqmKind::Heartbeat,
+                request_id: [92; 16],
+                payload: vec![0],
+            },
+        )
+        .await
+        .expect("sibling heartbeat");
+        assert_eq!(
+            read_control_frame(&mut b_recv)
+                .await
+                .expect("sibling heartbeat ack")
+                .kind,
+            HdqmKind::Heartbeat
+        );
+        let mut no_client_endpoint =
+            quinn::Endpoint::client("127.0.0.1:0".parse().expect("client bind"))
+                .expect("no-client endpoint");
+        no_client_endpoint.set_default_client_config(test_client_config(
+            server_der,
+            Vec::new(),
+            None,
+            QRM_RELAY_ALPN,
+        ));
+        let no_client_result = no_client_endpoint
+            .connect(address, "localhost")
+            .expect("no-client connect");
+        match no_client_result.await {
+            Err(_) => {}
+            Ok(connection) => {
+                // rustls may finish the transport handshake before the application boundary
+                // observes the missing identity; the connection must still close before QRM use.
+                tokio::time::timeout(Duration::from_secs(1), connection.closed())
+                    .await
+                    .expect("missing-client normal QRM must close");
+            }
+        }
+        a_endpoint.close(0u32.into(), b"revoked");
+        b_endpoint.close(0u32.into(), b"sibling complete");
+        no_client_endpoint.close(0u32.into(), b"no client");
+        let _ = shutdown_tx.send(());
+        server_task
+            .await
+            .expect("server task")
+            .expect("server result");
+        unix_task.abort();
+        let _ = unix_task.await;
         fs::remove_dir_all(root).expect("cleanup");
     }
 

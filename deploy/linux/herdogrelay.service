@@ -2,13 +2,14 @@
 Description=Herdr-dog QUIC Relay
 After=network-online.target
 Wants=network-online.target
+# Bound crash-loop restarts before systemd refuses further starts.
+StartLimitIntervalSec=300
+StartLimitBurst=5
 
 [Service]
 ExecStart=%h/.local/bin/herdogrelay --config %h/.config/herdr-dog/relay.toml
 Restart=on-failure
 RestartSec=30s
-StartLimitIntervalSec=300
-StartLimitBurst=5
 UMask=0077
 NoNewPrivileges=yes
 

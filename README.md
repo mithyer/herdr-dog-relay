@@ -2,7 +2,7 @@
 title: Herdr-dog Relay
 description: Single-device single-port QUIC TLS 1.3 opaque byte Relay.
 published: true
-date: 2026-08-24T01:43:10+08:00
+date: 2026-08-24T11:41:11+08:00
 tags: herdr-dog, relay, quic
 editor: markdown
 dateCreated: 2026-08-22T00:10:00+08:00
@@ -12,7 +12,7 @@ dateCreated: 2026-08-22T00:10:00+08:00
 
 ## Current status
 
-P3 typed Core/App integration is checkpointed at Core `ca3ab03`/`3404bac`, Relay status `76270bd`, App-iOS `a309515`/`1e2919b` and parent `d340a92`. QRM-PROD-1 P4 local cross-platform validation is now the active documentation-only stage: it will validate disposable-material enrollment/allowlist/revoke, updater safety and macOS/Linux user-service lifecycle without changing mb17 or claiming live issuance/deployment. No certificate issuance/deployment, Herdr payload parsing, writes, subscriptions, healthy `Online + Current`, actions, passthrough or automatic retry is claimed.
+QRM-PROD-1 P4 local cross-platform validation is the active implementation/validation stage. Its activation/baseline checkpoints are Core `413c5c0`/`1c0371e`, Relay `a244ba0`/`07b1be3`, App-iOS `e58eb3f`/`fe3c62a`, and parent `52fbe34`/`484d806`. The current P4 Relay corrections are uncommitted and include versioned Relay-governance restoration, verified enrollment/revocation validation, updater hardening, and disposable user-service evidence. No live/production certificate issuance or deployment, Herdr payload parsing, writes, subscriptions, healthy `Online + Current`, actions, passthrough or automatic retry is claimed; disposable local certificate issuance is covered only as P4 test evidence.
 
 ## Boundary
 
@@ -20,7 +20,11 @@ The Relay authenticates Core, validates HDQM/HDQS/session authority and bridges 
 
 ## Current implementation
 
-QRM-PROD-1 P2 implementation/status is checkpointed at `51134bb`/`6176552`; P3 has no Relay source changes and its status is checkpointed at `76270bd`. P4 is documentation-only local validation work; the existing Relay source remains the protected opaque QUIC bridge and no P4 production capability is claimed.
+QRM-PROD-1 P2 implementation/status is checkpointed at `51134bb`/`6176552`; P3 has no Relay source changes and its status is checkpointed at `76270bd`. P4 has uncommitted local enrollment/updater/supervision/test work. The prior `0fc3563` index change removed Relay governance documents; the active correction restores `AGENTS.md` and `docs/` for Relay-index tracking in the next selective P4 checkpoint. No P4 production capability is claimed and the opaque QUIC bridge boundary remains unchanged.
+
+## Validation evidence
+
+- [P4 local validation evidence](/herdr-dog/relay/docs/p4-local-validation-report) — local-only enrollment, updater, supervision, and typed App identity boundary evidence.
 
 ## Checkpoint Log
 
@@ -132,3 +136,63 @@ QRM-PROD-1 P2 implementation/status is checkpointed at `51134bb`/`6176552`; P3 h
 - Scope: disposable CA/material, two-App enrollment/revoke isolation, quota/ALPN/no-forward boundaries, archive rollback and macOS/Linux user-service lifecycle.
 - Exclusions: no mb17 change, live certificate issuance/deployment, Herdr parsing, writes, subscriptions, healthy Current, actions, passthrough or automatic retry.
 - Next dependency: capture the disposable-material and local service baseline before P4 Relay implementation/evidence work.
+
+[implemented](1-146) 2026-08-24 | QRM-PROD-1 P4 Relay enrollment local slice implemented
+- Repository state: Relay enrollment implementation/test changes are uncommitted; P4 remains active; P3 status `76270bd`, Herdr, secrets and mb17 are unchanged.
+- Validation: Relay 70 tests passed with locked quality gates; verified loopback enrollment covered two Apps, admin/revocation isolation, reconnect rejection, normal-QRM mTLS rejection, enrollment-ALPN no-forward and enrollment quota exhaustion.
+- Scope: challenge-first terminal enrollment, protected Core anchor/mTLS, CSR binding, public certificate issuance and persistent allowlist/revocation local evidence.
+- Exclusions: no live certificate issuance/deployment claim, mb17 change, Herdr parsing, writes, subscriptions, healthy Current, actions, passthrough or automatic retry.
+- Residual risk: updater/archive rollback, disposable service lifecycle, cross-architecture artifact evidence, authorization replay/expiry and P5 review remain open.
+[validated](1-148) 2026-08-24 | QRM-PROD-1 P4 local updater/service slice validated
+- Repository state: Relay enrollment/updater/test changes are uncommitted; P4 remains active; P3 status `76270bd`, Herdr, secrets and mb17 are unchanged.
+- Validation: Relay 73 tests passed with locked quality gates; archive extraction and atomic replacement preserve a rollback copy, macOS/Linux arm64/x86_64 release selection is explicit, and LaunchAgent/systemd templates reject injection and escape paths.
+- Scope: disposable local updater/archive and supervision-template evidence only; no service installation or remote update was performed.
+- Exclusions: no live certificate issuance/deployment claim, mb17 change, Herdr parsing, writes, subscriptions, healthy Current, actions, passthrough or automatic retry.
+- Residual risk: startup/readiness rollback, GOAWAY/drain/restart, real service lifecycle, cross-architecture archive/checksum artifact evidence, authorization replay/expiry, lazy silent-peer revocation and P5 review remain open.
+- Next dependency: run the fresh P4 review and parent-led correction loop; do not enter P6.
+
+[accepted](1-156) 2026-08-24 | QRM-PROD-1 P4 local enrollment/updater slice review accepted
+- Repository state: Relay source/tests and local status edits remain uncommitted; P4 overall remains active; Herdr, secrets and mb17 are unchanged.
+- Validation: fresh dual read-only review found no P0-P2; parent Relay 73-test quality battery and Core/App baseline checks passed.
+- Scope: verified local QUIC enrollment/revocation/quota/no-forward plus disposable archive extraction/replacement and supervision-template boundaries.
+- Exclusions: no live certificate issuance, service installation, remote update, mb17 change, Herdr parsing, writes, subscriptions, healthy Current, actions, passthrough or automatic retry.
+- Residual risk: cross-architecture archive/checksum artifact provenance, startup/readiness rollback, GOAWAY/drain/restart, real service lifecycle, authorization replay/expiry, lazy silent-peer revocation and remaining P4/P5 gates remain open.
+- Next dependency: finish remaining P4 artifact/service evidence; keep P4 active and do not enter P6.
+
+[validated](1-164) 2026-08-24 | QRM-PROD-1 P4 local lifecycle and updater hardening validated
+- Repository state: Relay source/tests and local status edits remain uncommitted; P4 remains active; Herdr, secrets and mb17 are unchanged.
+- Validation: Relay 77 tests plus locked quality gates, macOS arm64/x86_64 checks, disposable LaunchAgent bootstrap/duplicate/bootout, disposable Ubuntu systemd-user verify/single-instance/cleanup, Core 315 passed/2 ignored, core-ffi 4 passed, and an entitled simulator run with all 45 App tests executed and no failures.
+- Scope: local verified enrollment/revocation/quota/no-forward, malicious archive/startup/TOCTOU/rollback defenses, and disposable user-supervision evidence.
+- Exclusions: no Relay/Herdr deployment, live issuance, remote update, mb17 change, writes, subscriptions, healthy Current, actions, passthrough or automatic retry.
+- Residual risk: local archive fixtures do not prove published Linux release artifacts or CI provenance; a Linux cross C sysroot is unavailable locally, and P5 review/P6 live lifecycle evidence remain open.
+- Next dependency: review the latest P4 source/docs, then resolve the artifact/CI evidence boundary before P4 closure; do not enter P6.
+
+[active](1-176) 2026-08-24 | QRM-PROD-1 P4 local correction loop active
+- Repository state: P4 activation/baseline checkpoints are Core `413c5c0`/`1c0371e`, Relay `a244ba0`/`07b1be3`, App-iOS `e58eb3f`/`fe3c62a`, and parent `52fbe34`/`484d806`; Relay `0fc3563` removed governance docs from the index, and current uncommitted Relay work restores them for Relay-index tracking before any P4 checkpoint.
+- Validation: Relay 79 locked tests and quality gates; static supervision-template drift checks; temporary macOS LaunchAgent and Ubuntu systemd-user fixtures; Core 315 passed/2 ignored; core-ffi 4 passed; entitled simulator 45 executed/0 failed/0 skipped.
+- Scope: local-only enrollment/revocation/quota/no-forward, archive/startup/TOCTOU/rollback, user-supervision, governance, and typed App identity evidence. See `/herdr-dog/relay/docs/p4-local-validation-report`.
+- Exclusions: no live issuance, deployment, remote update, mb17 change, Herdr parsing, writes, subscriptions, healthy Current, actions, passthrough or automatic retry.
+- Residual risk: no published Linux artifact/CI provenance, no local Linux C sysroot, restart-persistent authorization consumption; P5/P6 evidence remains open. The maintenance tick closes matching idle revoked connections and their active session bridges.
+
+[active](1-182) 2026-08-24 | QRM-PROD-1 P4 cross-platform correction validated
+- Repository state: P4 source, restored Relay-owned AGENTS/docs governance, README and evidence updates remain uncommitted; Herdr, secrets, mb17 configuration and existing service state are unchanged.
+- Validation: Development macOS passed 81 Relay tests (78 library plus 3 binary) with locked tests, Clippy, rustfmt, rustdoc and diff checks. Native Ubuntu 24.04 x86_64 passed 80 tests (77 library plus 3 binary), Clippy, rustfmt, rustdoc, release build, disposable archive/checksum verification and `herdogrelay --version`.
+- Scope: protected material, allowlist locking, enrollment, updater, supervision, governance restoration and cross-platform test-fixture corrections only. Linux arm64 is rejected because no supported release artifact exists.
+- Exclusions: no mb17 deployment, live issuance, remote update, Herdr parsing, writes, subscriptions, healthy Current, actions, passthrough or automatic retry.
+- Next dependency: complete the fresh P4 review and any parent-led correction/revalidation loop before selective checkpointing; do not enter P6.
+
+[active](1-190) 2026-08-24 | QRM-PROD-1 P4 post-fix local validation
+- Repository state: Relay source, governance restoration and P4 evidence remain uncommitted; unrelated Core/App-iOS/parent/Herdr content remains preserved and excluded.
+- Validation: Development macOS passed 81 Relay tests and native Ubuntu 24.04 x86_64 passed 80 Relay tests plus release/archive/checksum evidence; the verified two-App regression proves idle revoked active-bridge closure without heartbeat and sibling usability.
+- Scope: local protected-material, allowlist, enrollment, updater, supervision and cross-platform fixture evidence around the one-Relay/one-UDP/one-QUIC boundary.
+- Exclusions: no deployment, live issuance, remote update, Herdr parsing, writes, subscriptions, healthy Current, actions, passthrough or automatic retry.
+- Residual risk: published Linux artifact/CI provenance, restart-persistent enrollment authorization and P6 lifecycle/rebind evidence remain open.
+- Next dependency: complete final fresh review and selective checkpoint validation; keep P4 active and do not enter P6.
+
+[active](1-198) 2026-08-24 | QRM-PROD-1 P4 post-review remediation validation
+- Review: parent-led fixes close the reviewed disabled-enrollment revoke, installer safety, protected-file race, rollback-verification and certificate-expiry gaps; no production deployment claim is added.
+- Validation: macOS passed 82 Relay tests (79 library plus 3 binary); native Ubuntu x86_64 passed 81 tests (78 library plus 3 binary), with locked quality, release/archive/checksum and version checks.
+- Scope: local protected material, expiry-aware allowlist, enrollment/revocation, updater, supervision and governance restoration.
+- Exclusions: no mb17 deployment, live issuance, remote update, Herdr parsing, writes, subscriptions, healthy Current, actions, passthrough or automatic retry.
+- Residual risk: same-source checksum provenance, published Linux CI/artifact provenance, restart-persistent authorization and P6 lifecycle/rebind evidence remain open.
+- Next dependency: run the replacement fresh read-only acceptance review, then checkpoint in Core, Relay, App-iOS and parent order if no P0-P2 findings remain.
