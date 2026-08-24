@@ -12,7 +12,7 @@ dateCreated: 2026-08-22T00:10:00+08:00
 
 ## Current status
 
-Status: `active` for QRM-PROD-1 after QRM-1 Q7 checkpoint at Relay `a2dd9dc`/`d30dea3`. Q4 weak-network, Q5 mb17 one-port/two-session read-only deployment evidence, Q6 App/embedded Core integration and Q7 cleanup remain checkpointed. This register now adds protected PKI, enrollment, allowlist/admin, stable-latest update and service-supervision decisions without widening Herdr capabilities or changing the opaque bridge boundary.
+Status: `active` for QRM-PROD-1 P4 local cross-platform validation after P3 Core/App checkpoint at Core `ca3ab03`/`3404bac`, Relay status `76270bd`, App-iOS `a309515`/`1e2919b` and parent `d340a92`. Q4 weak-network, Q5 mb17 one-port/two-session read-only evidence, Q6 App/embedded Core integration and Q7 cleanup remain checkpointed; this register records only P4 local evidence requirements and does not widen Herdr capabilities or change the opaque bridge boundary.
 
 ## Decisions
 
@@ -259,3 +259,11 @@ Q1 requires codec, fake authority and three-session tests. Q2 requires quinn TLS
 - Exclusions: no Relay source, live certificate issuance, deployment, Herdr writes, subscriptions, healthy Current, actions, passthrough or automatic retry.
 - Residual risk: Keychain entitlement skips and P4-P6 live enrollment/service/deployment evidence remain open.
 - Next dependency: checkpoint App-iOS implementation/status, then append the parent Wiki checkpoint without staging Herdr or unrelated content.
+
+[active](1-269) 2026-08-24 | QRM-PROD-1 P4 Relay local enrollment/update/service validation activated
+- Repository state: Relay P3 status `76270bd` is clean and contains no P3 source changes; P4 activation is documentation-only and uncommitted; Core/App-iOS/Herdr/mb17 are unchanged.
+- Herdr upstream check: `origin/master` and detached `HEAD` are `d6dae883`; tags `v0.8.2` and `v0.8.0` remain present; five generated schema helpers remain excluded; no Socket API schema or Relay byte-path impact was found.
+- Validation baseline: Relay 69 quality-gate tests; P4 evidence is not yet claimed and normal QRM/enrollment boundaries remain fail closed.
+- Scope: quota/ALPN isolation, allowlist/revoke generation closure, archive/update rollback and macOS/Linux service evidence.
+- Exclusions: no mb17 change, live certificate issuance/deployment, Herdr writes, subscriptions, healthy Current, actions, passthrough or automatic retry.
+- Next dependency: capture the disposable-material and local service baseline before Relay P4 implementation/evidence work.

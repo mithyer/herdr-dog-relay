@@ -12,7 +12,7 @@ dateCreated: 2026-08-22T00:10:00+08:00
 
 ## Current status
 
-QRM-1 Q5 mb17 one-port/two-session read-only evidence and Q6 App/embedded Core integration are checkpointed. Q7 Legacy Cleanup is checkpointed in Relay at `a2dd9dc`. QRM-PROD-1 P2 is now the active parent-owned Relay implementation stage: protected-file material validation, same-port enrollment framing/ALPN, persistent allowlist/revocation, stable-latest archive safety, and user-level supervision templates are implemented locally and remain uncheckpointed. No certificate issuance/deployment, Herdr payload parsing, writes, subscriptions, healthy `Online + Current`, actions, passthrough or automatic retry is claimed.
+P3 typed Core/App integration is checkpointed at Core `ca3ab03`/`3404bac`, Relay status `76270bd`, App-iOS `a309515`/`1e2919b` and parent `d340a92`. QRM-PROD-1 P4 local cross-platform validation is now the active documentation-only stage: it will validate disposable-material enrollment/allowlist/revoke, updater safety and macOS/Linux user-service lifecycle without changing mb17 or claiming live issuance/deployment. No certificate issuance/deployment, Herdr payload parsing, writes, subscriptions, healthy `Online + Current`, actions, passthrough or automatic retry is claimed.
 
 ## Boundary
 
@@ -20,7 +20,7 @@ The Relay authenticates Core, validates HDQM/HDQS/session authority and bridges 
 
 ## Current implementation
 
-QRM-PROD-1 P2 is active and implemented locally but not checkpointed. The current Relay source adds bounded protected-file, allowlist, enrollment-wire, transient PKI, updater and supervision seams around the existing QRM QUIC bridge; the 66-test local gate passes. Production certificate material, live enrollment, remote update, service installation and mb17 deployment remain later evidence gates.
+QRM-PROD-1 P2 implementation/status is checkpointed at `51134bb`/`6176552`; P3 has no Relay source changes and its status is checkpointed at `76270bd`. P4 is documentation-only local validation work; the existing Relay source remains the protected opaque QUIC bridge and no P4 production capability is claimed.
 
 ## Checkpoint Log
 
@@ -124,3 +124,11 @@ QRM-PROD-1 P2 is active and implemented locally but not checkpointed. The curren
 - Exclusions: live P6 cutover, production deployment, Herdr parsing, writes, subscriptions, healthy Current, actions, passthrough and automatic retry.
 - Residual risk: P3 live boundary and P4-P6 service/deployment evidence remain open.
 - Next dependency: synchronize parent status and gitlinks.
+
+[active](1-134) 2026-08-24 | QRM-PROD-1 P4 local cross-platform validation activated
+- Repository state: Relay P2 implementation/status `51134bb`/`6176552` and P3 status `76270bd` are checkpointed; P4 activation is documentation-only and uncommitted; Herdr, secrets and mb17 are unchanged.
+- Herdr upstream check: `origin/master` and detached `HEAD` are `d6dae883`; tags `v0.8.2` and `v0.8.0` remain present; five generated schema helpers remain excluded; no Socket API schema or Relay byte-path impact was found.
+- Validation baseline: Relay 69 quality-gate tests; P4 enrollment/update/service evidence is not yet claimed.
+- Scope: disposable CA/material, two-App enrollment/revoke isolation, quota/ALPN/no-forward boundaries, archive rollback and macOS/Linux user-service lifecycle.
+- Exclusions: no mb17 change, live certificate issuance/deployment, Herdr parsing, writes, subscriptions, healthy Current, actions, passthrough or automatic retry.
+- Next dependency: capture the disposable-material and local service baseline before P4 Relay implementation/evidence work.

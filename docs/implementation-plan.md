@@ -12,7 +12,7 @@ dateCreated: 2026-08-22T00:10:00+08:00
 
 ## Current status
 
-Status: `active` for QRM-PROD-1 after QRM-1 Q7 checkpoint at Relay `a2dd9dc`/`d30dea3`. Q4 weak-network, Q5 mb17 one-port/two-session read-only evidence, Q6 App/embedded Core integration and Q7 cleanup remain checkpointed; this package adds only protected-file PKI, same-port enrollment, per-App allowlist/admin, stable-latest update and macOS/Linux supervision. Herdr parsing, writes, subscriptions, healthy Current, actions, passthrough and automatic retry remain excluded.
+Status: `active` for QRM-PROD-1 P4 local cross-platform validation after P3 Core/App checkpoint at Core `ca3ab03`/`3404bac`, Relay status `76270bd`, App-iOS `a309515`/`1e2919b` and parent `d340a92`. Q4 weak-network, Q5 mb17 one-port/two-session read-only evidence, Q6 App/embedded Core integration and Q7 cleanup remain checkpointed; P4 adds only local disposable-material enrollment/allowlist/update/service validation. Herdr parsing, writes, subscriptions, healthy Current, actions, passthrough and automatic retry remain excluded.
 
 ## Architecture
 
@@ -95,7 +95,7 @@ src/bin/herdogrelay.rs   one-port CLI host, revoke and stable-latest update
 | Q4 | weak-network injection and reconnect | checkpointed | stream isolation, new epochs/handles and memory bounds |
 | Q5 | mb17 one-port/two-session read-only evidence | checkpointed | typed ping/snapshot and socket-failure isolation |
 | Q6 | hidden App transport consumer | checkpointed | no Relay source change; Core/App-iOS target baseline and typed boundary |
-| QRM-PROD-1 | protected-file PKI, enrollment ALPN, App allowlist/admin, stable-latest updater, LaunchAgent/systemd templates | active | P2 checkpointed; P3 Core/App typed path; P4-P6 live issuance, service and deployment evidence later |
+| QRM-PROD-1/P4 | protected-file PKI, enrollment ALPN, App allowlist/admin, stable-latest updater, LaunchAgent/systemd templates | active | P2/P3 checkpointed; P4 disposable local enrollment/update/service validation; P5 review; P6 live issuance, service and deployment evidence later |
 
 ## QRM-PROD-1 Relay boundary
 
@@ -347,3 +347,19 @@ Block QRM-PROD-1 when normal QRM lacks TLS/active allowlist enforcement, enrollm
 - Exclusions: no Relay source, live certificate issuance, deployment, Herdr writes, subscriptions, healthy Current, actions, passthrough or automatic retry.
 - Residual risk: Keychain entitlement skips and P4-P6 live enrollment/service/deployment evidence remain open.
 - Next dependency: checkpoint App-iOS implementation/status, then append the parent Wiki checkpoint without staging Herdr or unrelated content.
+
+[active](1-357) 2026-08-24 | QRM-PROD-1 P4 Relay local enrollment/update/service validation activated
+- Repository state: Relay P3 status `76270bd` is clean and contains no P3 source changes; P4 activation is documentation-only and uncommitted; Core/App-iOS/Herdr/mb17 are unchanged.
+- Herdr upstream check: `origin/master` and detached `HEAD` are `d6dae883`; tags `v0.8.2` and `v0.8.0` remain present; five generated schema helpers remain excluded; no Socket API schema or Relay byte-path impact was found.
+- Validation baseline: Relay 69 quality-gate tests, Core 315 passed/2 ignored and App 45 executed with 42 passed/3 skipped; P4 enrollment/update/service evidence is not yet claimed.
+- Scope: disposable CA/material loading, two-App enrollment/revoke isolation, quota/ALPN/no-forward checks, archive rollback and user-service lifecycle.
+- Exclusions: no mb17 change, live certificate issuance/deployment, Herdr writes, subscriptions, healthy Current, actions, passthrough or automatic retry.
+- Next dependency: capture the disposable-material and local service baseline before Relay P4 implementation/evidence work.
+
+[active](1-365) 2026-08-24 | QRM-PROD-1 P4 Relay scope clarification after review
+- Repository state: Relay P3 status `76270bd` is clean; P4 activation remains documentation-only and uncommitted; Core/App-iOS/Herdr/mb17 are unchanged.
+- Validation: the phase table now distinguishes P4 disposable local enrollment/update/service validation from P6 live issuance, service and deployment evidence; no source or capability change was made.
+- Scope: clarify Relay P4/P5/P6 ownership and preserve opaque QUIC, fail-closed enrollment and no-forward boundaries.
+- Exclusions: no mb17 change, live certificate issuance/deployment, Herdr parsing, writes, subscriptions, healthy Current, actions, passthrough or automatic retry.
+- Residual risk: disposable CA, two-App isolation, archive rollback and user-service evidence remain unexecuted; P5 review and P6 deployment remain gated.
+- Next dependency: capture the disposable-material and local service baseline before Relay P4 implementation/evidence work.
