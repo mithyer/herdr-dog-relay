@@ -356,10 +356,10 @@ Block QRM-PROD-1 when normal QRM lacks TLS/active allowlist enforcement, enrollm
 - Exclusions: no mb17 change, live certificate issuance/deployment, Herdr writes, subscriptions, healthy Current, actions, passthrough or automatic retry.
 - Next dependency: capture the disposable-material and local service baseline before Relay P4 implementation/evidence work.
 
-[active](1-365) 2026-08-24 | QRM-PROD-1 P4 Relay scope clarification after review
-- Repository state: Relay P3 status `76270bd` is clean; P4 activation remains documentation-only and uncommitted; Core/App-iOS/Herdr/mb17 are unchanged.
-- Validation: the phase table now distinguishes P4 disposable local enrollment/update/service validation from P6 live issuance, service and deployment evidence; no source or capability change was made.
-- Scope: clarify Relay P4/P5/P6 ownership and preserve opaque QUIC, fail-closed enrollment and no-forward boundaries.
+[active](1-365) 2026-08-24 | QRM-PROD-1 P4 Relay scope clarification and baseline captured
+- Repository state: Relay P3 status `76270bd` is clean; P4 remains documentation-only and uncommitted; Core/App-iOS/Herdr/mb17 are unchanged.
+- Baseline: mb17 macOS 15.7.7 x86_64, Herdr 0.8.2, one Relay process at UDP `100.64.0.6:18743`, default and `qrm-work` sockets mode 0600, no LaunchAgent; protected configuration hashes were recorded without reading contents.
+- Validation: the phase table distinguishes P4 disposable local enrollment/update/service validation from P6 live issuance, service and deployment evidence; Relay 69 quality-gate tests remain the baseline; no remote mutation or P4 evidence is claimed.
+- Scope: disposable CA/material loading, two-App isolation, archive rollback, quota/ALPN/no-forward and user-service lifecycle evidence remain next.
 - Exclusions: no mb17 change, live certificate issuance/deployment, Herdr parsing, writes, subscriptions, healthy Current, actions, passthrough or automatic retry.
-- Residual risk: disposable CA, two-App isolation, archive rollback and user-service evidence remain unexecuted; P5 review and P6 deployment remain gated.
-- Next dependency: capture the disposable-material and local service baseline before Relay P4 implementation/evidence work.
+- Next dependency: create repository-external disposable material and capture the local macOS/Linux service baseline before Relay P4 evidence work.

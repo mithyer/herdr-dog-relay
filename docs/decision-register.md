@@ -267,3 +267,11 @@ Q1 requires codec, fake authority and three-session tests. Q2 requires quinn TLS
 - Scope: quota/ALPN isolation, allowlist/revoke generation closure, archive/update rollback and macOS/Linux service evidence.
 - Exclusions: no mb17 change, live certificate issuance/deployment, Herdr writes, subscriptions, healthy Current, actions, passthrough or automatic retry.
 - Next dependency: capture the disposable-material and local service baseline before Relay P4 implementation/evidence work.
+
+[active](1-277) 2026-08-24 | QRM-PROD-1 P4 Relay baseline captured
+- Repository state: Relay P3 status `76270bd` is clean; P4 remains documentation-only and uncommitted; Core/App-iOS/Herdr/mb17 are unchanged.
+- Baseline: mb17 macOS 15.7.7 x86_64, Herdr 0.8.2, one Relay process at UDP `100.64.0.6:18743`, default and `qrm-work` sockets mode 0600, no LaunchAgent; protected configuration hashes were recorded without reading contents.
+- Validation: Relay 69 quality-gate tests remain the baseline; no remote mutation or P4 evidence is claimed and normal QRM/enrollment remains fail closed.
+- Scope: local quota/ALPN isolation, allowlist/revoke closure, archive rollback and service lifecycle evidence remain next.
+- Exclusions: no mb17 change, live certificate issuance/deployment, Herdr parsing, writes, subscriptions, healthy Current, actions, passthrough or automatic retry.
+- Next dependency: create repository-external disposable material and capture the local macOS/Linux service baseline before Relay P4 evidence work.
