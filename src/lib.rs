@@ -8,14 +8,39 @@
 #[cfg(not(unix))]
 compile_error!("herdr-dog-relay currently supports Unix hosts only");
 
+/// Maximum normalized HDB1 session name size shared by wire and authority validation.
+pub(crate) const HDB1_MAX_SESSION_BYTES: usize = 64;
+/// Maximum HDB1 CSR size shared by wire and authority validation.
+pub(crate) const HDB1_MAX_CSR_BYTES: usize = 16 * 1024;
+
+/// Validate the source-aligned normalized Herdr session name.
+pub(crate) fn is_valid_hdb1_session(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= HDB1_MAX_SESSION_BYTES
+        && value != "."
+        && value != ".."
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+}
+
 /// Protected persistent App allowlist and generation store.
 pub mod allowlist;
+/// Schema-neutral Relay-side HDB1 hidden-workspace verifier and issuance fake.
+#[allow(dead_code)]
+pub(crate) mod bootstrap;
+/// Frozen server-authenticated HDB1 bootstrap frame codec.
+#[allow(dead_code)]
+pub(crate) mod bootstrap_wire;
 /// Bounded opaque bidirectional byte forwarding.
 pub mod bridge;
 /// QRM-1 single-listener configuration.
 pub mod config;
 /// Schema-neutral QRM-PROD-1 enrollment, allowlist, and update contracts/fakes.
 pub mod enrollment;
+/// Frozen Core-enrollment HDE3 frame codec.
+#[allow(dead_code)]
+pub(crate) mod enrollment_v3_wire;
 /// Bounded same-port enrollment frame codec.
 pub mod enrollment_wire;
 /// Redacted Relay errors.
