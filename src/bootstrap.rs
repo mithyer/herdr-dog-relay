@@ -1238,7 +1238,7 @@ impl RelayBootstrapVerifier {
     ///
     /// This accessor is compiled only for the local contract tests; production code never exposes
     /// the verification code to a caller.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "contract-test-support"))]
     pub(crate) fn test_code(&self, bootstrap_id: Opaque32) -> Option<String> {
         self.attempts.get(&bootstrap_id).and_then(|attempt| {
             attempt
@@ -1247,6 +1247,17 @@ impl RelayBootstrapVerifier {
                 .and_then(|code| std::str::from_utf8(code).ok())
                 .map(str::to_owned)
         })
+    }
+
+    /// Return the deterministic approval identity for one live fake attempt.
+    ///
+    /// This accessor is compiled only for the local contract tests and never exposes verifier
+    /// state through a production API.
+    #[cfg(any(test, feature = "contract-test-support"))]
+    pub(crate) fn test_approval_id(&self, bootstrap_id: Opaque32) -> Option<[u8; 32]> {
+        self.attempts
+            .get(&bootstrap_id)
+            .map(|attempt| attempt.approval_id.0)
     }
 
     /// Return the number of hidden workspaces retained by the fake.

@@ -8,12 +8,21 @@
 #[cfg(not(unix))]
 compile_error!("herdr-dog-relay currently supports Unix hosts only");
 
-/// Maximum normalized HDB1 session name size shared by wire and authority validation.
+/// Test-only Core/Relay HDB1 contract-composition facade; never enabled in production builds.
+#[cfg(feature = "contract-test-support")]
+#[doc(hidden)]
+#[path = "bootstrap_test_support.rs"]
+pub mod contract_test_support;
+
+/// Maximum normalized HDB1 session name shared by test-gated wire and authority validation.
+#[cfg(any(test, feature = "contract-test-support"))]
 pub(crate) const HDB1_MAX_SESSION_BYTES: usize = 64;
-/// Maximum HDB1 CSR size shared by wire and authority validation.
+/// Maximum HDB1 CSR size shared by test-gated wire and authority validation.
+#[cfg(any(test, feature = "contract-test-support"))]
 pub(crate) const HDB1_MAX_CSR_BYTES: usize = 16 * 1024;
 
-/// Validate the source-aligned normalized Herdr session name.
+/// Validate the source-aligned normalized Herdr session name for HDB1 test support.
+#[cfg(any(test, feature = "contract-test-support"))]
 pub(crate) fn is_valid_hdb1_session(value: &str) -> bool {
     !value.is_empty()
         && value.len() <= HDB1_MAX_SESSION_BYTES
@@ -27,12 +36,15 @@ pub(crate) fn is_valid_hdb1_session(value: &str) -> bool {
 /// Protected persistent App allowlist and generation store.
 pub mod allowlist;
 /// Schema-neutral Relay-side HDB1 hidden-workspace verifier and issuance fake.
+#[cfg(any(test, feature = "contract-test-support"))]
 #[allow(dead_code)]
 pub(crate) mod bootstrap;
 /// Core-to-Relay HDB1 stream dispatcher for local contract tests.
+#[cfg(any(test, feature = "contract-test-support"))]
 #[allow(dead_code)]
 pub(crate) mod bootstrap_session;
 /// Frozen server-authenticated HDB1 bootstrap frame codec.
+#[cfg(any(test, feature = "contract-test-support"))]
 #[allow(dead_code)]
 pub(crate) mod bootstrap_wire;
 /// Bounded opaque bidirectional byte forwarding.
@@ -42,6 +54,7 @@ pub mod config;
 /// Schema-neutral QRM-PROD-1 enrollment, allowlist, and update contracts/fakes.
 pub mod enrollment;
 /// Frozen Core-enrollment HDE3 frame codec.
+#[cfg(any(test, feature = "contract-test-support"))]
 #[allow(dead_code)]
 pub(crate) mod enrollment_v3_wire;
 /// Bounded same-port enrollment frame codec.

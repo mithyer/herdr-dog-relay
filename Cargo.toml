@@ -5,6 +5,11 @@ edition = "2024"
 license = "AGPL-3.0-or-later"
 description = "Authenticated bounded byte relay for Herdr-dog Core"
 
+[features]
+default = []
+# Enables the parent-owned Core/Relay contract-composition test support only.
+contract-test-support = []
+
 [lib]
 name = "herdr_dog_relay"
 path = "src/lib.rs"
