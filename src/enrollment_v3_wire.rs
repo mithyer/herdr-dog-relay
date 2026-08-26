@@ -28,8 +28,8 @@ pub(crate) const HDE3_DIGEST_BYTES: usize = 32;
 pub(crate) const HDE3_ID_BYTES: usize = 32;
 /// Maximum normalized Herdr session name.
 pub(crate) const HDE3_MAX_SESSION_BYTES: usize = 64;
-/// Maximum public certificate chain bytes retained in one response.
-pub(crate) const HDE3_MAX_CHAIN_BYTES: usize = 48 * 1024;
+/// Maximum public certificate chain bytes retained in one response and kept below the 64 KiB JSON frame budget.
+pub(crate) const HDE3_MAX_CHAIN_BYTES: usize = 46 * 1024;
 /// Maximum number of certificates in one public chain.
 pub(crate) const HDE3_MAX_CHAIN_CERTIFICATES: usize = 8;
 
@@ -794,6 +794,40 @@ mod tests {
             payload: vec![b' '; HDE3_MAX_PAYLOAD_BYTES + 1],
         };
         assert_eq!(oversized.encode(), Err(Hde3Error::FrameTooLarge));
+    }
+
+    /// Prove issued HDE3 results fit the complete frame budget at the maximum chain size.
+    #[test]
+    // TEST:relay/src/enrollment_v3_wire.rs[tests::issued_chain_is_frame_bounded]
+    fn issued_chain_is_frame_bounded() {
+        let per_certificate = HDE3_MAX_CHAIN_BYTES / HDE3_MAX_CHAIN_CERTIFICATES;
+        let remainder = HDE3_MAX_CHAIN_BYTES % HDE3_MAX_CHAIN_CERTIFICATES;
+        let chain: Vec<String> = (0..HDE3_MAX_CHAIN_CERTIFICATES)
+            .map(|index| {
+                encode_base64(&vec![
+                    index as u8;
+                    per_certificate + usize::from(index < remainder)
+                ])
+            })
+            .collect();
+        let payload = Hde3ResultPayload {
+            approval_id: encode_base64(&[1; 32]),
+            status: Hde3ResultStatus::Issued,
+            app_identity: Some(encode_hex(&[2; 32])),
+            certificate_chain: Some(chain),
+            certificate_fingerprint: Some(encode_hex(&[3; 32])),
+            certificate_chain_digest: Some(encode_hex(&[4; 32])),
+            not_after_epoch_seconds: Some(500),
+            configuration_generation: Some(1),
+            rejection_code: None,
+        };
+        payload.validate().expect("issued result");
+        let frame = Hde3Frame::json(Hde3Kind::Result, &payload).expect("result frame");
+        assert!(frame.encode().expect("result bytes").len() <= HDE3_MAX_FRAME_BYTES);
+        let mut oversized = payload;
+        oversized.certificate_chain =
+            Some(vec![encode_base64(&vec![9_u8; HDE3_MAX_CHAIN_BYTES + 1])]);
+        assert_eq!(oversized.validate(), Err(Hde3Error::FrameTooLarge));
     }
 
     /// Reject HDB1 and historical HDE1 magic in the HDE3 decoder.

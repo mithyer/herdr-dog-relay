@@ -42,6 +42,11 @@ pub(crate) const CORE_CERTIFICATE_TTL_SECS: u64 = 90 * 24 * 60 * 60;
 pub(crate) struct Opaque32([u8; 32]);
 
 impl Opaque32 {
+    /// Return the opaque bytes for crate-internal wire composition.
+    pub(crate) const fn bytes(self) -> [u8; 32] {
+        self.0
+    }
+
     /// Construct a non-zero opaque value.
     fn new(bytes: [u8; 32]) -> Result<Self, RelayBootstrapError> {
         if bytes == [0; 32] {
@@ -1001,6 +1006,30 @@ impl RelayBootstrapVerifier {
         Ok(issued)
     }
 
+    /// Submit a wire-decoded identifier pair after validating non-zero opaque values.
+    ///
+    /// # Parameters
+    /// * `bootstrap_id` - Wire bootstrap identifier returned by Challenge.
+    /// * `challenge` - Wire challenge returned by Challenge.
+    /// * `code` - Six ASCII digits read by the user from the designated Herdr UI.
+    /// * `now_epoch_seconds` - Deterministic current epoch second.
+    ///
+    /// # Returns
+    /// Public Core certificate metadata or a sanitized terminal/validation error.
+    pub(crate) fn submit_wire(
+        &mut self,
+        bootstrap_id: [u8; 32],
+        challenge: [u8; 32],
+        code: &str,
+        now_epoch_seconds: u64,
+    ) -> Result<CoreCertificateMetadata, RelayBootstrapError> {
+        let bootstrap_id =
+            Opaque32::new(bootstrap_id).map_err(|_| RelayBootstrapError::InvalidChallenge)?;
+        let challenge =
+            Opaque32::new(challenge).map_err(|_| RelayBootstrapError::InvalidChallenge)?;
+        self.submit(bootstrap_id, challenge, code, now_epoch_seconds)
+    }
+
     /// Retry cleanup for an attempt left pending after an injected workspace-close failure.
     ///
     /// # Parameters
@@ -1203,6 +1232,21 @@ impl RelayBootstrapVerifier {
     /// Return the number of active session fences.
     pub(crate) fn active_count(&self) -> usize {
         self.active_by_session.len()
+    }
+
+    /// Return the deterministic test code for one live fake attempt.
+    ///
+    /// This accessor is compiled only for the local contract tests; production code never exposes
+    /// the verification code to a caller.
+    #[cfg(test)]
+    pub(crate) fn test_code(&self, bootstrap_id: Opaque32) -> Option<String> {
+        self.attempts.get(&bootstrap_id).and_then(|attempt| {
+            attempt
+                .code
+                .as_ref()
+                .and_then(|code| std::str::from_utf8(code).ok())
+                .map(str::to_owned)
+        })
     }
 
     /// Return the number of hidden workspaces retained by the fake.

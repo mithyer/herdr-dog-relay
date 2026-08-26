@@ -29,6 +29,9 @@ pub mod allowlist;
 /// Schema-neutral Relay-side HDB1 hidden-workspace verifier and issuance fake.
 #[allow(dead_code)]
 pub(crate) mod bootstrap;
+/// Core-to-Relay HDB1 stream dispatcher for local contract tests.
+#[allow(dead_code)]
+pub(crate) mod bootstrap_session;
 /// Frozen server-authenticated HDB1 bootstrap frame codec.
 #[allow(dead_code)]
 pub(crate) mod bootstrap_wire;

@@ -29,8 +29,8 @@ pub(crate) const HDB1_ID_BYTES: usize = 32;
 pub(crate) const HDB1_REQUEST_ID_BYTES: usize = 16;
 /// Maximum normalized Herdr session name.
 pub(crate) const HDB1_MAX_SESSION_BYTES: usize = crate::HDB1_MAX_SESSION_BYTES;
-/// Maximum public certificate chain bytes retained in one response.
-pub(crate) const HDB1_MAX_CHAIN_BYTES: usize = 48 * 1024;
+/// Maximum public certificate chain bytes retained in one response and kept below the 64 KiB JSON frame budget.
+pub(crate) const HDB1_MAX_CHAIN_BYTES: usize = 46 * 1024;
 /// Maximum number of certificates in one public chain.
 pub(crate) const HDB1_MAX_CHAIN_CERTIFICATES: usize = 8;
 
@@ -45,6 +45,24 @@ type Hdb1StartFields = (
 
 /// Decoded HDB1 exact-binding recovery fields returned to Relay-owned callers.
 type Hdb1ReconcileFields = ([u8; HDB1_ID_BYTES], [u8; HDB1_DIGEST_BYTES], String);
+
+/// Decoded public Core issuance metadata returned to Relay-owned callers.
+type Hdb1CoreIssuedFields = (
+    [u8; HDB1_ID_BYTES],
+    [u8; HDB1_DIGEST_BYTES],
+    Vec<Vec<u8>>,
+    u64,
+);
+
+/// Decoded HDB1 recovery result fields returned to Relay-owned callers.
+type Hdb1ResultFields = (
+    [u8; HDB1_ID_BYTES],
+    Hdb1ResultStatus,
+    Option<[u8; HDB1_DIGEST_BYTES]>,
+    Option<Vec<Vec<u8>>>,
+    Option<u64>,
+    Option<u16>,
+);
 
 /// Fixed HDB1 operation registry.
 #[derive(Clone, Copy, Eq, PartialEq)]
@@ -280,6 +298,42 @@ pub(crate) struct Hdb1StartPayload {
 }
 
 impl Hdb1StartPayload {
+    /// Builds a canonical HDB1 Start payload.
+    ///
+    /// # Parameters
+    /// * `request_id` - Non-zero non-authoritative request identifier.
+    /// * `core_csr` - Bounded transient Core CSR bytes.
+    /// * `app_csr_digest` - Non-zero App CSR digest.
+    /// * `normalized_session` - Existing normalized Herdr session name.
+    /// * `core_binding_digest` - Non-zero Core binding digest.
+    ///
+    /// # Returns
+    /// A validated canonical Start payload.
+    pub(crate) fn new(
+        request_id: [u8; HDB1_REQUEST_ID_BYTES],
+        core_csr: &[u8],
+        app_csr_digest: [u8; HDB1_DIGEST_BYTES],
+        normalized_session: String,
+        core_binding_digest: [u8; HDB1_DIGEST_BYTES],
+    ) -> Result<Self, Hdb1Error> {
+        validate_session(&normalized_session)?;
+        if request_id == [0; HDB1_REQUEST_ID_BYTES]
+            || core_csr.is_empty()
+            || core_csr.len() > HDB1_MAX_CSR_BYTES
+            || app_csr_digest == [0; HDB1_DIGEST_BYTES]
+            || core_binding_digest == [0; HDB1_DIGEST_BYTES]
+        {
+            return Err(Hdb1Error::InvalidField);
+        }
+        Ok(Self {
+            request_id: encode_base64(&request_id),
+            core_csr: encode_base64(core_csr),
+            app_csr_digest: encode_hex(&app_csr_digest),
+            normalized_session,
+            core_binding_digest: encode_hex(&core_binding_digest),
+        })
+    }
+
     /// Validates and decodes a Start payload before Relay authority checks.
     pub(crate) fn decode_fields(&self) -> Result<Hdb1StartFields, Hdb1Error> {
         let request_id = decode_base64_exact::<HDB1_REQUEST_ID_BYTES>(&self.request_id)?;
@@ -312,6 +366,34 @@ pub(crate) struct Hdb1ChallengePayload {
 }
 
 impl Hdb1ChallengePayload {
+    /// Builds a canonical Relay challenge payload.
+    ///
+    /// # Parameters
+    /// * `bootstrap_id` - Non-zero Relay-minted bootstrap identifier.
+    /// * `challenge` - Non-zero challenge bound to the attempt.
+    /// * `expires_at_epoch_seconds` - Protected code-entry expiry.
+    ///
+    /// # Returns
+    /// A validated challenge payload or a sanitized field error.
+    pub(crate) fn new(
+        bootstrap_id: [u8; HDB1_ID_BYTES],
+        challenge: [u8; HDB1_DIGEST_BYTES],
+        expires_at_epoch_seconds: u64,
+    ) -> Result<Self, Hdb1Error> {
+        if bootstrap_id == [0; HDB1_ID_BYTES]
+            || challenge == [0; HDB1_DIGEST_BYTES]
+            || expires_at_epoch_seconds == 0
+        {
+            return Err(Hdb1Error::InvalidField);
+        }
+        Ok(Self {
+            bootstrap_id: encode_base64(&bootstrap_id),
+            challenge: encode_base64(&challenge),
+            expires_at_epoch_seconds,
+            status: Hdb1ChallengeStatus::AwaitingCode,
+        })
+    }
+
     /// Validates and decodes the Challenge's fixed fields.
     pub(crate) fn decode_fields(
         &self,
@@ -338,6 +420,31 @@ pub(crate) struct Hdb1SubmitPayload {
 }
 
 impl Hdb1SubmitPayload {
+    /// Builds a canonical transient Submit payload.
+    ///
+    /// # Parameters
+    /// * `bootstrap_id` - Bootstrap identifier returned by Challenge.
+    /// * `challenge` - Challenge returned by Challenge.
+    /// * `code` - Exactly six ASCII digits entered by the user.
+    ///
+    /// # Returns
+    /// A validated canonical Submit payload.
+    pub(crate) fn new(
+        bootstrap_id: [u8; HDB1_ID_BYTES],
+        challenge: [u8; HDB1_DIGEST_BYTES],
+        code: &str,
+    ) -> Result<Self, Hdb1Error> {
+        validate_code(code)?;
+        if bootstrap_id == [0; HDB1_ID_BYTES] || challenge == [0; HDB1_DIGEST_BYTES] {
+            return Err(Hdb1Error::InvalidField);
+        }
+        Ok(Self {
+            bootstrap_id: encode_base64(&bootstrap_id),
+            challenge: encode_base64(&challenge),
+            code: code.to_owned(),
+        })
+    }
+
     /// Validates and decodes a transient Submit payload.
     pub(crate) fn decode_fields(
         &self,
@@ -366,15 +473,60 @@ pub(crate) struct Hdb1CoreIssuedPayload {
 }
 
 impl Hdb1CoreIssuedPayload {
-    /// Validates public Core issuance metadata without logging public certificate bytes.
-    pub(crate) fn validate(&self) -> Result<(), Hdb1Error> {
-        decode_base64_exact::<HDB1_ID_BYTES>(&self.approval_id)?;
-        decode_hex_exact::<HDB1_DIGEST_BYTES>(&self.core_identity)?;
-        decode_certificate_chain(&self.certificate_chain)?;
+    /// Builds a canonical public Core issuance payload.
+    ///
+    /// # Parameters
+    /// * `approval_id` - Non-zero durable Relay approval identifier.
+    /// * `core_identity` - Non-zero public Core leaf identity digest.
+    /// * `certificate_chain` - Bounded public leaf and Intermediate DER bytes.
+    /// * `not_after_epoch_seconds` - Public certificate expiry.
+    ///
+    /// # Returns
+    /// A validated issuance payload or a sanitized field/size error.
+    pub(crate) fn new(
+        approval_id: [u8; HDB1_ID_BYTES],
+        core_identity: [u8; HDB1_DIGEST_BYTES],
+        certificate_chain: &[Vec<u8>],
+        not_after_epoch_seconds: u64,
+    ) -> Result<Self, Hdb1Error> {
+        if approval_id == [0; HDB1_ID_BYTES]
+            || core_identity == [0; HDB1_DIGEST_BYTES]
+            || not_after_epoch_seconds == 0
+        {
+            return Err(Hdb1Error::InvalidField);
+        }
+        let payload = Self {
+            approval_id: encode_base64(&approval_id),
+            core_identity: encode_hex(&core_identity),
+            certificate_chain: encode_certificate_chain(certificate_chain)?,
+            not_after_epoch_seconds,
+            state: Hdb1CoreState::BootstrapPending,
+        };
+        payload.validate().map(|_| payload)
+    }
+
+    /// Validates and decodes public Core issuance metadata.
+    ///
+    /// # Returns
+    /// Approval, identity, bounded public chain and expiry fields.
+    pub(crate) fn decode_fields(&self) -> Result<Hdb1CoreIssuedFields, Hdb1Error> {
+        let approval_id = decode_base64_exact::<HDB1_ID_BYTES>(&self.approval_id)?;
+        let core_identity = decode_hex_exact::<HDB1_DIGEST_BYTES>(&self.core_identity)?;
+        let certificate_chain = decode_certificate_chain(&self.certificate_chain)?;
         if self.not_after_epoch_seconds == 0 || self.state != Hdb1CoreState::BootstrapPending {
             return Err(Hdb1Error::InvalidField);
         }
-        Ok(())
+        Ok((
+            approval_id,
+            core_identity,
+            certificate_chain,
+            self.not_after_epoch_seconds,
+        ))
+    }
+
+    /// Validates public Core issuance metadata without logging public certificate bytes.
+    pub(crate) fn validate(&self) -> Result<(), Hdb1Error> {
+        self.decode_fields().map(|_| ())
     }
 }
 
@@ -491,6 +643,112 @@ pub(crate) struct Hdb1ResultPayload {
 }
 
 impl Hdb1ResultPayload {
+    /// Builds a canonical pending recovery result.
+    ///
+    /// # Parameters
+    /// * `approval_id` - Non-zero durable Relay approval identifier.
+    ///
+    /// # Returns
+    /// A pending result with no public certificate fields.
+    pub(crate) fn new_pending(approval_id: [u8; HDB1_ID_BYTES]) -> Result<Self, Hdb1Error> {
+        if approval_id == [0; HDB1_ID_BYTES] {
+            return Err(Hdb1Error::InvalidField);
+        }
+        Ok(Self {
+            approval_id: encode_base64(&approval_id),
+            status: Hdb1ResultStatus::Pending,
+            core_identity: None,
+            certificate_chain: None,
+            not_after_epoch_seconds: None,
+            rejection_code: None,
+        })
+    }
+
+    /// Builds a canonical issued recovery result.
+    ///
+    /// # Parameters
+    /// * `approval_id` - Non-zero durable Relay approval identifier.
+    /// * `core_identity` - Non-zero public Core identity digest.
+    /// * `certificate_chain` - Bounded public certificate chain.
+    /// * `not_after_epoch_seconds` - Public certificate expiry.
+    ///
+    /// # Returns
+    /// An issued result or a sanitized validation error.
+    pub(crate) fn new_issued(
+        approval_id: [u8; HDB1_ID_BYTES],
+        core_identity: [u8; HDB1_DIGEST_BYTES],
+        certificate_chain: &[Vec<u8>],
+        not_after_epoch_seconds: u64,
+    ) -> Result<Self, Hdb1Error> {
+        if approval_id == [0; HDB1_ID_BYTES]
+            || core_identity == [0; HDB1_DIGEST_BYTES]
+            || not_after_epoch_seconds == 0
+        {
+            return Err(Hdb1Error::InvalidField);
+        }
+        let payload = Self {
+            approval_id: encode_base64(&approval_id),
+            status: Hdb1ResultStatus::Issued,
+            core_identity: Some(encode_hex(&core_identity)),
+            certificate_chain: Some(encode_certificate_chain(certificate_chain)?),
+            not_after_epoch_seconds: Some(not_after_epoch_seconds),
+            rejection_code: None,
+        };
+        payload.validate().map(|_| payload)
+    }
+
+    /// Builds a canonical rejected recovery result.
+    ///
+    /// # Parameters
+    /// * `approval_id` - Non-zero durable Relay approval identifier.
+    /// * `rejection_code` - Non-zero sanitized rejection code.
+    ///
+    /// # Returns
+    /// A rejected result or a sanitized field error.
+    pub(crate) fn new_rejected(
+        approval_id: [u8; HDB1_ID_BYTES],
+        rejection_code: u16,
+    ) -> Result<Self, Hdb1Error> {
+        if approval_id == [0; HDB1_ID_BYTES] || rejection_code == 0 {
+            return Err(Hdb1Error::InvalidField);
+        }
+        Ok(Self {
+            approval_id: encode_base64(&approval_id),
+            status: Hdb1ResultStatus::Rejected,
+            core_identity: None,
+            certificate_chain: None,
+            not_after_epoch_seconds: None,
+            rejection_code: Some(rejection_code),
+        })
+    }
+
+    /// Validates and decodes a sanitized recovery result.
+    ///
+    /// # Returns
+    /// The approval identity and status-specific public fields.
+    pub(crate) fn decode_fields(&self) -> Result<Hdb1ResultFields, Hdb1Error> {
+        self.validate()?;
+        let approval_id = decode_base64_exact::<HDB1_ID_BYTES>(&self.approval_id)?;
+        let core_identity = self
+            .core_identity
+            .as_deref()
+            .map(decode_hex_exact::<HDB1_DIGEST_BYTES>)
+            .transpose()?;
+        let certificate_chain = self
+            .certificate_chain
+            .as_deref()
+            .map(decode_certificate_chain)
+            .transpose()?;
+        Ok((
+            approval_id,
+            self.status,
+            core_identity,
+            certificate_chain,
+            self.not_after_epoch_seconds,
+            self.rejection_code,
+        ))
+    }
+
     /// Validates status-specific recovery fields without exposing certificate bytes.
     pub(crate) fn validate(&self) -> Result<(), Hdb1Error> {
         decode_base64_exact::<HDB1_ID_BYTES>(&self.approval_id)?;
@@ -542,6 +800,20 @@ pub(crate) struct Hdb1RejectedPayload {
 }
 
 impl Hdb1RejectedPayload {
+    /// Builds a canonical terminal rejection payload.
+    ///
+    /// # Parameters
+    /// * `code` - Non-zero sanitized rejection code.
+    ///
+    /// # Returns
+    /// A rejected payload or a sanitized field error.
+    pub(crate) fn new(code: u16) -> Result<Self, Hdb1Error> {
+        if code == 0 {
+            return Err(Hdb1Error::InvalidField);
+        }
+        Ok(Self { code })
+    }
+
     /// Validates the fixed sanitized rejection shape.
     pub(crate) fn validate(&self) -> Result<(), Hdb1Error> {
         if self.code == 0 {
@@ -643,6 +915,32 @@ fn validate_code(value: &str) -> Result<(), Hdb1Error> {
     Ok(())
 }
 
+/// Encode a bounded public certificate chain as canonical base64url fields.
+fn encode_certificate_chain(values: &[Vec<u8>]) -> Result<Vec<String>, Hdb1Error> {
+    if values.is_empty() || values.len() > HDB1_MAX_CHAIN_CERTIFICATES {
+        return Err(Hdb1Error::InvalidField);
+    }
+    let mut total = 0_usize;
+    let mut output = Vec::with_capacity(values.len());
+    for value in values {
+        if value.is_empty() || value.len() > HDB1_MAX_CHAIN_BYTES {
+            return Err(if value.len() > HDB1_MAX_CHAIN_BYTES {
+                Hdb1Error::FrameTooLarge
+            } else {
+                Hdb1Error::InvalidField
+            });
+        }
+        total = total
+            .checked_add(value.len())
+            .ok_or(Hdb1Error::FrameTooLarge)?;
+        if total > HDB1_MAX_CHAIN_BYTES {
+            return Err(Hdb1Error::FrameTooLarge);
+        }
+        output.push(encode_base64(value));
+    }
+    Ok(output)
+}
+
 /// Decode and bound a public certificate chain without exposing it in diagnostics.
 fn decode_certificate_chain(values: &[String]) -> Result<Vec<Vec<u8>>, Hdb1Error> {
     if values.is_empty() || values.len() > HDB1_MAX_CHAIN_CERTIFICATES {
@@ -734,6 +1032,28 @@ mod tests {
             payload: vec![b' '; HDB1_MAX_PAYLOAD_BYTES + 1],
         };
         assert_eq!(oversized.encode(), Err(Hdb1Error::FrameTooLarge));
+    }
+
+    /// Prove the maximum encoded certificate chain still fits every issued HDB1 response frame.
+    #[test]
+    // TEST:relay/src/bootstrap_wire.rs[tests::issued_chain_is_frame_bounded]
+    fn issued_chain_is_frame_bounded() {
+        let per_certificate = HDB1_MAX_CHAIN_BYTES / HDB1_MAX_CHAIN_CERTIFICATES;
+        let remainder = HDB1_MAX_CHAIN_BYTES % HDB1_MAX_CHAIN_CERTIFICATES;
+        let chain: Vec<Vec<u8>> = (0..HDB1_MAX_CHAIN_CERTIFICATES)
+            .map(|index| vec![index as u8; per_certificate + usize::from(index < remainder)])
+            .collect();
+        let issued = Hdb1CoreIssuedPayload::new([1; 32], [2; 32], &chain, 500).expect("issued");
+        let issued_frame = Hdb1Frame::json(Hdb1Kind::CoreIssued, &issued).expect("issued frame");
+        assert!(issued_frame.encode().expect("issued bytes").len() <= HDB1_MAX_FRAME_BYTES);
+        let result = Hdb1ResultPayload::new_issued([1; 32], [2; 32], &chain, 500).expect("result");
+        let result_frame = Hdb1Frame::json(Hdb1Kind::Result, &result).expect("result frame");
+        assert!(result_frame.encode().expect("result bytes").len() <= HDB1_MAX_FRAME_BYTES);
+        let oversized = vec![vec![3_u8; HDB1_MAX_CHAIN_BYTES + 1]];
+        assert!(matches!(
+            Hdb1CoreIssuedPayload::new([1; 32], [2; 32], &oversized, 500),
+            Err(Hdb1Error::FrameTooLarge)
+        ));
     }
 
     /// Reject the historical HDE1 magic in the bootstrap decoder.
