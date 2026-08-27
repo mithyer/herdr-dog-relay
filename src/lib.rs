@@ -8,7 +8,7 @@
 #[cfg(not(unix))]
 compile_error!("herdr-dog-relay currently supports Unix hosts only");
 
-/// Test-only Core/Relay HDB1 contract-composition facade; never enabled in production builds.
+/// Test-only Core/Relay HDB1 and HDE3 contract-composition facade; never enabled in production builds.
 #[cfg(feature = "contract-test-support")]
 #[doc(hidden)]
 #[path = "bootstrap_test_support.rs"]
@@ -53,6 +53,10 @@ pub mod bridge;
 pub mod config;
 /// Schema-neutral QRM-PROD-1 enrollment, allowlist, and update contracts/fakes.
 pub mod enrollment;
+/// Generic HDE3 Relay enrollment session dispatcher for local contract tests.
+#[cfg(any(test, feature = "contract-test-support"))]
+#[allow(dead_code)]
+pub(crate) mod enrollment_v3_session;
 /// Frozen Core-enrollment HDE3 frame codec.
 #[cfg(any(test, feature = "contract-test-support"))]
 #[allow(dead_code)]

@@ -293,6 +293,11 @@ pub(crate) struct Hde3ApprovalStartPayload {
 }
 
 impl Hde3ApprovalStartPayload {
+    /// Returns the validated App CSR digest used to bind the later submission.
+    pub(crate) fn app_csr_digest(&self) -> Result<[u8; HDE3_DIGEST_BYTES], Hde3Error> {
+        decode_hex_exact::<HDE3_DIGEST_BYTES>(&self.app_csr_digest)
+    }
+
     /// Validates the later approval-start binding fields.
     pub(crate) fn validate(&self) -> Result<(), Hde3Error> {
         decode_hex_exact::<HDE3_DIGEST_BYTES>(&self.app_csr_digest)?;
@@ -318,6 +323,25 @@ pub(crate) struct Hde3ApprovalChallengePayload {
 }
 
 impl Hde3ApprovalChallengePayload {
+    /// Builds a bounded later-approval challenge without exposing workspace data.
+    pub(crate) fn new(
+        approval_id: [u8; HDE3_ID_BYTES],
+        challenge: [u8; HDE3_DIGEST_BYTES],
+        expires_at_epoch_seconds: u64,
+    ) -> Result<Self, Hde3Error> {
+        if approval_id == [0; HDE3_ID_BYTES]
+            || challenge == [0; HDE3_DIGEST_BYTES]
+            || expires_at_epoch_seconds == 0
+        {
+            return Err(Hde3Error::InvalidField);
+        }
+        Ok(Self {
+            approval_id: encode_base64(&approval_id),
+            challenge: encode_base64(&challenge),
+            expires_at_epoch_seconds,
+        })
+    }
+
     /// Validates and decodes the later approval challenge.
     pub(crate) fn decode_fields(
         &self,
@@ -383,6 +407,11 @@ pub(crate) struct Hde3ConfirmPersistedPayload {
 }
 
 impl Hde3ConfirmPersistedPayload {
+    /// Returns the approval identifier after canonical decoding.
+    pub(crate) fn approval_id(&self) -> Result<[u8; HDE3_ID_BYTES], Hde3Error> {
+        decode_base64_exact::<HDE3_ID_BYTES>(&self.approval_id)
+    }
+
     /// Validates the exact confirmation identity and generation binding.
     pub(crate) fn validate(&self) -> Result<(), Hde3Error> {
         decode_base64_exact::<HDE3_ID_BYTES>(&self.approval_id)?;
@@ -413,6 +442,11 @@ pub(crate) struct Hde3ReconcilePayload {
 }
 
 impl Hde3ReconcilePayload {
+    /// Returns the approval identifier after canonical decoding.
+    pub(crate) fn approval_id(&self) -> Result<[u8; HDE3_ID_BYTES], Hde3Error> {
+        decode_base64_exact::<HDE3_ID_BYTES>(&self.approval_id)
+    }
+
     /// Validates the persisted reconciliation binding.
     pub(crate) fn validate(&self) -> Result<(), Hde3Error> {
         decode_base64_exact::<HDE3_ID_BYTES>(&self.approval_id)?;
@@ -510,7 +544,171 @@ pub(crate) struct Hde3ResultPayload {
     pub(crate) rejection_code: Option<u16>,
 }
 
+/// Input metadata for constructing an issued or active HDE3 result.
+///
+/// Grouping these fields makes the certificate-bearing constructor difficult to misorder while
+/// keeping the public certificate bytes inside the crate-private enrollment boundary.
+pub(crate) struct Hde3IssuedInput<'a> {
+    /// Durable approval identifier.
+    pub(crate) approval_id: [u8; HDE3_ID_BYTES],
+    /// App public-key identity digest.
+    pub(crate) app_identity: [u8; HDE3_DIGEST_BYTES],
+    /// Public certificate chain bytes.
+    pub(crate) certificate_chain: &'a [Vec<u8>],
+    /// Issued leaf fingerprint.
+    pub(crate) certificate_fingerprint: [u8; HDE3_DIGEST_BYTES],
+    /// Public chain digest.
+    pub(crate) certificate_chain_digest: [u8; HDE3_DIGEST_BYTES],
+    /// Certificate expiry.
+    pub(crate) not_after_epoch_seconds: u64,
+    /// Profile configuration generation.
+    pub(crate) configuration_generation: u64,
+    /// Whether protected App persistence has been confirmed.
+    pub(crate) active: bool,
+}
+
+/// Decoded public fields from an issued or active HDE3 result.
+///
+/// The type is crate-private because certificate bytes may cross only the hidden Core/Relay
+/// enrollment boundary and never the public App facade.
+#[derive(Clone, Eq, PartialEq)]
+pub(crate) struct Hde3IssuedFields {
+    /// Durable approval identifier.
+    pub(crate) approval_id: [u8; HDE3_ID_BYTES],
+    /// App public-key identity digest.
+    pub(crate) app_identity: [u8; HDE3_DIGEST_BYTES],
+    /// Public certificate chain bytes.
+    pub(crate) certificate_chain: Vec<Vec<u8>>,
+    /// Issued leaf fingerprint.
+    pub(crate) certificate_fingerprint: [u8; HDE3_DIGEST_BYTES],
+    /// Public chain digest.
+    pub(crate) certificate_chain_digest: [u8; HDE3_DIGEST_BYTES],
+    /// Certificate expiry.
+    pub(crate) not_after_epoch_seconds: u64,
+    /// Profile configuration generation.
+    pub(crate) configuration_generation: u64,
+    /// Whether protected App persistence has been confirmed.
+    pub(crate) active: bool,
+}
+
 impl Hde3ResultPayload {
+    /// Builds a pending result containing only its nonzero approval identifier.
+    pub(crate) fn new_pending(approval_id: [u8; HDE3_ID_BYTES]) -> Result<Self, Hde3Error> {
+        if approval_id == [0; HDE3_ID_BYTES] {
+            return Err(Hde3Error::InvalidField);
+        }
+        Ok(Self {
+            approval_id: encode_base64(&approval_id),
+            status: Hde3ResultStatus::Pending,
+            app_identity: None,
+            certificate_chain: None,
+            certificate_fingerprint: None,
+            certificate_chain_digest: None,
+            not_after_epoch_seconds: None,
+            configuration_generation: None,
+            rejection_code: None,
+        })
+    }
+
+    /// Builds an issued or active result from bounded public certificate metadata.
+    pub(crate) fn new_issued(input: Hde3IssuedInput<'_>) -> Result<Self, Hde3Error> {
+        if input.approval_id == [0; HDE3_ID_BYTES]
+            || input.app_identity == [0; HDE3_DIGEST_BYTES]
+            || input.certificate_fingerprint == [0; HDE3_DIGEST_BYTES]
+            || input.certificate_chain_digest == [0; HDE3_DIGEST_BYTES]
+            || input.not_after_epoch_seconds == 0
+            || input.configuration_generation == 0
+        {
+            return Err(Hde3Error::InvalidField);
+        }
+        let encoded_chain = encode_certificate_chain(input.certificate_chain)?;
+        Ok(Self {
+            approval_id: encode_base64(&input.approval_id),
+            status: if input.active {
+                Hde3ResultStatus::Active
+            } else {
+                Hde3ResultStatus::Issued
+            },
+            app_identity: Some(encode_hex(&input.app_identity)),
+            certificate_chain: Some(encoded_chain),
+            certificate_fingerprint: Some(encode_hex(&input.certificate_fingerprint)),
+            certificate_chain_digest: Some(encode_hex(&input.certificate_chain_digest)),
+            not_after_epoch_seconds: Some(input.not_after_epoch_seconds),
+            configuration_generation: Some(input.configuration_generation),
+            rejection_code: None,
+        })
+    }
+
+    /// Builds a rejected result with no public identity or certificate fields.
+    pub(crate) fn new_rejected(
+        approval_id: [u8; HDE3_ID_BYTES],
+        rejection_code: u16,
+    ) -> Result<Self, Hde3Error> {
+        if approval_id == [0; HDE3_ID_BYTES] || rejection_code == 0 {
+            return Err(Hde3Error::InvalidField);
+        }
+        Ok(Self {
+            approval_id: encode_base64(&approval_id),
+            status: Hde3ResultStatus::Rejected,
+            app_identity: None,
+            certificate_chain: None,
+            certificate_fingerprint: None,
+            certificate_chain_digest: None,
+            not_after_epoch_seconds: None,
+            configuration_generation: None,
+            rejection_code: Some(rejection_code),
+        })
+    }
+
+    /// Returns the result approval identifier after canonical decoding.
+    pub(crate) fn approval_id(&self) -> Result<[u8; HDE3_ID_BYTES], Hde3Error> {
+        decode_base64_exact::<HDE3_ID_BYTES>(&self.approval_id)
+    }
+
+    /// Returns the sanitized result status.
+    pub(crate) const fn status(&self) -> Hde3ResultStatus {
+        self.status
+    }
+
+    /// Validates and decodes public certificate fields for an issued or active result.
+    pub(crate) fn decode_issued_fields(&self) -> Result<Option<Hde3IssuedFields>, Hde3Error> {
+        self.validate()?;
+        let approval_id = self.approval_id()?;
+        match self.status {
+            Hde3ResultStatus::Pending | Hde3ResultStatus::Rejected => Ok(None),
+            Hde3ResultStatus::Issued | Hde3ResultStatus::Active => Ok(Some(Hde3IssuedFields {
+                approval_id,
+                app_identity: decode_hex_exact::<HDE3_DIGEST_BYTES>(
+                    self.app_identity
+                        .as_deref()
+                        .ok_or(Hde3Error::InvalidField)?,
+                )?,
+                certificate_chain: decode_certificate_chain(
+                    self.certificate_chain
+                        .as_ref()
+                        .ok_or(Hde3Error::InvalidField)?,
+                )?,
+                certificate_fingerprint: decode_hex_exact::<HDE3_DIGEST_BYTES>(
+                    self.certificate_fingerprint
+                        .as_deref()
+                        .ok_or(Hde3Error::InvalidField)?,
+                )?,
+                certificate_chain_digest: decode_hex_exact::<HDE3_DIGEST_BYTES>(
+                    self.certificate_chain_digest
+                        .as_deref()
+                        .ok_or(Hde3Error::InvalidField)?,
+                )?,
+                not_after_epoch_seconds: self
+                    .not_after_epoch_seconds
+                    .ok_or(Hde3Error::InvalidField)?,
+                configuration_generation: self
+                    .configuration_generation
+                    .ok_or(Hde3Error::InvalidField)?,
+                active: self.status == Hde3ResultStatus::Active,
+            })),
+        }
+    }
+
     /// Validates status-specific result fields without exposing certificate bytes.
     pub(crate) fn validate(&self) -> Result<(), Hde3Error> {
         decode_base64_exact::<HDE3_ID_BYTES>(&self.approval_id)?;
@@ -581,6 +779,19 @@ pub(crate) struct Hde3RejectedPayload {
 }
 
 impl Hde3RejectedPayload {
+    /// Builds a fixed nonzero terminal rejection.
+    pub(crate) fn new(code: u16) -> Result<Self, Hde3Error> {
+        if code == 0 {
+            return Err(Hde3Error::InvalidField);
+        }
+        Ok(Self { code })
+    }
+
+    /// Returns the fixed sanitized rejection code after validation.
+    pub(crate) const fn code(&self) -> u16 {
+        self.code
+    }
+
     /// Validates the fixed sanitized rejection shape.
     pub(crate) fn validate(&self) -> Result<(), Hde3Error> {
         if self.code == 0 {
@@ -677,7 +888,7 @@ fn hex_nibble(byte: u8) -> Result<u8, Hde3Error> {
 }
 
 /// Validate the source-aligned normalized Herdr session contract.
-fn validate_session(value: &str) -> Result<(), Hde3Error> {
+pub(crate) fn validate_session(value: &str) -> Result<(), Hde3Error> {
     if value.is_empty()
         || value.len() > HDE3_MAX_SESSION_BYTES
         || value == "."
@@ -697,6 +908,28 @@ fn validate_code(value: &str) -> Result<(), Hde3Error> {
         return Err(Hde3Error::InvalidField);
     }
     Ok(())
+}
+
+/// Encode a bounded public certificate chain using canonical base64url.
+fn encode_certificate_chain(values: &[Vec<u8>]) -> Result<Vec<String>, Hde3Error> {
+    if values.is_empty() || values.len() > HDE3_MAX_CHAIN_CERTIFICATES {
+        return Err(Hde3Error::InvalidField);
+    }
+    let mut total = 0_usize;
+    let mut output = Vec::with_capacity(values.len());
+    for value in values {
+        if value.is_empty() {
+            return Err(Hde3Error::InvalidField);
+        }
+        total = total
+            .checked_add(value.len())
+            .ok_or(Hde3Error::FrameTooLarge)?;
+        if total > HDE3_MAX_CHAIN_BYTES {
+            return Err(Hde3Error::FrameTooLarge);
+        }
+        output.push(encode_base64(value));
+    }
+    Ok(output)
 }
 
 /// Decode and bound a public certificate chain without exposing it in diagnostics.

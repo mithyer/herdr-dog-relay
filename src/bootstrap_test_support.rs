@@ -1,4 +1,4 @@
-//! Feature-gated Relay facade used only by the cross-crate HDB1 contract test.
+//! Feature-gated Relay facade used only by cross-crate HDB1 and HDE3 contract tests.
 //!
 //! The facade owns the deterministic Relay verifier behind an async mutex and exposes only
 //! sanitized test controls. It is unavailable unless `contract-test-support` is enabled.
@@ -16,6 +16,10 @@ use crate::{
     bootstrap_wire::{Hdb1Kind, Hdb1StartPayload},
     enrollment::CsrDigest,
 };
+
+#[cfg(feature = "contract-test-support")]
+#[path = "enrollment_v3_test_support.rs"]
+pub mod enrollment_v3;
 
 /// Frozen HDB1 magic exposed only to the cross-crate parity test.
 pub const HDB1_CONTRACT_MAGIC: [u8; 4] = crate::bootstrap_wire::HDB1_MAGIC;
