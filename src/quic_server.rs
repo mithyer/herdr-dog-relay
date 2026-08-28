@@ -307,7 +307,7 @@ impl QuicRelayServer {
     ///
     /// This seam is available only to contract tests so cross-crate disposable migrations can
     /// hold a selected port without a check-then-bind race; production callers use [`Self::bind`].
-    // TEST:core/tests/qrm_e5_trust_bundle.rs[qrm_e5_disposable_bundle_rebind_and_rollback]
+    // TEST:core/tests/qrm_e5_trust_bundle.rs[qrm_e5_disposable_bundle_rebind_and_rollback,qrm_e5_core_receives_on_wire_goaway]
     #[cfg(feature = "contract-test-support")]
     pub async fn bind_with_socket_path_on_socket(
         config: RelayConfig,
