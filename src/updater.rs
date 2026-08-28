@@ -34,6 +34,53 @@ pub const STABLE_CHANNEL: &str = "stable-latest";
 pub const EXPECTED_BINARY_NAME: &str = "herdogrelay";
 /// Maximum time allowed for a fixed-argument staged-binary startup probe.
 const STARTUP_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+/// Maximum output accepted from the fixed `--version` startup probe.
+const MAX_VERSION_OUTPUT_BYTES: usize = 128;
+
+/// Numeric semantic version used to prevent stable-latest downgrades.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct ReleaseVersion {
+    /// Major release component.
+    major: u64,
+    /// Minor release component.
+    minor: u64,
+    /// Patch release component.
+    patch: u64,
+}
+
+impl ReleaseVersion {
+    /// Parses an exact numeric `major.minor.patch` version.
+    ///
+    /// # Parameters
+    /// * `value` - Version text without the command name.
+    ///
+    /// # Returns
+    /// A parsed release version, or `None` for extra components or invalid text.
+    fn parse(value: &str) -> Option<Self> {
+        let mut components = value.split('.');
+        let version = Self {
+            major: components.next()?.parse().ok()?,
+            minor: components.next()?.parse().ok()?,
+            patch: components.next()?.parse().ok()?,
+        };
+        components.next().is_none().then_some(version)
+    }
+
+    /// Parses the exact bounded output of `herdogrelay --version`.
+    ///
+    /// # Parameters
+    /// * `output` - Captured bounded standard output from the staged binary.
+    ///
+    /// # Returns
+    /// A parsed version only when the output has the expected command prefix and shape.
+    fn parse_version_output(output: &[u8]) -> Option<Self> {
+        if output.len() >= MAX_VERSION_OUTPUT_BYTES {
+            return None;
+        }
+        let text = std::str::from_utf8(output).ok()?.trim();
+        Self::parse(text.strip_prefix("herdogrelay ")?)
+    }
+}
 
 /// Process-local/external update lock held for one explicit replacement.
 pub struct UpdateLock {
@@ -60,6 +107,8 @@ impl Drop for UpdateLock {
 pub struct FixedSourceUpdater {
     /// Validated update policy.
     config: UpdateConfig,
+    /// Installed package version used to reject equal or older staged binaries.
+    current_version: ReleaseVersion,
 }
 
 impl FixedSourceUpdater {
@@ -72,7 +121,15 @@ impl FixedSourceUpdater {
                 reason: "stable-latest updater is disabled",
             });
         }
-        Ok(Self { config })
+        let current_version =
+            ReleaseVersion::parse(env!("CARGO_PKG_VERSION")).ok_or(RelayError::Update {
+                operation: "initializing updater",
+                reason: "current Relay version is invalid",
+            })?;
+        Ok(Self {
+            config,
+            current_version,
+        })
     }
 
     /// Acquires the exclusive stable-latest update lock.
@@ -388,6 +445,28 @@ impl FixedSourceUpdater {
         Ok(binary)
     }
 
+    /// Validates the staged command's version against the installed package version.
+    ///
+    /// # Parameters
+    /// * `output` - Bounded output captured from the staged `--version` probe.
+    ///
+    /// # Returns
+    /// `Ok(())` only when the staged version is strictly newer than the installed version.
+    fn validate_staged_version(&self, output: &[u8]) -> RelayResult<()> {
+        let staged_version =
+            ReleaseVersion::parse_version_output(output).ok_or(RelayError::Update {
+                operation: "checking staged Relay version",
+                reason: "staged executable version output is invalid",
+            })?;
+        if staged_version <= self.current_version {
+            return Err(RelayError::Update {
+                operation: "checking staged Relay version",
+                reason: "staged executable version is not newer",
+            });
+        }
+        Ok(())
+    }
+
     /// Verifies that one staged executable can start with the fixed `--version` argument.
     ///
     /// The probe inherits no caller-provided arguments and discards child I/O so a bad release
@@ -431,19 +510,30 @@ impl FixedSourceUpdater {
         let mut child = Command::new(staged)
             .arg("--version")
             .stdin(Stdio::null())
-            .stdout(Stdio::null())
+            .stdout(Stdio::piped())
             .stderr(Stdio::null())
             .spawn()
             .map_err(|_| RelayError::Update {
                 operation: "probing staged Relay binary",
                 reason: "staged executable could not be started",
             })?;
+        let stdout = child.stdout.take().ok_or(RelayError::Update {
+            operation: "probing staged Relay binary",
+            reason: "staged executable output is unavailable",
+        })?;
+        let output_reader = thread::spawn(move || {
+            let mut output = Vec::with_capacity(MAX_VERSION_OUTPUT_BYTES);
+            stdout
+                .take(MAX_VERSION_OUTPUT_BYTES as u64)
+                .read_to_end(&mut output)
+                .map(|_| output)
+        });
         let started = Instant::now();
-        loop {
+        let probe_result = loop {
             match child.try_wait() {
-                Ok(Some(status)) if status.success() => return Ok(()),
+                Ok(Some(status)) if status.success() => break Ok(()),
                 Ok(Some(_)) => {
-                    return Err(RelayError::Update {
+                    break Err(RelayError::Update {
                         operation: "probing staged Relay binary",
                         reason: "staged executable startup check failed",
                     });
@@ -454,13 +544,30 @@ impl FixedSourceUpdater {
                 Ok(None) | Err(_) => {
                     let _ = child.kill();
                     let _ = child.wait();
-                    return Err(RelayError::Update {
+                    break Err(RelayError::Update {
                         operation: "probing staged Relay binary",
                         reason: "staged executable startup check timed out",
                     });
                 }
             }
+        };
+        if let Err(error) = probe_result {
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = output_reader.join();
+            return Err(error);
         }
+        let output = output_reader
+            .join()
+            .map_err(|_| RelayError::Update {
+                operation: "checking staged Relay version",
+                reason: "staged executable output reader failed",
+            })?
+            .map_err(|_| RelayError::Update {
+                operation: "checking staged Relay version",
+                reason: "staged executable output could not be read",
+            })?;
+        self.validate_staged_version(&output)
     }
 
     /// Atomically replaces the installed executable while retaining a local rollback copy.
@@ -874,7 +981,14 @@ mod tests {
         fs::create_dir(&directory).expect("directory");
         fs::set_permissions(&directory, fs::Permissions::from_mode(0o700)).expect("directory mode");
         let config = UpdateConfig::from_toml_for_test(directory.clone());
-        (FixedSourceUpdater::new(config).expect("updater"), directory)
+        let mut updater = FixedSourceUpdater::new(config).expect("updater");
+        // Use an older test baseline so the current package binary is a valid newer fixture.
+        updater.current_version = ReleaseVersion {
+            major: 0,
+            minor: 1,
+            patch: 0,
+        };
+        (updater, directory)
     }
 
     /// Creates one valid single-entry archive using an explicitly supplied entry name.
@@ -909,9 +1023,17 @@ mod tests {
         create_archive_entry(directory, archive_name, EXPECTED_BINARY_NAME, content)
     }
 
-    /// Reads a native utility that accepts the updater's fixed `--version` probe argument.
+    /// Reads the current Relay binary used by the startup/version probe fixture.
     fn native_version_fixture() -> Vec<u8> {
-        fs::read("/usr/bin/true").expect("native version fixture")
+        let path = std::env::var_os("CARGO_BIN_EXE_herdogrelay")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| {
+                PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                    .join("target")
+                    .join("debug")
+                    .join(EXPECTED_BINARY_NAME)
+            });
+        fs::read(path).expect("Relay version fixture")
     }
 
     /// Creates a link entry to prove the archive validator rejects non-regular files.
@@ -1038,6 +1160,28 @@ mod tests {
         assert_eq!(
             fs::read(&installed).expect("installed after rejected replacement"),
             b"new relay binary"
+        );
+        fs::remove_dir_all(directory).expect("cleanup");
+    }
+
+    // TEST:relay/src/updater.rs[tests::staged_version_must_be_newer]
+    #[test]
+    fn staged_version_must_be_newer() {
+        let (updater, directory) = updater();
+        assert!(
+            updater
+                .validate_staged_version(b"herdogrelay 0.1.1\n")
+                .is_ok()
+        );
+        assert!(
+            updater
+                .validate_staged_version(b"herdogrelay 0.1.0\n")
+                .is_err()
+        );
+        assert!(
+            updater
+                .validate_staged_version(b"herdogrelay 0.1.1\nextra")
+                .is_err()
         );
         fs::remove_dir_all(directory).expect("cleanup");
     }
