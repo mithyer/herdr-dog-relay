@@ -201,6 +201,8 @@ pub struct QuicRelayServer {
     relay_generation: u64,
     /// Relay certificate fingerprint repeated in the application hello.
     relay_identity: [u8; 32],
+    /// Protected trust-bundle generation repeated in the application hello.
+    ca_generation: u64,
     /// Bound Quinn endpoint, absent for the contract-only constructor.
     endpoint: Option<quinn::Endpoint>,
     /// Global connection quota.
@@ -229,6 +231,8 @@ impl std::fmt::Debug for QuicRelayServer {
         formatter
             .debug_struct("QuicRelayServer")
             .field("relay_generation_present", &true)
+            .field("relay_identity_present", &true)
+            .field("ca_generation_present", &true)
             .field("bound", &self.endpoint.is_some())
             .field("connection_limit", &self.config.limits().max_connections())
             .finish()
@@ -301,6 +305,11 @@ impl QuicRelayServer {
     /// Returns the Relay process startup generation.
     pub const fn relay_generation(&self) -> u64 {
         self.relay_generation
+    }
+
+    /// Returns the protected trust-bundle generation advertised by this server.
+    pub const fn ca_generation(&self) -> u64 {
+        self.ca_generation
     }
 
     /// Creates one contract registry for a fresh connection epoch.
@@ -434,6 +443,7 @@ impl QuicRelayServer {
             });
         }
         config.validate()?;
+        let ca_generation = config.security().ca_generation();
         Ok(Self {
             connections: Arc::new(Semaphore::new(config.limits().max_connections())),
             pre_auth_handshakes: Arc::new(Semaphore::new(
@@ -447,6 +457,7 @@ impl QuicRelayServer {
             config,
             relay_generation,
             relay_identity,
+            ca_generation,
             endpoint,
             issuance_results,
             allowlist,
@@ -542,6 +553,7 @@ impl QuicRelayServer {
                 request_id: hello.request_id,
                 payload: DeviceHelloAck {
                     relay_identity: self.relay_identity,
+                    ca_generation: self.ca_generation,
                     relay_generation: self.relay_generation,
                     connection_epoch,
                 }
@@ -1768,6 +1780,7 @@ impl QuicRelayServer {
             config: self.config.clone(),
             relay_generation: self.relay_generation,
             relay_identity: self.relay_identity,
+            ca_generation: self.ca_generation,
             endpoint: None,
             connections: Arc::clone(&self.connections),
             pre_auth_handshakes: Arc::clone(&self.pre_auth_handshakes),
@@ -2250,8 +2263,8 @@ mod tests {
             write_frame as write_enrollment_frame,
         },
         quic_wire::{
-            HdqmFrame, HdqmKind, HdqsBinding, HdqsResponse, SessionName, SessionOpenAck,
-            SessionOpenRequest, SessionPrepareAck, SessionPrepareRequest,
+            DeviceHelloAck, HdqmFrame, HdqmKind, HdqsBinding, HdqsResponse, SessionName,
+            SessionOpenAck, SessionOpenRequest, SessionPrepareAck, SessionPrepareRequest,
         },
         reconciliation_wire::{
             ReconcilePayload, ReconciliationFrame, ReconciliationFrameKind,
@@ -2418,12 +2431,13 @@ idle_timeout_secs = 900
             .expect("UDP address")
             .port();
         let config = RelayConfig::from_toml_str(&format!(
-            "[listener]\nlisten_address=\"127.0.0.1\"\nport={port}\n[security]\nmode=\"development_unverified\"\nserver_certificate=\"{}\"\nserver_private_key=\"{}\"\ntrusted_client_ca=\"{}\"\n[limits]\nmax_connections=64\nmax_sessions_per_connection=64\nmax_control_frame_bytes=65536\nbuffer_bytes=65536\nhandshake_timeout_secs=5\nidle_timeout_secs=900\n",
+            "[listener]\nlisten_address=\"127.0.0.1\"\nport={port}\n[security]\nmode=\"development_unverified\"\nca_generation=7\nserver_certificate=\"{}\"\nserver_private_key=\"{}\"\ntrusted_client_ca=\"{}\"\n[limits]\nmax_connections=64\nmax_sessions_per_connection=64\nmax_control_frame_bytes=65536\nbuffer_bytes=65536\nhandshake_timeout_secs=5\nidle_timeout_secs=900\n",
             server_cert_path.display(), server_key_path.display(), server_cert_path.display()
         )).expect("config");
         let server = QuicRelayServer::bind_with_socket_path(config, 11, socket_path)
             .await
             .expect("bind server");
+        let expected_ca_generation = server.ca_generation();
         let address = server.local_addr().expect("address");
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
         let server_task = tokio::spawn(server.serve_until(async move {
@@ -2463,9 +2477,12 @@ idle_timeout_secs = 900
         )
         .await
         .expect("hello");
-        read_control_frame(&mut control_recv)
+        let hello_ack = read_control_frame(&mut control_recv)
             .await
             .expect("hello ack");
+        // The served hello must carry the generation loaded from Relay configuration.
+        let hello_ack = DeviceHelloAck::decode(&hello_ack.payload).expect("hello ack payload");
+        assert_eq!(hello_ack.ca_generation, expected_ca_generation);
         let mut streams = Vec::new();
         for (index, name) in ["default", "work", "review"].into_iter().enumerate() {
             streams.push(

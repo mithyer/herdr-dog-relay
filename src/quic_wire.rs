@@ -23,6 +23,8 @@ pub const QRM_MAX_SESSION_NAME_BYTES: usize = 64;
 pub const QRM_AUTHORITY_BYTES: usize = 32;
 /// Fixed HDQS response width.
 pub const HDQS_RESPONSE_BYTES: usize = 20;
+/// Fixed authenticated DEVICE_HELLO_ACK payload size.
+pub const QRM_DEVICE_HELLO_ACK_BYTES: usize = 56;
 
 /// Stable Relay wire errors.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -228,6 +230,8 @@ impl SessionName {
 pub struct DeviceHelloAck {
     /// Relay certificate identity repeated at the application boundary.
     pub relay_identity: [u8; QRM_AUTHORITY_BYTES],
+    /// Non-secret protected trust-bundle generation.
+    pub ca_generation: u64,
     /// Relay process startup generation.
     pub relay_generation: u64,
     /// Current QUIC connection epoch.
@@ -241,6 +245,7 @@ impl fmt::Debug for DeviceHelloAck {
         formatter
             .debug_struct("DeviceHelloAck")
             .field("relay_identity_present", &true)
+            .field("ca_generation_present", &true)
             .field("relay_generation_present", &true)
             .field("connection_epoch_present", &true)
             .finish()
@@ -250,8 +255,9 @@ impl fmt::Debug for DeviceHelloAck {
 impl DeviceHelloAck {
     /// Encodes the fixed hello acknowledgement.
     pub fn encode(&self) -> Vec<u8> {
-        let mut bytes = Vec::with_capacity(48);
+        let mut bytes = Vec::with_capacity(QRM_DEVICE_HELLO_ACK_BYTES);
         bytes.extend_from_slice(&self.relay_identity);
+        bytes.extend_from_slice(&self.ca_generation.to_be_bytes());
         bytes.extend_from_slice(&self.relay_generation.to_be_bytes());
         bytes.extend_from_slice(&self.connection_epoch.to_be_bytes());
         bytes
@@ -259,18 +265,24 @@ impl DeviceHelloAck {
 
     /// Decodes the fixed hello acknowledgement.
     pub fn decode(bytes: &[u8]) -> Result<Self, QuicProtocolError> {
-        if bytes.len() != 48 {
+        if bytes.len() != QRM_DEVICE_HELLO_ACK_BYTES {
             return Err(QuicProtocolError::LengthMismatch);
         }
         let mut identity = [0_u8; QRM_AUTHORITY_BYTES];
         identity.copy_from_slice(&bytes[..QRM_AUTHORITY_BYTES]);
-        let relay_generation = u64::from_be_bytes(bytes[32..40].try_into().unwrap());
-        let connection_epoch = u64::from_be_bytes(bytes[40..48].try_into().unwrap());
-        if relay_generation == 0 || connection_epoch == 0 || identity == [0; QRM_AUTHORITY_BYTES] {
+        let ca_generation = u64::from_be_bytes(bytes[32..40].try_into().unwrap());
+        let relay_generation = u64::from_be_bytes(bytes[40..48].try_into().unwrap());
+        let connection_epoch = u64::from_be_bytes(bytes[48..56].try_into().unwrap());
+        if ca_generation == 0
+            || relay_generation == 0
+            || connection_epoch == 0
+            || identity == [0; QRM_AUTHORITY_BYTES]
+        {
             return Err(QuicProtocolError::InvalidField);
         }
         Ok(Self {
             relay_identity: identity,
+            ca_generation,
             relay_generation,
             connection_epoch,
         })
@@ -939,6 +951,30 @@ mod tests {
         assert_eq!(HdqmKind::try_from(13), Ok(HdqmKind::RelayUpdateAccepted));
         assert_eq!(HdqmKind::try_from(14), Ok(HdqmKind::RelayUpdateRejected));
         assert_eq!(HdqmKind::try_from(15), Ok(HdqmKind::RelayUpdateStatus));
+    }
+
+    // TEST:relay/src/quic_wire.rs[tests::relay_device_hello_ack_binds_ca_generation]
+    #[test]
+    fn relay_device_hello_ack_binds_ca_generation() {
+        let ack = DeviceHelloAck {
+            relay_identity: [1; QRM_AUTHORITY_BYTES],
+            ca_generation: 2,
+            relay_generation: 3,
+            connection_epoch: 4,
+        };
+        let encoded = ack.encode();
+        assert_eq!(encoded.len(), QRM_DEVICE_HELLO_ACK_BYTES);
+        assert_eq!(DeviceHelloAck::decode(&encoded).expect("decode"), ack);
+        assert_eq!(
+            DeviceHelloAck::decode(&encoded[..48]),
+            Err(QuicProtocolError::LengthMismatch)
+        );
+        let mut zero_generation = encoded;
+        zero_generation[32..40].fill(0);
+        assert_eq!(
+            DeviceHelloAck::decode(&zero_generation),
+            Err(QuicProtocolError::InvalidField)
+        );
     }
 
     // TEST:relay/src/quic_wire.rs[tests::relay_hdqs_binding_round_trips]

@@ -11,6 +11,8 @@ port = 18743
 [security]
 # verified is required for production. Every mode uses QUIC TLS 1.3.
 mode = "verified"
+# Non-secret trust-bundle generation. A CA cutover increments this value atomically.
+ca_generation = 1
 # Absolute path to the Relay certificate chain; never inline PEM.
 server_certificate = ""
 # Absolute path to the Relay private key; never commit or log this value.

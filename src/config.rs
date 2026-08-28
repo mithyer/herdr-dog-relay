@@ -109,12 +109,20 @@ impl ListenerConfig {
     }
 }
 
+/// The default protected trust-bundle generation.
+fn default_ca_generation() -> u64 {
+    1
+}
+
 /// TLS certificate and trust references.
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SecurityConfig {
     /// Explicit TLS mode.
     mode: SecurityMode,
+    /// Non-secret trust-bundle generation advertised during the QRM hello.
+    #[serde(default = "default_ca_generation")]
+    ca_generation: u64,
     /// Absolute path to the Relay certificate chain.
     server_certificate: PathBuf,
     /// Absolute path to the Relay private key.
@@ -139,6 +147,11 @@ impl SecurityConfig {
     /// Returns the configured TLS mode.
     pub const fn mode(&self) -> SecurityMode {
         self.mode
+    }
+
+    /// Returns the configured trust-bundle generation.
+    pub const fn ca_generation(&self) -> u64 {
+        self.ca_generation
     }
 
     /// Returns the configured certificate path.
@@ -544,6 +557,12 @@ impl RelayConfig {
         self.limits.validate()?;
         self.enrollment.validate()?;
         self.update.validate()?;
+        if self.security.ca_generation == 0 {
+            return Err(RelayError::InvalidConfiguration {
+                field: "security.ca_generation",
+                reason: "must be non-zero",
+            });
+        }
         if self.security.mode == SecurityMode::Verified {
             validate_absolute_path(
                 "security.server_certificate",
@@ -665,6 +684,26 @@ idle_timeout_secs = 900
         let config = RelayConfig::from_toml_str(VALID).expect("valid QRM config");
         assert_eq!(config.listener().socket_addr().unwrap().port(), 18743);
         assert_eq!(config.limits().max_sessions_per_connection(), 64);
+    }
+
+    // TEST:relay/src/config.rs[tests::ca_generation_is_nonzero_and_explicit]
+    #[test]
+    fn ca_generation_is_nonzero_and_explicit() {
+        let defaulted = RelayConfig::from_toml_str(VALID).expect("default trust generation");
+        assert_eq!(defaulted.security().ca_generation(), 1);
+        let explicit = VALID.replace(
+            "mode = \"development_unverified\"",
+            "mode = \"development_unverified\"\nca_generation = 7",
+        );
+        assert_eq!(
+            RelayConfig::from_toml_str(&explicit)
+                .expect("explicit trust generation")
+                .security()
+                .ca_generation(),
+            7
+        );
+        let zero = explicit.replace("ca_generation = 7", "ca_generation = 0");
+        assert!(RelayConfig::from_toml_str(&zero).is_err());
     }
 
     // TEST:relay/src/config.rs[tests::legacy_network_tables_are_rejected]
