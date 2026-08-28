@@ -18,7 +18,7 @@ use sha2::{Digest, Sha256};
 
 use tokio::{
     io::{AsyncRead, AsyncWrite, ReadBuf},
-    sync::{Mutex, Notify, OwnedSemaphorePermit, Semaphore, mpsc, oneshot},
+    sync::{Mutex, Notify, OwnedSemaphorePermit, Semaphore, mpsc, oneshot, watch},
     task::JoinSet,
     time::timeout,
 };
@@ -66,6 +66,8 @@ pub const QRM_RELAY_ALPN: &[u8] = b"herdr-dog-relay-quic/1";
 pub const QRM_ENROLLMENT_ALPN: &[u8] = b"herdr-dog-relay-enroll/1";
 /// Maximum time allowed for the initial control stream and session bind.
 pub const QRM_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(QRM_HANDSHAKE_TIMEOUT_SECS);
+/// Maximum time allowed for an existing QUIC connection to drain after GOAWAY.
+pub const QRM_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// AsyncRead/AsyncWrite adapter that combines one QUIC bidirectional stream.
 struct QuicBiStream {
@@ -220,6 +222,8 @@ pub struct QuicRelayServer {
     /// Contract-only and test-only unverified owners retain `None` because they never expose
     /// production normal-QRM admission.
     allowlist: Option<Arc<Mutex<PersistentAllowlist>>>,
+    /// Broadcasts the bounded drain deadline to every accepted connection task.
+    drain_tx: watch::Sender<Option<Instant>>,
 
     /// Optional test-only socket override for deterministic Unix bridge tests.
     socket_override: Option<PathBuf>,
@@ -281,13 +285,41 @@ impl QuicRelayServer {
     /// # Returns
     /// A bound server whose bridge uses the supplied validated socket path.
     // TEST:relay/src/quic_server.rs[tests::server_accepts_only_valid_generation]
-    #[cfg(test)]
+    #[cfg(any(test, feature = "contract-test-support"))]
     pub async fn bind_with_socket_path(
         config: RelayConfig,
         relay_generation: u64,
         socket_path: PathBuf,
     ) -> RelayResult<Self> {
         Self::bind_inner(config, relay_generation, Some(socket_path)).await
+    }
+
+    /// Binds a test-owned UDP socket without reopening the port between fixture setup and Relay startup.
+    ///
+    /// # Parameters
+    /// * `config` - Validated QRM configuration whose listener address must match `socket`.
+    /// * `relay_generation` - Non-zero process startup epoch.
+    /// * `socket_path` - Private test socket path used by every test session.
+    /// * `socket` - Already-bound nonblocking UDP socket owned by the test harness.
+    ///
+    /// # Returns
+    /// A bound server using the supplied socket, or a redacted listener/TLS error.
+    ///
+    /// This seam is available only to contract tests so cross-crate disposable migrations can
+    /// hold a selected port without a check-then-bind race; production callers use [`Self::bind`].
+    // TEST:core/tests/qrm_e5_trust_bundle.rs[qrm_e5_disposable_bundle_rebind_and_rollback]
+    #[cfg(feature = "contract-test-support")]
+    pub async fn bind_with_socket_path_on_socket(
+        config: RelayConfig,
+        relay_generation: u64,
+        socket_path: PathBuf,
+        socket: std::net::UdpSocket,
+    ) -> RelayResult<Self> {
+        socket
+            .set_nonblocking(true)
+            .map_err(|error| RelayError::io("configuring QRM UDP listener", error))?;
+        Self::bind_inner_with_socket(config, relay_generation, Some(socket_path), Some(socket))
+            .await
     }
 
     /// Returns the configured or actual UDP bind address.
@@ -328,6 +360,7 @@ impl QuicRelayServer {
     ///
     /// # Returns
     /// `Ok(())` after the endpoint and owned connection tasks are closed.
+    // TEST:relay/src/quic_server.rs[tests::qrm_shutdown_sends_goaway_and_blocks_new_sessions]
     pub async fn serve_until<S>(self, shutdown: S) -> RelayResult<()>
     where
         S: std::future::Future<Output = ()> + Send + 'static,
@@ -341,6 +374,20 @@ impl QuicRelayServer {
         loop {
             tokio::select! {
                 _ = &mut shutdown => {
+                    // Broadcast GOAWAY before closing the endpoint so existing connections can
+                    // finish read-only work inside the bounded drain window.
+                    let deadline = Instant::now() + QRM_DRAIN_TIMEOUT;
+                    let _ = server.drain_tx.send(Some(deadline));
+                    while !tasks.is_empty() {
+                        let remaining = deadline.saturating_duration_since(Instant::now());
+                        if remaining.is_zero() {
+                            break;
+                        }
+                        match timeout(remaining, tasks.join_next()).await {
+                            Ok(Some(_)) => {}
+                            Ok(None) | Err(_) => break,
+                        }
+                    }
                     endpoint.close(0u32.into(), b"shutdown");
                     tasks.abort_all();
                     while tasks.join_next().await.is_some() {}
@@ -357,9 +404,16 @@ impl QuicRelayServer {
                     };
                     let owner = Arc::clone(&server);
                     tasks.spawn(async move {
-                        let connection = match timeout(owner.handshake_timeout(), incoming).await {
-                            Ok(Ok(connection)) => connection,
-                            _ => return,
+                        let mut drain_rx = owner.drain_tx.subscribe();
+                        if drain_rx.borrow().is_some() {
+                            return;
+                        }
+                        let connection = tokio::select! {
+                            _ = drain_rx.changed() => return,
+                            result = timeout(owner.handshake_timeout(), incoming) => match result {
+                                Ok(Ok(connection)) => connection,
+                                _ => return,
+                            },
                         };
                         drop(handshake_permit);
                         let is_enrollment = negotiated_alpn(&connection)
@@ -392,10 +446,42 @@ impl QuicRelayServer {
         relay_generation: u64,
         socket_override: Option<PathBuf>,
     ) -> RelayResult<Self> {
+        Self::bind_inner_with_socket(config, relay_generation, socket_override, None).await
+    }
+
+    /// Builds a Relay endpoint from either a newly bound or a test-prebound UDP socket.
+    async fn bind_inner_with_socket(
+        config: RelayConfig,
+        relay_generation: u64,
+        socket_override: Option<PathBuf>,
+        prebound_socket: Option<std::net::UdpSocket>,
+    ) -> RelayResult<Self> {
         let address = config.listener().socket_addr()?;
         let server_config = build_server_config(&config)?;
-        let endpoint = quinn::Endpoint::server(server_config, address)
-            .map_err(|error| RelayError::io("binding QRM UDP listener", error))?;
+        let endpoint = match prebound_socket {
+            Some(socket) => {
+                let actual_address = socket
+                    .local_addr()
+                    .map_err(|error| RelayError::io("reading QRM UDP listener address", error))?;
+                if actual_address != address {
+                    return Err(RelayError::ListenerStartup {
+                        reason: "prebound QRM UDP listener address does not match configuration",
+                    });
+                }
+                let runtime = quinn::default_runtime().ok_or(RelayError::ListenerStartup {
+                    reason: "Tokio QUIC runtime is unavailable",
+                })?;
+                quinn::Endpoint::new(
+                    quinn::EndpointConfig::default(),
+                    Some(server_config),
+                    socket,
+                    runtime,
+                )
+                .map_err(|error| RelayError::io("binding QRM UDP listener", error))?
+            }
+            None => quinn::Endpoint::server(server_config, address)
+                .map_err(|error| RelayError::io("binding QRM UDP listener", error))?,
+        };
         let relay_identity = load_relay_identity(&config)?;
         // Enrollment may be disabled, but verified normal QRM still requires an active allowlist.
         let (allowlist, issuance_results) = if config.security().mode() == SecurityMode::Verified {
@@ -444,6 +530,7 @@ impl QuicRelayServer {
         }
         config.validate()?;
         let ca_generation = config.security().ca_generation();
+        let (drain_tx, _) = watch::channel(None);
         Ok(Self {
             connections: Arc::new(Semaphore::new(config.limits().max_connections())),
             pre_auth_handshakes: Arc::new(Semaphore::new(
@@ -461,6 +548,7 @@ impl QuicRelayServer {
             endpoint,
             issuance_results,
             allowlist,
+            drain_tx,
             socket_override,
         })
     }
@@ -565,8 +653,32 @@ impl QuicRelayServer {
             control_recv,
             Duration::from_secs(self.config.limits().idle_timeout_secs()),
         );
+        let mut drain_rx = self.drain_tx.subscribe();
+        let mut draining = drain_rx.borrow().is_some();
+        let mut drain_deadline = *drain_rx.borrow();
+        if draining {
+            self.send_go_away(&mut control_send).await?;
+        }
         loop {
+            let drain_wait = Self::wait_for_drain_deadline(drain_deadline);
+            tokio::pin!(drain_wait);
             tokio::select! {
+                changed = drain_rx.changed(), if !draining => {
+                    if let Ok(()) = changed {
+                        let deadline: Option<Instant> = *drain_rx.borrow();
+                        if let Some(deadline) = deadline {
+                            self.send_go_away(&mut control_send).await?;
+                            draining = true;
+                            drain_deadline = Some(deadline);
+                        }
+                    }
+                }
+                _ = &mut drain_wait, if draining => {
+                    session_tasks.abort_all();
+                    while session_tasks.join_next().await.is_some() {}
+                    connection.close(0u32.into(), b"drain deadline");
+                    return Ok(());
+                }
                 _ = expiry_tick.tick() => {
                     // Recheck the persistent allowlist independently of control traffic so a
                     // local revoke closes an idle connection and all of its matching sessions.
@@ -589,6 +701,12 @@ impl QuicRelayServer {
                 }
                 joined = session_tasks.join_next(), if !session_tasks.is_empty() => {
                     let _ = joined;
+                    if draining && session_tasks.is_empty() {
+                        // Once the last existing session has finished, the bounded drain can
+                        // complete without waiting for the full deadline.
+                        connection.close(0u32.into(), b"drain complete");
+                        return Ok(());
+                    }
                 }
                 control = control_frames.recv() => {
                     let Some(control) = control else {
@@ -611,6 +729,7 @@ impl QuicRelayServer {
                             &registry,
                             &session_controls,
                             peer_fingerprint,
+                            !draining,
                         )
                         .await {
                         Ok(keep_open) => keep_open,
@@ -627,7 +746,7 @@ impl QuicRelayServer {
                         return Ok(());
                     }
                 }
-                session = connection.accept_bi() => {
+                session = connection.accept_bi(), if !draining => {
                     let (send, recv) = match session {
                         Ok(stream) => stream,
                         Err(_) => {
@@ -678,7 +797,31 @@ impl QuicRelayServer {
         registry: &Arc<Mutex<SessionRegistry>>,
         session_controls: &SessionTaskControls,
         peer_fingerprint: Option<Fingerprint>,
+        accept_new_sessions: bool,
     ) -> RelayResult<bool> {
+        if !accept_new_sessions
+            && matches!(frame.kind, HdqmKind::SessionPrepare | HdqmKind::SessionOpen)
+        {
+            // GOAWAY is a connection-level admission fence. Existing session close and
+            // heartbeat frames remain processable during the bounded read-only drain.
+            let epoch = registry.lock().await.connection_epoch();
+            let response = HdqsResponse::rejected(HdqsReason::ConnectionClosing, epoch);
+            send_control_frame(
+                send,
+                HdqmFrame {
+                    kind: HdqmKind::ErrorResponse,
+                    request_id: frame.request_id,
+                    payload: response
+                        .encode()
+                        .map_err(|_| RelayError::QuicProtocol {
+                            reason: "drain rejection encoding failed",
+                        })?
+                        .to_vec(),
+                },
+            )
+            .await?;
+            return Ok(true);
+        }
         if let (Some(allowlist), Some(fingerprint)) = (&self.allowlist, peer_fingerprint) {
             let mut allowlist = allowlist.lock().await;
             allowlist.reload()?;
@@ -1774,6 +1917,29 @@ impl QuicRelayServer {
         }
     }
 
+    /// Sends the uncorrelated GOAWAY control frame used to begin a bounded read-only drain.
+    async fn send_go_away(&self, send: &mut quinn::SendStream) -> RelayResult<()> {
+        send_control_frame(
+            send,
+            HdqmFrame {
+                kind: HdqmKind::GoAway,
+                request_id: [0; 16],
+                payload: Vec::new(),
+            },
+        )
+        .await
+    }
+
+    /// Waits until a drain deadline, or forever while the connection remains open.
+    async fn wait_for_drain_deadline(deadline: Option<Instant>) {
+        match deadline {
+            Some(deadline) => {
+                tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)).await;
+            }
+            None => std::future::pending::<()>().await,
+        }
+    }
+
     /// Clones only immutable server state for a spawned connection task.
     fn clone_for_task(&self) -> Self {
         Self {
@@ -1788,6 +1954,7 @@ impl QuicRelayServer {
             enrollment_connections: Arc::clone(&self.enrollment_connections),
             issuance_results: self.issuance_results.clone(),
             allowlist: self.allowlist.clone(),
+            drain_tx: self.drain_tx.clone(),
             socket_override: self.socket_override.clone(),
         }
     }
@@ -2387,6 +2554,99 @@ idle_timeout_secs = 900
             session_send,
             session_recv,
         )
+    }
+
+    // TEST:relay/src/quic_server.rs[tests::qrm_shutdown_sends_goaway_and_blocks_new_sessions]
+    #[tokio::test(flavor = "current_thread")]
+    async fn qrm_shutdown_sends_goaway_and_blocks_new_sessions() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let root = fs::canonicalize(std::env::temp_dir())
+            .expect("canonical temp root")
+            .join(format!("qrm-drain-{}-{nonce}", std::process::id()));
+        fs::create_dir_all(&root).expect("root");
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).expect("root mode");
+        let server_cert =
+            rcgen::generate_simple_self_signed(vec!["localhost".to_owned()]).expect("server cert");
+        let server_cert_path = root.join("server.pem");
+        let server_key_path = root.join("server.key");
+        write_test_material(&server_cert_path, server_cert.cert.pem().as_bytes());
+        write_test_material(
+            &server_key_path,
+            server_cert.signing_key.serialize_pem().as_bytes(),
+        );
+        let port = std::net::UdpSocket::bind("127.0.0.1:0")
+            .expect("free UDP port")
+            .local_addr()
+            .expect("UDP address")
+            .port();
+        let config = RelayConfig::from_toml_str(&format!(
+            "[listener]\nlisten_address=\"127.0.0.1\"\nport={port}\n[security]\nmode=\"development_unverified\"\nca_generation=7\nserver_certificate=\"{}\"\nserver_private_key=\"{}\"\ntrusted_client_ca=\"{}\"\n[limits]\nmax_connections=64\nmax_sessions_per_connection=64\nmax_control_frame_bytes=65536\nbuffer_bytes=65536\nhandshake_timeout_secs=5\nidle_timeout_secs=900\n",
+            server_cert_path.display(),
+            server_key_path.display(),
+            server_cert_path.display(),
+        ))
+        .expect("config");
+        let server = QuicRelayServer::bind_with_socket_path(config, 7, root.join("missing.sock"))
+            .await
+            .expect("bind server");
+        let address = server.local_addr().expect("server address");
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let server_task = tokio::spawn(server.serve_until(async move {
+            let _ = shutdown_rx.await;
+        }));
+        let (endpoint, connection, mut control_send, mut control_recv) =
+            connect_dev_client(server_cert.cert.der().to_vec(), address).await;
+
+        shutdown_tx.send(()).expect("request drain");
+        let go_away = tokio::time::timeout(
+            Duration::from_secs(1),
+            read_control_frame(&mut control_recv),
+        )
+        .await
+        .expect("GOAWAY deadline")
+        .expect("GOAWAY frame");
+        assert_eq!(go_away.kind, HdqmKind::GoAway);
+        assert_eq!(go_away.request_id, [0; 16]);
+        assert!(go_away.payload.is_empty());
+
+        send_control_frame(
+            &mut control_send,
+            HdqmFrame {
+                kind: HdqmKind::SessionPrepare,
+                request_id: [8; 16],
+                payload: SessionPrepareRequest {
+                    session: SessionName::new("default").expect("session"),
+                    expected_fingerprint: [3; 32],
+                    configuration_generation: 1,
+                }
+                .encode()
+                .expect("prepare"),
+            },
+        )
+        .await
+        .expect("prepare during drain");
+        let rejection = tokio::time::timeout(
+            Duration::from_secs(1),
+            read_control_frame(&mut control_recv),
+        )
+        .await
+        .expect("drain rejection deadline")
+        .expect("drain rejection");
+        assert_eq!(rejection.kind, HdqmKind::ErrorResponse);
+        let rejection = HdqsResponse::decode(&rejection.payload).expect("rejection payload");
+        assert_eq!(rejection.reason, HdqsReason::ConnectionClosing);
+
+        connection.close(0u32.into(), b"drain test complete");
+        endpoint.close(0u32.into(), b"drain test complete");
+        tokio::time::timeout(Duration::from_secs(2), server_task)
+            .await
+            .expect("server drain deadline")
+            .expect("server task")
+            .expect("server result");
+        fs::remove_dir_all(root).expect("cleanup");
     }
 
     // TEST:relay/src/quic_server.rs[tests::qrm_quic_three_session_network_isolated]
