@@ -1543,6 +1543,183 @@ fn digest(bytes: &[u8]) -> [u8; 32] {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::{
+        fs,
+        os::unix::fs::PermissionsExt,
+        path::{Path, PathBuf},
+        time::{SystemTime, UNIX_EPOCH},
+    };
+    use tokio::{io::AsyncWriteExt, net::UnixListener};
+
+    /// Create a unique owner-only directory for production bootstrap runtime tests.
+    fn test_root() -> PathBuf {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let root = fs::canonicalize(std::env::temp_dir())
+            .expect("canonical temp root")
+            .join(format!("herdr-dog-bootstrap-runtime-{nonce}"));
+        fs::create_dir(&root).expect("test root");
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).expect("test root mode");
+        root
+    }
+
+    /// Build a production-shaped runtime with injected test socket and protected state paths.
+    fn test_runtime(root: &Path, socket_path: PathBuf) -> BootstrapRuntime {
+        let uid = crate::material::current_uid().expect("uid");
+        let config = RelayConfig::from_toml_str(&format!(
+            "[listener]\nlisten_address=\"127.0.0.1\"\nport=18743\n[security]\nmode=\"verified\"\nserver_certificate=\"{}\"\nserver_private_key=\"{}\"\ntrusted_client_ca=\"{}\"\ntrusted_core_enrollment_ca=\"{}\"\ncore_enrollment_intermediate_certificate=\"{}\"\ncore_enrollment_intermediate_private_key=\"{}\"\ndevice_intermediate_certificate=\"{}\"\ndevice_intermediate_private_key=\"{}\"\npublic_root_certificate=\"{}\"\n[enrollment]\nenabled=true\nallowlist_path=\"{}\"\nissuance_result_path=\"{}\"\nbootstrap_state_path=\"{}\"\nbootstrap_session=\"default\"\nbootstrap_verification_cwd=\"/tmp\"\n[limits]\nmax_connections=8\nmax_sessions_per_connection=8\nmax_control_frame_bytes=65536\nbuffer_bytes=65536\nhandshake_timeout_secs=5\nidle_timeout_secs=900\n",
+            root.join("server.pem").display(),
+            root.join("server.key").display(),
+            root.join("client-ca.pem").display(),
+            root.join("core-ca.pem").display(),
+            root.join("core-intermediate.pem").display(),
+            root.join("core-intermediate.key").display(),
+            root.join("device-intermediate.pem").display(),
+            root.join("device-intermediate.key").display(),
+            root.join("root.pem").display(),
+            root.join("allowlist.json").display(),
+            root.join("issuance.json").display(),
+            root.join("bootstrap-state.json").display(),
+        ))
+        .expect("production-shaped config");
+        let workspace =
+            HerdrWorkspaceClient::new(socket_path, uid, "/tmp".to_owned(), "default".to_owned())
+                .expect("workspace client");
+        let store = BootstrapStateStore::open(root.join("bootstrap-state.json"), uid)
+            .expect("bootstrap state store");
+        BootstrapRuntime {
+            state: Arc::new(Mutex::new(BootstrapState::default())),
+            workspace,
+            security: config.security().clone(),
+            expected_uid: uid,
+            store,
+        }
+    }
+
+    /// Serve the exact create/get/close response sequence consumed by one runtime attempt.
+    fn spawn_workspace_server(socket_path: PathBuf) -> tokio::task::JoinHandle<()> {
+        let listener = UnixListener::bind(&socket_path).expect("workspace socket");
+        fs::set_permissions(&socket_path, fs::Permissions::from_mode(0o600))
+            .expect("workspace socket mode");
+        tokio::spawn(async move {
+            let mut title = String::new();
+            for expected_method in ["workspace.create", "workspace.get", "workspace.close"] {
+                let (mut stream, _) = listener.accept().await.expect("workspace accept");
+                let request = read_json_line(&mut stream)
+                    .await
+                    .expect("workspace request");
+                let id = request["id"].as_str().expect("request id");
+                let method = request["method"].as_str().expect("request method");
+                assert_eq!(method, expected_method);
+                let response = match method {
+                    "workspace.create" => {
+                        title = request["params"]["label"]
+                            .as_str()
+                            .expect("workspace title")
+                            .to_owned();
+                        json!({
+                            "id": id,
+                            "result": {"workspace": {"workspace_id": "test-workspace"}}
+                        })
+                    }
+                    "workspace.get" => json!({
+                        "id": id,
+                        "result": {
+                            "workspace": {"workspace_id": "test-workspace", "label": title}
+                        }
+                    }),
+                    "workspace.close" => json!({"id": id, "result": {"type": "ok"}}),
+                    _ => unreachable!("fixed workspace method list"),
+                };
+                let mut bytes = serde_json::to_vec(&response).expect("workspace response");
+                bytes.push(b'\n');
+                stream
+                    .write_all(&bytes)
+                    .await
+                    .expect("workspace response write");
+            }
+            fs::remove_file(socket_path).expect("workspace socket cleanup");
+        })
+    }
+
+    /// Build a bounded HDB1 Start payload for runtime-level admission tests.
+    fn test_start_payload(session: &str) -> Hdb1StartPayload {
+        Hdb1StartPayload::new(
+            [1; 16],
+            &[1, 2, 3],
+            [2; HDB1_DIGEST_BYTES],
+            session.to_owned(),
+            [3; HDB1_DIGEST_BYTES],
+            1,
+        )
+        .expect("start payload")
+    }
+
+    /// Verify production HDB1 rejects a session binding before opening the Herdr socket.
+    // TEST:relay/src/bootstrap_runtime.rs[tests::production_start_rejects_binding_mismatch]
+    #[tokio::test(flavor = "current_thread")]
+    async fn production_start_rejects_binding_mismatch() {
+        let root = test_root();
+        let runtime = test_runtime(&root, root.join("missing.sock"));
+        let result = runtime
+            .start(
+                "127.0.0.1".parse().expect("peer IP"),
+                test_start_payload("other"),
+            )
+            .await;
+        assert_eq!(result, Err(BootstrapRuntimeError::AuthorityMismatch));
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    /// Verify production HDB1 persists bounded code failures and closes at the fixed limit.
+    // TEST:relay/src/bootstrap_runtime.rs[tests::production_submit_enforces_code_limit]
+    #[tokio::test(flavor = "current_thread")]
+    async fn production_submit_enforces_code_limit() {
+        let root = test_root();
+        let socket_dir = PathBuf::from(format!(
+            "/private/tmp/hbr-{}-{}",
+            std::process::id(),
+            root.file_name().expect("root name").to_string_lossy()
+        ));
+        fs::create_dir(&socket_dir).expect("workspace socket directory");
+        fs::set_permissions(&socket_dir, fs::Permissions::from_mode(0o700))
+            .expect("workspace socket directory mode");
+        let socket_path = socket_dir.join("s");
+        let workspace_task = spawn_workspace_server(socket_path.clone());
+        let runtime = test_runtime(&root, socket_path);
+        let challenge = runtime
+            .start(
+                "127.0.0.1".parse().expect("peer IP"),
+                test_start_payload("default"),
+            )
+            .await
+            .expect("start");
+        for _ in 0..4 {
+            assert_eq!(
+                runtime
+                    .submit(challenge.bootstrap_id, challenge.challenge, "000000")
+                    .await,
+                Err(BootstrapRuntimeError::CodeMismatch)
+            );
+        }
+        assert_eq!(
+            runtime
+                .submit(challenge.bootstrap_id, challenge.challenge, "000000")
+                .await,
+            Err(BootstrapRuntimeError::CodeRateLimited)
+        );
+        assert_eq!(
+            runtime
+                .submit(challenge.bootstrap_id, challenge.challenge, "000000")
+                .await,
+            Err(BootstrapRuntimeError::NotFound)
+        );
+        workspace_task.await.expect("workspace task");
+        fs::remove_dir_all(socket_dir).expect("workspace socket directory cleanup");
+        fs::remove_dir_all(root).expect("cleanup");
+    }
 
     /// Verify the fixed code comparison does not change the accepted shape.
     // TEST:relay/src/bootstrap_runtime.rs[tests::code_parser_is_fixed_width]

@@ -5868,6 +5868,46 @@ idle_timeout_secs = 900
         fs::remove_dir_all(root).expect("cleanup");
     }
 
+    // TEST:relay/src/quic_server.rs[tests::production_alpn_registry_is_explicit]
+    #[test]
+    fn production_alpn_registry_is_explicit() {
+        let protocols = [QRM_BOOTSTRAP_ALPN, QRM_ENROLLMENT_ALPN, QRM_RELAY_ALPN];
+        for (index, protocol) in protocols.iter().enumerate() {
+            assert!(!protocol.is_empty());
+            assert!(protocol.ends_with(b"/1"));
+            assert!(
+                protocols
+                    .iter()
+                    .enumerate()
+                    .all(|(other_index, other)| index == other_index || protocol != other)
+            );
+        }
+    }
+
+    // TEST:relay/src/quic_server.rs[tests::production_rejection_codes_are_wire_stable]
+    #[test]
+    fn production_rejection_codes_are_wire_stable() {
+        let cases = [
+            (BootstrapRuntimeError::InvalidField, 1),
+            (BootstrapRuntimeError::CapacityExhausted, 2),
+            (BootstrapRuntimeError::AlreadyActive, 3),
+            (BootstrapRuntimeError::AuthorityMismatch, 4),
+            (BootstrapRuntimeError::PersistenceFailed, 5),
+            (BootstrapRuntimeError::CodeRateLimited, 6),
+            (BootstrapRuntimeError::Expired, 7),
+            (BootstrapRuntimeError::CodeMismatch, 8),
+        ];
+        for (error, expected_code) in cases {
+            assert_eq!(bootstrap_rejection_code(error), expected_code);
+            let frame = hdb1_rejection_frame(expected_code).expect("rejection frame");
+            assert_eq!(frame.kind(), crate::bootstrap_wire::Hdb1Kind::Rejected);
+            let payload: crate::bootstrap_wire::Hdb1RejectedPayload = frame
+                .parse_json(crate::bootstrap_wire::Hdb1Kind::Rejected)
+                .expect("rejection payload");
+            assert_eq!(payload.code, expected_code);
+        }
+    }
+
     // TEST:relay/src/quic_server.rs[tests::server_accepts_only_valid_generation]
     #[test]
     fn server_accepts_only_valid_generation() {
