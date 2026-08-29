@@ -68,7 +68,7 @@ impl fmt::Debug for Opaque32 {
 pub(crate) struct CoreCertificateMetadata {
     /// Relay approval identifier bound to the issuance.
     pub(crate) approval_id: Opaque32,
-    /// Public Core certificate leaf identity digest.
+    /// Public Core certificate SubjectPublicKeyInfo identity digest.
     pub(crate) core_identity: Opaque32,
     /// Digest of the public leaf-plus-Intermediate chain.
     pub(crate) certificate_chain_digest: Opaque32,

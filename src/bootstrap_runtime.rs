@@ -60,6 +60,8 @@ const PEER_START_WINDOW_SECS: u64 = 15 * 60;
 const BOOTSTRAP_CODE_TTL_SECS: u64 = 300;
 /// Hard lifetime for an HDB1 attempt.
 pub(crate) const BOOTSTRAP_HARD_LIFETIME_SECS: u64 = 330;
+/// Recovery lifetime for an issued but unconfirmed Core approval.
+const CORE_APPROVAL_RECOVERY_TTL_SECS: u64 = 24 * 60 * 60;
 /// Maximum failed code submissions for one approval.
 const MAX_CODE_FAILURES: u8 = 5;
 /// Maximum time for one fixed Herdr operation.
@@ -141,7 +143,7 @@ impl fmt::Debug for BootstrapChallenge {
 pub(crate) struct CoreIssuedMaterial {
     /// Durable approval identifier used by later HDE3 operations.
     pub(crate) approval_id: [u8; HDB1_ID_BYTES],
-    /// SHA-256 identity of the issued Core leaf certificate.
+    /// SHA-256 identity of the issued Core certificate's SubjectPublicKeyInfo.
     pub(crate) core_identity: [u8; HDB1_DIGEST_BYTES],
     /// Public Core leaf and Core-enrollment Intermediate chain.
     pub(crate) certificate_chain: Vec<Vec<u8>>,
@@ -439,7 +441,7 @@ struct BootstrapAttempt {
 
 /// Durable-in-process Core approval record used by HDE3.
 struct CoreApproval {
-    /// Issued Core leaf identity.
+    /// Issued Core certificate SubjectPublicKeyInfo identity.
     core_identity: [u8; HDB1_DIGEST_BYTES],
     /// App CSR digest authorized by the Core bootstrap.
     app_csr_digest: [u8; HDB1_DIGEST_BYTES],
@@ -451,6 +453,8 @@ struct CoreApproval {
     configuration_generation: u64,
     /// Whether the first App certificate has been durably confirmed.
     confirmed: bool,
+    /// Recovery deadline while the issued Core approval remains unconfirmed.
+    recovery_expires_at_epoch_seconds: u64,
     /// Public Core issuance material for HDB1 recovery.
     issued: CoreIssuedMaterial,
 }
@@ -531,7 +535,7 @@ struct PersistedBootstrapRecord {
     approval_id: [u8; 32],
     /// Original bootstrap identifier when available.
     bootstrap_id: Option<[u8; 32]>,
-    /// Issued Core leaf identity, when available.
+    /// Issued Core certificate SubjectPublicKeyInfo identity, when available.
     core_identity: Option<[u8; 32]>,
     /// App CSR digest bound by the attempt.
     app_csr_digest: [u8; 32],
@@ -546,7 +550,7 @@ struct PersistedBootstrapRecord {
     confirmed: bool,
     /// Known hidden workspace identity, only for cleanup.
     workspace_id: Option<String>,
-    /// Code-entry expiry for pending records.
+    /// Pending-record expiry or unconfirmed Core-approval recovery expiry; zero after confirmation.
     expires_at_epoch_seconds: u64,
     /// Hard bootstrap expiry for pending records.
     hard_expires_at_epoch_seconds: Option<u64>,
@@ -681,7 +685,7 @@ impl BootstrapStateStore {
                 configuration_generation: approval.configuration_generation,
                 confirmed: approval.confirmed,
                 workspace_id: None,
-                expires_at_epoch_seconds: approval.issued.not_after_epoch_seconds,
+                expires_at_epoch_seconds: approval.recovery_expires_at_epoch_seconds,
                 hard_expires_at_epoch_seconds: None,
                 certificate_chain: Some(approval.issued.certificate_chain.clone()),
                 not_after_epoch_seconds: Some(approval.issued.not_after_epoch_seconds),
@@ -741,6 +745,7 @@ impl BootstrapStateStore {
                             normalized_session: record.normalized_session,
                             configuration_generation: record.configuration_generation,
                             confirmed: record.confirmed,
+                            recovery_expires_at_epoch_seconds: record.expires_at_epoch_seconds,
                             issued,
                         },
                     );
@@ -816,6 +821,11 @@ fn valid_persisted_record(record: &PersistedBootstrapRecord) -> bool {
                     && record
                         .not_after_epoch_seconds
                         .is_some_and(|value| value != 0)
+                    && if record.confirmed {
+                        record.expires_at_epoch_seconds == 0
+                    } else {
+                        record.expires_at_epoch_seconds != 0
+                    }
             }
         }
 }
@@ -907,6 +917,7 @@ impl BootstrapRuntime {
         let now = pki::current_epoch_seconds()
             .map_err(|_| BootstrapRuntimeError::WorkspaceUnavailable)?;
         let mut state = self.state.lock().await;
+        let core_approvals_expired = reap_expired_core_approvals(&mut state, now);
         let mut workspaces = std::mem::take(&mut state.orphaned_workspaces);
         workspaces.extend(reap_expired_state(&mut state, now));
         for (_, workspace_id) in &workspaces {
@@ -915,7 +926,7 @@ impl BootstrapRuntime {
                 return Err(BootstrapRuntimeError::WorkspaceUnavailable);
             }
         }
-        if !workspaces.is_empty() {
+        if !workspaces.is_empty() || core_approvals_expired {
             self.store
                 .persist(&state)
                 .map_err(|_| BootstrapRuntimeError::PersistenceFailed)?;
@@ -1047,7 +1058,10 @@ impl BootstrapRuntime {
         state.attempts.remove(&bootstrap_id);
         let issued = pki::issue_core_certificate(&self.security, self.expected_uid, &core_csr)
             .map_err(|_| BootstrapRuntimeError::PersistenceFailed)?;
-        let core_identity = issued.fingerprint().to_bytes();
+        let recovery_expires_at_epoch_seconds = now
+            .checked_add(CORE_APPROVAL_RECOVERY_TTL_SECS)
+            .ok_or(BootstrapRuntimeError::InvalidField)?;
+        let core_identity = issued.app_identity();
         let material = CoreIssuedMaterial {
             approval_id,
             core_identity,
@@ -1063,6 +1077,7 @@ impl BootstrapRuntime {
                 normalized_session,
                 configuration_generation,
                 confirmed: false,
+                recovery_expires_at_epoch_seconds,
                 issued: material.clone(),
             },
         );
@@ -1082,6 +1097,7 @@ impl BootstrapRuntime {
         let now = pki::current_epoch_seconds()
             .map_err(|_| BootstrapRuntimeError::WorkspaceUnavailable)?;
         let mut state = self.state.lock().await;
+        let core_approvals_expired = reap_expired_core_approvals(&mut state, now);
         let mut workspaces = std::mem::take(&mut state.orphaned_workspaces);
         workspaces.extend(reap_expired_state(&mut state, now));
         for (_, workspace_id) in &workspaces {
@@ -1090,7 +1106,7 @@ impl BootstrapRuntime {
                 return Err(BootstrapRuntimeError::WorkspaceUnavailable);
             }
         }
-        if !workspaces.is_empty() {
+        if !workspaces.is_empty() || core_approvals_expired {
             self.store
                 .persist(&state)
                 .map_err(|_| BootstrapRuntimeError::PersistenceFailed)?;
@@ -1114,7 +1130,23 @@ impl BootstrapRuntime {
         approval_id: [u8; HDB1_ID_BYTES],
         app_csr_digest: [u8; HDB1_DIGEST_BYTES],
     ) -> Result<u64, BootstrapRuntimeError> {
-        let state = self.state.lock().await;
+        let now = pki::current_epoch_seconds()
+            .map_err(|_| BootstrapRuntimeError::WorkspaceUnavailable)?;
+        let mut state = self.state.lock().await;
+        let expired = state
+            .core_approvals
+            .get(&approval_id)
+            .is_some_and(|approval| {
+                !approval.confirmed && now > approval.recovery_expires_at_epoch_seconds
+            });
+        if expired {
+            // Remove an unconfirmed approval before returning so it cannot authorize after TTL.
+            state.core_approvals.remove(&approval_id);
+            self.store
+                .persist(&state)
+                .map_err(|_| BootstrapRuntimeError::PersistenceFailed)?;
+            return Err(BootstrapRuntimeError::Expired);
+        }
         let approval = state
             .core_approvals
             .get(&approval_id)
@@ -1145,7 +1177,23 @@ impl BootstrapRuntime {
         app_csr_digest: [u8; HDB1_DIGEST_BYTES],
         configuration_generation: u64,
     ) -> Result<(), BootstrapRuntimeError> {
+        let now = pki::current_epoch_seconds()
+            .map_err(|_| BootstrapRuntimeError::WorkspaceUnavailable)?;
         let mut state = self.state.lock().await;
+        let expired = state
+            .core_approvals
+            .get(&approval_id)
+            .is_some_and(|approval| {
+                !approval.confirmed && now > approval.recovery_expires_at_epoch_seconds
+            });
+        if expired {
+            // Expired unconfirmed material cannot be promoted after its recovery window.
+            state.core_approvals.remove(&approval_id);
+            self.store
+                .persist(&state)
+                .map_err(|_| BootstrapRuntimeError::PersistenceFailed)?;
+            return Err(BootstrapRuntimeError::Expired);
+        }
         let approval = state
             .core_approvals
             .get_mut(&approval_id)
@@ -1159,6 +1207,7 @@ impl BootstrapRuntime {
         if !approval.confirmed {
             // Keep the Core approval pending until the matching App certificate is durably stored.
             approval.confirmed = true;
+            approval.recovery_expires_at_epoch_seconds = 0;
             self.store
                 .persist(&state)
                 .map_err(|_| BootstrapRuntimeError::PersistenceFailed)?;
@@ -1186,6 +1235,7 @@ impl BootstrapRuntime {
         let now = pki::current_epoch_seconds()
             .map_err(|_| BootstrapRuntimeError::WorkspaceUnavailable)?;
         let mut state = self.state.lock().await;
+        let core_approvals_expired = reap_expired_core_approvals(&mut state, now);
         let mut workspaces = std::mem::take(&mut state.orphaned_workspaces);
         workspaces.extend(reap_expired_state(&mut state, now));
         for (_, workspace_id) in &workspaces {
@@ -1194,7 +1244,7 @@ impl BootstrapRuntime {
                 return Err(BootstrapRuntimeError::WorkspaceUnavailable);
             }
         }
-        if !workspaces.is_empty() {
+        if !workspaces.is_empty() || core_approvals_expired {
             self.store
                 .persist(&state)
                 .map_err(|_| BootstrapRuntimeError::PersistenceFailed)?;
@@ -1352,6 +1402,24 @@ fn session_socket_path(session: &str) -> PathBuf {
     }
 }
 
+/// Reap unconfirmed Core approvals whose 24-hour recovery window elapsed.
+fn reap_expired_core_approvals(state: &mut BootstrapState, now: u64) -> bool {
+    let expired_approvals: Vec<_> = state
+        .core_approvals
+        .iter()
+        .filter_map(|(id, approval)| {
+            (!approval.confirmed
+                && approval.recovery_expires_at_epoch_seconds != 0
+                && now > approval.recovery_expires_at_epoch_seconds)
+                .then_some(*id)
+        })
+        .collect();
+    for id in &expired_approvals {
+        state.core_approvals.remove(id);
+    }
+    !expired_approvals.is_empty()
+}
+
 /// Reap expired process-local attempts before admitting new work.
 fn reap_expired_state(state: &mut BootstrapState, now: u64) -> Vec<(String, String)> {
     let mut workspaces = Vec::new();
@@ -1412,16 +1480,18 @@ fn random_code() -> [u8; 6] {
     code
 }
 
-/// Format the user-visible code-first title with an explicit UTC offset.
+/// Format the user-visible code-first title with the Relay host's local UTC offset.
 fn verification_title(
     code: [u8; 6],
     expires_at_epoch_seconds: u64,
 ) -> Result<String, BootstrapRuntimeError> {
     let timestamp =
         i64::try_from(expires_at_epoch_seconds).map_err(|_| BootstrapRuntimeError::InvalidField)?;
+    let local_offset =
+        time::UtcOffset::current_local_offset().map_err(|_| BootstrapRuntimeError::InvalidField)?;
     let datetime = time::OffsetDateTime::from_unix_timestamp(timestamp)
         .map_err(|_| BootstrapRuntimeError::InvalidField)?
-        .to_offset(time::UtcOffset::UTC);
+        .to_offset(local_offset);
     let format = time::format_description::parse_borrowed::<2>(
         "[year]-[month]-[day]T[hour]:[minute]:[second][offset_hour sign:mandatory]:[offset_minute]",
     )
@@ -1483,7 +1553,7 @@ mod tests {
         assert!(parse_code("１２３４５６").is_err());
     }
 
-    /// Verify the hidden title contains the code but remains bounded and explicit about UTC.
+    /// Verify the hidden title contains the code but remains bounded and explicit about the local offset.
     // TEST:relay/src/bootstrap_runtime.rs[tests::verification_title_is_bounded]
     #[test]
     fn verification_title_is_bounded() {
@@ -1491,6 +1561,55 @@ mod tests {
         assert!(title.starts_with("123456 (expires "));
         assert!(title.ends_with(" - herdr-dog verification"));
         assert!(title.len() <= WORKSPACE_TITLE_MAX_BYTES);
+    }
+
+    /// Verify only unconfirmed Core approvals are removed after their recovery deadline.
+    // TEST:relay/src/bootstrap_runtime.rs[tests::unconfirmed_core_approval_expiry_is_reaped]
+    #[test]
+    fn unconfirmed_core_approval_expiry_is_reaped() {
+        let mut state = BootstrapState::default();
+        let issued = CoreIssuedMaterial {
+            approval_id: [1; 32],
+            core_identity: [2; 32],
+            certificate_chain: vec![vec![3; 8]],
+            not_after_epoch_seconds: 10_000,
+        };
+        state.core_approvals.insert(
+            [1; 32],
+            CoreApproval {
+                core_identity: [2; 32],
+                app_csr_digest: [4; 32],
+                core_binding_digest: [5; 32],
+                normalized_session: "default".to_owned(),
+                configuration_generation: 1,
+                confirmed: false,
+                recovery_expires_at_epoch_seconds: 100,
+                issued,
+            },
+        );
+        assert!(reap_expired_core_approvals(&mut state, 101));
+        assert!(state.core_approvals.is_empty());
+
+        state.core_approvals.insert(
+            [6; 32],
+            CoreApproval {
+                core_identity: [7; 32],
+                app_csr_digest: [8; 32],
+                core_binding_digest: [9; 32],
+                normalized_session: "default".to_owned(),
+                configuration_generation: 1,
+                confirmed: true,
+                recovery_expires_at_epoch_seconds: 0,
+                issued: CoreIssuedMaterial {
+                    approval_id: [6; 32],
+                    core_identity: [7; 32],
+                    certificate_chain: vec![vec![10; 8]],
+                    not_after_epoch_seconds: 10_000,
+                },
+            },
+        );
+        assert!(!reap_expired_core_approvals(&mut state, 101));
+        assert!(state.core_approvals.contains_key(&[6; 32]));
     }
 
     /// Verify the fixed session grammar rejects path-like and non-ASCII values.

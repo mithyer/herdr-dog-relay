@@ -473,7 +473,7 @@ impl Hdb1SubmitPayload {
 pub(crate) struct Hdb1CoreIssuedPayload {
     /// Durable approval identifier encoded as base64url.
     pub(crate) approval_id: String,
-    /// Issued Core leaf fingerprint encoded as lowercase hex.
+    /// Core certificate SubjectPublicKeyInfo identity encoded as lowercase hex.
     pub(crate) core_identity: String,
     /// Public Core leaf and device Intermediate certificates as base64url.
     pub(crate) certificate_chain: Vec<String>,
@@ -488,7 +488,7 @@ impl Hdb1CoreIssuedPayload {
     ///
     /// # Parameters
     /// * `approval_id` - Non-zero durable Relay approval identifier.
-    /// * `core_identity` - Non-zero public Core leaf identity digest.
+    /// * `core_identity` - Non-zero public Core certificate SubjectPublicKeyInfo identity digest.
     /// * `certificate_chain` - Bounded public leaf and Intermediate DER bytes.
     /// * `not_after_epoch_seconds` - Public certificate expiry.
     ///

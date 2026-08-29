@@ -637,12 +637,8 @@ impl QuicRelayServer {
                 return Err(RelayError::QuicAuthentication);
             }
             let connection_for_close = connection.clone();
-            let result = self
-                .serve_hde3_connection(
-                    connection,
-                    peer_fingerprint.ok_or(RelayError::QuicAuthentication)?,
-                )
-                .await;
+            let core_identity = peer_certificate_identity(&connection)?;
+            let result = self.serve_hde3_connection(connection, core_identity).await;
             if result.is_ok() {
                 connection_for_close.close(0u32.into(), b"enrollment terminal");
             }
@@ -1453,7 +1449,7 @@ impl QuicRelayServer {
     async fn serve_hde3_connection(
         &self,
         connection: quinn::Connection,
-        core_fingerprint: Fingerprint,
+        core_identity: [u8; 32],
     ) -> RelayResult<()> {
         let bootstrap = self.bootstrap.as_ref().ok_or(RelayError::QuicProtocol {
             reason: "enrollment authority is unavailable",
@@ -1542,7 +1538,7 @@ impl QuicRelayServer {
                     }
                 };
                 let configuration_generation = match bootstrap
-                    .authorize_first_app(core_fingerprint.to_bytes(), approval_id, app_csr_digest)
+                    .authorize_first_app(core_identity, approval_id, app_csr_digest)
                     .await
                 {
                     Ok(generation) => generation,
@@ -1583,7 +1579,7 @@ impl QuicRelayServer {
                 let core_binding_digest = decode_hex_digest(&payload.core_binding_digest)?;
                 let challenge = match bootstrap
                     .start_app_approval(
-                        core_fingerprint.to_bytes(),
+                        core_identity,
                         app_csr_digest,
                         core_binding_digest,
                         payload.normalized_session.clone(),
@@ -1690,9 +1686,7 @@ impl QuicRelayServer {
                             return Ok(());
                         }
                     };
-                let result = self
-                    .confirm_hde3_persisted(&payload, core_fingerprint.to_bytes())
-                    .await;
+                let result = self.confirm_hde3_persisted(&payload, core_identity).await;
                 self.send_hde3_result(&mut send, result).await?;
             }
             crate::enrollment_v3_wire::Hde3Kind::Reconcile => {
@@ -3352,6 +3346,20 @@ fn peer_certificate_fingerprint(connection: &quinn::Connection) -> RelayResult<F
     let leaf = certificates.first().ok_or(RelayError::QuicAuthentication)?;
     let digest = Sha256::digest(leaf.as_ref());
     Fingerprint::from_bytes(digest.into()).map_err(|_| RelayError::QuicAuthentication)
+}
+
+/// Computes the leaf certificate's SubjectPublicKeyInfo identity for Core-enrollment authority.
+fn peer_certificate_identity(connection: &quinn::Connection) -> RelayResult<[u8; 32]> {
+    let identity = connection
+        .peer_identity()
+        .ok_or(RelayError::QuicAuthentication)?;
+    let certificates = identity
+        .downcast::<Vec<rustls::pki_types::CertificateDer<'static>>>()
+        .map_err(|_| RelayError::QuicAuthentication)?;
+    let leaf = certificates.first().ok_or(RelayError::QuicAuthentication)?;
+    let (_, certificate) = x509_parser::parse_x509_certificate(leaf.as_ref())
+        .map_err(|_| RelayError::QuicAuthentication)?;
+    Ok(Sha256::digest(certificate.tbs_certificate.subject_pki.raw).into())
 }
 
 /// Verifies that the presented client chain contains the dedicated Core enrollment anchor.
