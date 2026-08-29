@@ -35,8 +35,8 @@ pub const QRM_MAX_ENROLLMENT_CSR_BYTES: usize = 16_384;
 pub const QRM_MAX_ENROLLMENT_HANDSHAKES: usize = 16;
 /// The maximum concurrent enrollment connections.
 pub const QRM_MAX_ENROLLMENT_CONNECTIONS: usize = 8;
-/// The maximum enrollment connection lifetime in seconds.
-pub const QRM_MAX_ENROLLMENT_LIFETIME_SECS: u64 = 30;
+/// The maximum enrollment connection lifetime in seconds, including human code entry.
+pub const QRM_MAX_ENROLLMENT_LIFETIME_SECS: u64 = 330;
 /// The maximum enrollment challenge lifetime in seconds.
 pub const QRM_MAX_ENROLLMENT_CHALLENGE_TTL_SECS: u64 = 300;
 /// The maximum downloaded updater archive size.
@@ -132,6 +132,12 @@ pub struct SecurityConfig {
     /// Absolute path to the trusted Core client CA used by enrollment.
     #[serde(default)]
     trusted_core_enrollment_ca: PathBuf,
+    /// Absolute path to the Core-enrollment Intermediate CA certificate used for HDB1 issuance.
+    #[serde(default)]
+    core_enrollment_intermediate_certificate: PathBuf,
+    /// Absolute path to the Core-enrollment Intermediate CA private key.
+    #[serde(default)]
+    core_enrollment_intermediate_private_key: PathBuf,
     /// Absolute path to the device Intermediate CA certificate chain.
     #[serde(default)]
     device_intermediate_certificate: PathBuf,
@@ -167,6 +173,16 @@ impl SecurityConfig {
     /// Returns the trusted Core enrollment CA path.
     pub fn trusted_core_enrollment_ca(&self) -> &Path {
         &self.trusted_core_enrollment_ca
+    }
+
+    /// Returns the Core-enrollment Intermediate CA certificate path.
+    pub fn core_enrollment_intermediate_certificate(&self) -> &Path {
+        &self.core_enrollment_intermediate_certificate
+    }
+
+    /// Returns the Core-enrollment Intermediate CA private-key path.
+    pub fn core_enrollment_intermediate_private_key(&self) -> &Path {
+        &self.core_enrollment_intermediate_private_key
     }
 
     /// Returns the configured device Intermediate CA certificate path.
@@ -284,6 +300,9 @@ pub struct EnrollmentConfig {
     /// Absolute protected path for response-lost issuance reconciliation records.
     #[serde(default)]
     issuance_result_path: PathBuf,
+    /// Absolute protected path for restart-surviving HDB1 bootstrap metadata.
+    #[serde(default = "default_bootstrap_state_path")]
+    bootstrap_state_path: PathBuf,
     /// Maximum pre-authenticated enrollment handshakes.
     max_handshakes: usize,
     /// Maximum enrollment connections after TLS/ALPN selection.
@@ -296,6 +315,24 @@ pub struct EnrollmentConfig {
     connection_lifetime_secs: u64,
     /// Maximum lifetime of one Relay challenge.
     challenge_ttl_secs: u64,
+    /// Normalized Herdr session used by server-only bootstrap and later approval.
+    #[serde(default = "default_bootstrap_session")]
+    bootstrap_session: String,
+    /// Remote absolute cwd used by the bounded hidden verification workspace.
+    #[serde(default = "default_bootstrap_verification_cwd")]
+    bootstrap_verification_cwd: String,
+}
+
+fn default_bootstrap_session() -> String {
+    "default".to_owned()
+}
+
+fn default_bootstrap_verification_cwd() -> String {
+    "/path/to/herdr-dog/bootstrap-verification".to_owned()
+}
+
+fn default_bootstrap_state_path() -> PathBuf {
+    PathBuf::from("/path/to/herdr-dog/bootstrap-state.json")
 }
 
 impl Default for EnrollmentConfig {
@@ -305,12 +342,15 @@ impl Default for EnrollmentConfig {
             enabled: false,
             allowlist_path: PathBuf::new(),
             issuance_result_path: PathBuf::new(),
+            bootstrap_state_path: default_bootstrap_state_path(),
             max_handshakes: QRM_MAX_ENROLLMENT_HANDSHAKES,
             max_connections: QRM_MAX_ENROLLMENT_CONNECTIONS,
             max_request_bytes: QRM_MAX_ENROLLMENT_REQUEST_BYTES,
             max_csr_bytes: QRM_MAX_ENROLLMENT_CSR_BYTES,
             connection_lifetime_secs: QRM_MAX_ENROLLMENT_LIFETIME_SECS,
             challenge_ttl_secs: QRM_MAX_ENROLLMENT_CHALLENGE_TTL_SECS,
+            bootstrap_session: default_bootstrap_session(),
+            bootstrap_verification_cwd: default_bootstrap_verification_cwd(),
         }
     }
 }
@@ -325,6 +365,10 @@ impl EnrollmentConfig {
         validate_absolute_path(
             "enrollment.issuance_result_path",
             &self.issuance_result_path,
+        )?;
+        validate_absolute_path(
+            "enrollment.bootstrap_state_path",
+            &self.bootstrap_state_path,
         )?;
         if self.max_handshakes == 0 || self.max_handshakes > QRM_MAX_ENROLLMENT_HANDSHAKES {
             return Err(RelayError::InvalidConfiguration {
@@ -351,6 +395,17 @@ impl EnrollmentConfig {
                 reason: "enrollment bounds exceed the fixed QRM limits",
             });
         }
+        if !is_valid_bootstrap_session(&self.bootstrap_session)
+            || self.bootstrap_verification_cwd.is_empty()
+            || !Path::new(&self.bootstrap_verification_cwd).is_absolute()
+            || self.bootstrap_verification_cwd.contains('\n')
+            || self.bootstrap_verification_cwd.contains('\r')
+        {
+            return Err(RelayError::InvalidConfiguration {
+                field: "enrollment.bootstrap_verification_cwd",
+                reason: "bootstrap workspace configuration is invalid",
+            });
+        }
         Ok(())
     }
 
@@ -367,6 +422,11 @@ impl EnrollmentConfig {
     /// Returns the protected issuance-result path.
     pub fn issuance_result_path(&self) -> &Path {
         &self.issuance_result_path
+    }
+
+    /// Returns the protected bootstrap state path.
+    pub fn bootstrap_state_path(&self) -> &Path {
+        &self.bootstrap_state_path
     }
 
     /// Returns the pre-authentication semaphore bound.
@@ -398,6 +458,26 @@ impl EnrollmentConfig {
     pub const fn challenge_ttl_secs(&self) -> u64 {
         self.challenge_ttl_secs
     }
+
+    /// Returns the normalized session used by HDB1/HDE3 bootstrap verification.
+    pub fn bootstrap_session(&self) -> &str {
+        &self.bootstrap_session
+    }
+
+    /// Returns the remote cwd used by the hidden verification workspace.
+    pub fn bootstrap_verification_cwd(&self) -> &str {
+        &self.bootstrap_verification_cwd
+    }
+}
+
+fn is_valid_bootstrap_session(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 64
+        && value != "."
+        && value != ".."
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
 }
 
 /// Fixed-source stable-latest updater settings.
@@ -582,6 +662,14 @@ impl RelayConfig {
                 validate_absolute_path(
                     "security.trusted_core_enrollment_ca",
                     &self.security.trusted_core_enrollment_ca,
+                )?;
+                validate_absolute_path(
+                    "security.core_enrollment_intermediate_certificate",
+                    &self.security.core_enrollment_intermediate_certificate,
+                )?;
+                validate_absolute_path(
+                    "security.core_enrollment_intermediate_private_key",
+                    &self.security.core_enrollment_intermediate_private_key,
                 )?;
                 validate_absolute_path(
                     "security.device_intermediate_certificate",

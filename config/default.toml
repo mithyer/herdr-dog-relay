@@ -21,7 +21,11 @@ server_private_key = ""
 trusted_client_ca = "/path/to/herdr-dog/app-client-ca.pem"
 # Absolute path to the trusted Core client CA used only by enrollment.
 trusted_core_enrollment_ca = "/path/to/herdr-dog/core-enrollment-ca.pem"
-# Absolute path to this device's Intermediate CA certificate chain.
+# Absolute path to the Core-enrollment Intermediate certificate used by HDB1 issuance.
+core_enrollment_intermediate_certificate = "/path/to/herdr-dog/core-enrollment-intermediate.pem"
+# Absolute path to the Core-enrollment Intermediate private key; keep mode 0600.
+core_enrollment_intermediate_private_key = "/path/to/herdr-dog/core-enrollment-intermediate.key"
+# Absolute path to this device's App-client Intermediate CA certificate chain.
 device_intermediate_certificate = "/path/to/herdr-dog/device-intermediate-chain.pem"
 # Absolute path to this device's Intermediate CA private key; keep mode 0600.
 device_intermediate_private_key = "/path/to/herdr-dog/device-intermediate.key"
@@ -49,6 +53,8 @@ enabled = true
 allowlist_path = "/path/to/herdr-dog/allowlist.json"
 # Protected bounded issuance-result record path for response-lost reconciliation.
 issuance_result_path = "/path/to/herdr-dog/issuance-results.json"
+# Protected restart-surviving HDB1 bootstrap metadata path.
+bootstrap_state_path = "/path/to/herdr-dog/bootstrap-state.json"
 # Maximum pre-authenticated TLS handshakes held at once.
 max_handshakes = 16
 # Maximum enrollment connections after ALPN selection.
@@ -57,10 +63,14 @@ max_connections = 8
 max_request_bytes = 65536
 # Maximum raw CSR bytes retained only during one request.
 max_csr_bytes = 16384
-# Maximum enrollment connection lifetime in seconds.
-connection_lifetime_secs = 30
+# Maximum enrollment connection lifetime in seconds, including human code entry.
+connection_lifetime_secs = 330
 # Maximum Relay challenge lifetime in seconds.
 challenge_ttl_secs = 300
+# Existing Herdr session used by the bounded bootstrap verifier; empty is not allowed.
+bootstrap_session = "default"
+# Remote absolute cwd for the hidden verification workspace.
+bootstrap_verification_cwd = "/path/to/herdr-dog/bootstrap-verification"
 
 [update]
 # Enable the explicit stable-latest updater control surface.

@@ -524,6 +524,8 @@ pub enum AllowlistRole {
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AllowlistState {
+    /// Certificate is waiting for protected App certificate-chain persistence confirmation.
+    Pending,
     /// Certificate may enter normal QRM.
     Active,
     /// Certificate is denied and matching connections must close.
@@ -703,6 +705,17 @@ impl AllowlistRegistry {
         self.generation
     }
 
+    /// Atomically add one pending update-admin entry.
+    ///
+    /// The entry cannot enter normal QRM or request updates until `activate` is called after
+    /// the App confirms protected certificate-chain persistence.
+    pub fn enroll_pending(
+        &mut self,
+        certificate: CertificateMetadata,
+    ) -> Result<AllowlistEntry, EnrollmentError> {
+        self.enroll_with_state(certificate, AllowlistState::Pending)
+    }
+
     /// Atomically add one active update-admin entry.
     ///
     /// # Parameters
@@ -714,6 +727,15 @@ impl AllowlistRegistry {
     pub fn enroll(
         &mut self,
         certificate: CertificateMetadata,
+    ) -> Result<AllowlistEntry, EnrollmentError> {
+        self.enroll_with_state(certificate, AllowlistState::Active)
+    }
+
+    /// Add one entry with an explicit pre-activation state.
+    fn enroll_with_state(
+        &mut self,
+        certificate: CertificateMetadata,
+        state: AllowlistState,
     ) -> Result<AllowlistEntry, EnrollmentError> {
         if self.entries.contains_key(certificate.app_id())
             || self.entries.values().any(|entry| {
@@ -731,13 +753,30 @@ impl AllowlistRegistry {
             app_id: certificate.app_id().clone(),
             fingerprint: certificate.fingerprint(),
             role: AllowlistRole::RelayUpdateAdmin,
-            state: AllowlistState::Active,
+            state,
             generation,
             not_after_epoch_seconds: certificate.not_after_epoch_seconds,
         };
         self.generation = generation;
         self.entries.insert(entry.app_id.clone(), entry.clone());
         Ok(entry)
+    }
+
+    /// Activate one pending App identity after protected certificate persistence is confirmed.
+    pub fn activate(
+        &mut self,
+        app_id: &AppId,
+        fingerprint: Fingerprint,
+    ) -> Result<AllowlistEntry, EnrollmentError> {
+        let entry = self
+            .entries
+            .get_mut(app_id)
+            .ok_or(EnrollmentError::AllowlistNotFound)?;
+        if entry.state != AllowlistState::Pending || entry.fingerprint != fingerprint {
+            return Err(EnrollmentError::UpdateUnauthorized);
+        }
+        entry.state = AllowlistState::Active;
+        Ok(entry.clone())
     }
 
     /// Revoke one App and close only its matching authority while siblings survive.

@@ -243,9 +243,19 @@ fn decode_start(
     payload: Hdb1StartPayload,
     configuration_generation: u64,
 ) -> Result<BootstrapStartRequest, Hdb1RelaySessionError> {
-    let (request_id, core_csr, app_csr_digest, normalized_session, core_binding_digest) = payload
+    let (
+        request_id,
+        core_csr,
+        app_csr_digest,
+        normalized_session,
+        core_binding_digest,
+        wire_configuration_generation,
+    ) = payload
         .decode_fields()
         .map_err(Hdb1RelaySessionError::from)?;
+    if wire_configuration_generation != configuration_generation {
+        return Err(Hdb1RelaySessionError::Wire(Hdb1Error::InvalidField));
+    }
     let app_csr_digest = CsrDigest::from_bytes(app_csr_digest)
         .map_err(|_| Hdb1RelaySessionError::Wire(Hdb1Error::InvalidField))?;
     BootstrapStartRequest::new(
@@ -344,20 +354,26 @@ mod tests {
 
     /// Build a deterministic valid Start payload for Relay session tests.
     fn start_payload() -> Hdb1StartPayload {
-        Hdb1StartPayload::new([1; 16], &[2; 32], [3; 32], "default".to_owned(), [4; 32])
+        Hdb1StartPayload::new([1; 16], &[2; 32], [3; 32], "default".to_owned(), [4; 32], 1)
             .expect("start payload")
     }
 
     /// Build the fake request corresponding to the wire Start payload.
     fn start_request(payload: &Hdb1StartPayload) -> BootstrapStartRequest {
-        let (request_id, core_csr, app_csr_digest, normalized_session, core_binding_digest) =
-            payload.decode_fields().expect("start fields");
+        let (
+            request_id,
+            core_csr,
+            app_csr_digest,
+            normalized_session,
+            core_binding_digest,
+            configuration_generation,
+        ) = payload.decode_fields().expect("start fields");
         BootstrapStartRequest::new(
             request_id,
             core_csr,
             CsrDigest::from_bytes(app_csr_digest).expect("app digest"),
             normalized_session,
-            1,
+            configuration_generation,
             core_binding_digest,
         )
         .expect("start request")

@@ -184,6 +184,43 @@ impl PersistentAllowlist {
         Ok(())
     }
 
+    /// Enrolls one issued public certificate in a pending state and persists it atomically.
+    pub fn enroll_pending(
+        &mut self,
+        certificate: crate::enrollment::CertificateMetadata,
+    ) -> Result<AllowlistEntry, EnrollmentError> {
+        let _lock = self
+            .lock_file()
+            .map_err(|_| EnrollmentError::AllowlistPersistence)?;
+        let mut next = self
+            .load_registry()
+            .map_err(|_| EnrollmentError::AllowlistPersistence)?;
+        let entry = next.enroll_pending(certificate)?;
+        self.persist_registry(&next)
+            .map_err(|_| EnrollmentError::AllowlistPersistence)?;
+        self.registry = next;
+        Ok(entry)
+    }
+
+    /// Activates one pending App identity and persists it atomically.
+    pub fn activate(
+        &mut self,
+        app_id: &AppId,
+        fingerprint: Fingerprint,
+    ) -> Result<AllowlistEntry, EnrollmentError> {
+        let _lock = self
+            .lock_file()
+            .map_err(|_| EnrollmentError::AllowlistPersistence)?;
+        let mut next = self
+            .load_registry()
+            .map_err(|_| EnrollmentError::AllowlistPersistence)?;
+        let entry = next.activate(app_id, fingerprint)?;
+        self.persist_registry(&next)
+            .map_err(|_| EnrollmentError::AllowlistPersistence)?;
+        self.registry = next;
+        Ok(entry)
+    }
+
     /// Enrolls one issued public certificate and persists the new generation atomically.
     pub fn enroll(
         &mut self,

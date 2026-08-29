@@ -41,6 +41,7 @@ type Hdb1StartFields = (
     [u8; HDB1_DIGEST_BYTES],
     String,
     [u8; HDB1_DIGEST_BYTES],
+    u64,
 );
 
 /// Decoded HDB1 exact-binding recovery fields returned to Relay-owned callers.
@@ -295,6 +296,8 @@ pub(crate) struct Hdb1StartPayload {
     pub(crate) normalized_session: String,
     /// Core binding correlation digest encoded as lowercase hex.
     pub(crate) core_binding_digest: String,
+    /// Core-owned Profile configuration generation.
+    pub(crate) configuration_generation: u64,
 }
 
 impl Hdb1StartPayload {
@@ -306,6 +309,7 @@ impl Hdb1StartPayload {
     /// * `app_csr_digest` - Non-zero App CSR digest.
     /// * `normalized_session` - Existing normalized Herdr session name.
     /// * `core_binding_digest` - Non-zero Core binding digest.
+    /// * `configuration_generation` - Non-zero Core Profile generation.
     ///
     /// # Returns
     /// A validated canonical Start payload.
@@ -315,6 +319,7 @@ impl Hdb1StartPayload {
         app_csr_digest: [u8; HDB1_DIGEST_BYTES],
         normalized_session: String,
         core_binding_digest: [u8; HDB1_DIGEST_BYTES],
+        configuration_generation: u64,
     ) -> Result<Self, Hdb1Error> {
         validate_session(&normalized_session)?;
         if request_id == [0; HDB1_REQUEST_ID_BYTES]
@@ -322,6 +327,7 @@ impl Hdb1StartPayload {
             || core_csr.len() > HDB1_MAX_CSR_BYTES
             || app_csr_digest == [0; HDB1_DIGEST_BYTES]
             || core_binding_digest == [0; HDB1_DIGEST_BYTES]
+            || configuration_generation == 0
         {
             return Err(Hdb1Error::InvalidField);
         }
@@ -331,6 +337,7 @@ impl Hdb1StartPayload {
             app_csr_digest: encode_hex(&app_csr_digest),
             normalized_session,
             core_binding_digest: encode_hex(&core_binding_digest),
+            configuration_generation,
         })
     }
 
@@ -340,6 +347,9 @@ impl Hdb1StartPayload {
         let core_csr = decode_base64_bounded(&self.core_csr, HDB1_MAX_CSR_BYTES)?;
         let app_csr_digest = decode_hex_exact::<HDB1_DIGEST_BYTES>(&self.app_csr_digest)?;
         let core_binding_digest = decode_hex_exact::<HDB1_DIGEST_BYTES>(&self.core_binding_digest)?;
+        if self.configuration_generation == 0 {
+            return Err(Hdb1Error::InvalidField);
+        }
         validate_session(&self.normalized_session)?;
         Ok((
             request_id,
@@ -347,6 +357,7 @@ impl Hdb1StartPayload {
             app_csr_digest,
             self.normalized_session.clone(),
             core_binding_digest,
+            self.configuration_generation,
         ))
     }
 }
@@ -974,6 +985,7 @@ mod tests {
             app_csr_digest: encode_hex(&[3; 32]),
             normalized_session: "default".to_owned(),
             core_binding_digest: encode_hex(&[4; 32]),
+            configuration_generation: 1,
         }
     }
 

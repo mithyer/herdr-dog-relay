@@ -125,6 +125,12 @@ pub struct IssuanceResultRecord {
     certificate_chain: Vec<Vec<u8>>,
     /// Public leaf fingerprint after issuance.
     fingerprint: Option<[u8; 32]>,
+    /// Profile configuration generation bound to the Core authorization.
+    ///
+    /// `None` is retained only for pre-field records; those records cannot produce a successful
+    /// reconciliation result and are rejected closed by the HDE3 response builder.
+    #[serde(default)]
+    configuration_generation: Option<u64>,
     /// Allowlist generation after the issuance transaction.
     allowlist_generation: Option<u64>,
     /// Public certificate expiry after issuance.
@@ -155,6 +161,7 @@ impl fmt::Debug for IssuanceResultRecord {
                 &self.certificate_chain.iter().map(Vec::len).sum::<usize>(),
             )
             .field("fingerprint_present", &self.fingerprint.is_some())
+            .field("configuration_generation", &self.configuration_generation)
             .field("allowlist_generation", &self.allowlist_generation)
             .field("not_after_epoch_seconds", &self.not_after_epoch_seconds)
             .field("rejection_code", &self.rejection_code)
@@ -196,6 +203,11 @@ impl IssuanceResultRecord {
     /// Returns the public certificate fingerprint when issuance completed.
     pub const fn fingerprint(&self) -> Option<[u8; 32]> {
         self.fingerprint
+    }
+
+    /// Returns the Core-owned configuration generation when retained.
+    pub const fn configuration_generation(&self) -> Option<u64> {
+        self.configuration_generation
     }
 
     /// Returns the allowlist generation when issuance completed.
@@ -280,6 +292,53 @@ impl PersistentIssuanceResults {
         &self.path
     }
 
+    /// Find one exact issuance record while reloading the protected file.
+    ///
+    /// # Parameters
+    /// * `key` - Exact authorization/CSR binding key.
+    /// * `now_epoch_seconds` - Current epoch used to prune expired records.
+    ///
+    /// # Returns
+    /// A bounded public record, or `None` when no unexpired record exists.
+    pub fn find(
+        &mut self,
+        key: IssuanceResultKey,
+        now_epoch_seconds: u64,
+    ) -> RelayResult<Option<IssuanceResultRecord>> {
+        let _lock = self.lock_file()?;
+        let mut records = self.load_records()?;
+        let changed = prune_records(&mut records, now_epoch_seconds);
+        if changed {
+            self.persist_records(&records)?;
+        }
+        self.records = records;
+        Ok(self
+            .records
+            .iter()
+            .find(|record| record.key == key)
+            .cloned())
+    }
+
+    /// Find one unexpired issuance record by its derived authorization identity.
+    pub fn find_by_authorization_id(
+        &mut self,
+        authorization_id: [u8; 16],
+        now_epoch_seconds: u64,
+    ) -> RelayResult<Option<IssuanceResultRecord>> {
+        let _lock = self.lock_file()?;
+        let mut records = self.load_records()?;
+        let changed = prune_records(&mut records, now_epoch_seconds);
+        if changed {
+            self.persist_records(&records)?;
+        }
+        self.records = records;
+        Ok(self
+            .records
+            .iter()
+            .find(|record| record.key.authorization_id() == authorization_id)
+            .cloned())
+    }
+
     /// Begins or resumes one pending authorization/CSR binding.
     ///
     /// Existing records are returned unchanged, making duplicate Submit handling terminal and
@@ -288,6 +347,7 @@ impl PersistentIssuanceResults {
     /// # Parameters
     /// * `key` - Core authorization and CSR digest binding.
     /// * `app_id` - Validated App identity bound to the CSR.
+    /// * `configuration_generation` - Core Profile generation bound to the authorization.
     /// * `authorization_expires_at_epoch_seconds` - Core authorization deadline.
     /// * `now_epoch_seconds` - Current epoch used for TTL and expiry checks.
     ///
@@ -297,6 +357,7 @@ impl PersistentIssuanceResults {
         &mut self,
         key: IssuanceResultKey,
         app_id: impl Into<String>,
+        configuration_generation: u64,
         authorization_expires_at_epoch_seconds: u64,
         now_epoch_seconds: u64,
     ) -> RelayResult<IssuanceBeginResult> {
@@ -304,6 +365,11 @@ impl PersistentIssuanceResults {
         AppId::new(app_id.clone()).map_err(|_| RelayError::QuicProtocol {
             reason: "issuance App identity is invalid",
         })?;
+        if configuration_generation == 0 {
+            return Err(RelayError::QuicProtocol {
+                reason: "issuance configuration generation is empty",
+            });
+        }
         if authorization_expires_at_epoch_seconds <= now_epoch_seconds
             || authorization_expires_at_epoch_seconds - now_epoch_seconds
                 > MAX_AUTHORIZATION_TTL_SECS
@@ -324,6 +390,11 @@ impl PersistentIssuanceResults {
             if existing.app_id != app_id {
                 return Err(RelayError::QuicProtocol {
                     reason: "issuance binding App identity mismatch",
+                });
+            }
+            if existing.configuration_generation != Some(configuration_generation) {
+                return Err(RelayError::QuicProtocol {
+                    reason: "issuance binding configuration generation mismatch",
                 });
             }
             if changed {
@@ -353,6 +424,7 @@ impl PersistentIssuanceResults {
             retained_until_epoch_seconds: retained_until,
             certificate_chain: Vec::new(),
             fingerprint: None,
+            configuration_generation: Some(configuration_generation),
             allowlist_generation: None,
             not_after_epoch_seconds: None,
             rejection_code: None,
@@ -678,6 +750,9 @@ fn validate_records(persisted: &PersistedIssuanceResults) -> RelayResult<()> {
             || record.key.authorization_id() == [0; 16]
             || record.key.csr_digest() == [0; 32]
             || AppId::new(record.app_id.clone()).is_err()
+            || record
+                .configuration_generation
+                .is_some_and(|generation| generation == 0)
             || record.authorization_expires_at_epoch_seconds == 0
             || record.retained_until_epoch_seconds == 0
         {
@@ -695,6 +770,7 @@ fn validate_records(persisted: &PersistedIssuanceResults) -> RelayResult<()> {
             IssuanceResultStatus::Issued => {
                 validate_chain(&record.certificate_chain)?;
                 if record.fingerprint.is_none()
+                    || record.configuration_generation.is_none()
                     || record.allowlist_generation.is_none()
                     || record.not_after_epoch_seconds.is_none()
                     || record.rejection_code.is_some()
@@ -745,7 +821,7 @@ mod tests {
         let uid = crate::material::current_uid().expect("uid");
         let mut store = PersistentIssuanceResults::open(&path, uid).expect("open");
         let pending = match store
-            .begin_pending(key(1, 2), "app-a", 100, 90)
+            .begin_pending(key(1, 2), "app-a", 1, 100, 90)
             .expect("pending")
         {
             IssuanceBeginResult::Created(record) => record,
@@ -753,7 +829,7 @@ mod tests {
         };
         assert_eq!(pending.status(), IssuanceResultStatus::Pending);
         let existing = match store
-            .begin_pending(key(1, 2), "app-a", 100, 90)
+            .begin_pending(key(1, 2), "app-a", 1, 100, 90)
             .expect("existing")
         {
             IssuanceBeginResult::Existing(record) => record,
@@ -781,7 +857,7 @@ mod tests {
         let uid = crate::material::current_uid().expect("uid");
         let mut store = PersistentIssuanceResults::open(&path, uid).expect("open");
         store
-            .begin_pending(key(3, 4), "app-b", 100, 90)
+            .begin_pending(key(3, 4), "app-b", 1, 100, 90)
             .expect("pending");
         let attached = store
             .attach_certificate(key(3, 4), vec![vec![1, 2], vec![3]], [5; 32], 2, 200, 91)
@@ -806,7 +882,7 @@ mod tests {
         let uid = crate::material::current_uid().expect("uid");
         let mut store = PersistentIssuanceResults::open(&path, uid).expect("open");
         store
-            .begin_pending(key(5, 6), "app-c", 100, 90)
+            .begin_pending(key(5, 6), "app-c", 1, 100, 90)
             .expect("pending");
         store.mark_rejected(key(5, 6), 7, 100).expect("reject");
         assert_eq!(
@@ -826,9 +902,9 @@ mod tests {
         let uid = crate::material::current_uid().expect("uid");
         let mut store = PersistentIssuanceResults::open(&path, uid).expect("open");
         store
-            .begin_pending(key(7, 8), "app-d", 100, 90)
+            .begin_pending(key(7, 8), "app-d", 1, 100, 90)
             .expect("pending");
-        let result = store.begin_pending(key(7, 9), "app-d", 100, 90);
+        let result = store.begin_pending(key(7, 9), "app-d", 1, 100, 90);
         assert!(matches!(result, Err(RelayError::QuicProtocol { .. })));
         fs::remove_dir_all(directory).expect("cleanup");
     }

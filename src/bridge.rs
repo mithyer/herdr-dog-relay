@@ -281,9 +281,10 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .expect("system clock after Unix epoch")
             .as_nanos();
+        // Keep the canonical Darwin Unix socket path below SUN_LEN with a short test directory.
         let directory = fs::canonicalize(std::env::temp_dir())
             .expect("canonicalize temporary directory")
-            .join(format!("hd-r-int-{}-{nonce}", std::process::id()));
+            .join(format!("h{}{}", std::process::id(), nonce % 1_000_000));
         fs::create_dir(&directory).expect("create private integration directory");
         fs::set_permissions(&directory, fs::Permissions::from_mode(0o700))
             .expect("set private integration directory mode");

@@ -25,17 +25,10 @@ use tokio::{
 
 use crate::{
     allowlist::PersistentAllowlist,
+    bootstrap_runtime::{BootstrapRuntime, BootstrapRuntimeError},
     bridge::{self, BridgeLimits},
     config::{QRM_HANDSHAKE_TIMEOUT_SECS, RelayConfig, SecurityMode},
-    enrollment::{
-        AppId, CoreAuthorization, CsrDigest, CsrMetadata, EnrollmentChallenge,
-        EnrollmentSubmission, Fingerprint, STABLE_LATEST_SELECTOR,
-    },
-    enrollment_wire::{
-        EnrollmentChallengePayload, EnrollmentFrame, EnrollmentFrameKind, EnrollmentIssuedPayload,
-        EnrollmentRejectedPayload, EnrollmentSubmitPayload, EnrollmentWireError,
-        write_frame as write_enrollment_frame,
-    },
+    enrollment::{AllowlistState, Fingerprint, STABLE_LATEST_SELECTOR},
     error::{RelayError, RelayResult},
     issuance::{
         IssuanceBeginResult, IssuanceResultKey, IssuanceResultStatus, PersistentIssuanceResults,
@@ -44,26 +37,41 @@ use crate::{
         MAX_PRIVATE_MATERIAL_BYTES, MAX_PUBLIC_MATERIAL_BYTES, ProtectedFileKind, current_uid,
         read_protected_file,
     },
-    pki::{current_epoch_seconds, issue_certificate},
+    pki::current_epoch_seconds,
     quic_wire::{
         DeviceHelloAck, HdqmFrame, HdqmKind, HdqsBinding, HdqsReason, HdqsResponse, SessionOpenAck,
         SessionOpenRequest, SessionPrepareAck, SessionPrepareRequest,
-    },
-    reconciliation_wire::{
-        RECONCILIATION_HEADER_BYTES, RECONCILIATION_MAGIC, RECONCILIATION_VERSION,
-        ReconcilePayload, ReconciliationFrame, ReconciliationFrameKind,
-        ReconciliationResultPayload, ReconciliationStatus,
-        write_frame as write_reconciliation_frame,
     },
     session_registry::SessionRegistry,
     socket::UnixSocketConnector,
     updater::FixedSourceUpdater,
 };
 
+#[cfg(test)]
+use crate::{
+    enrollment::{
+        AppId, CoreAuthorization, CsrDigest, CsrMetadata, EnrollmentChallenge, EnrollmentSubmission,
+    },
+    enrollment_wire::{
+        EnrollmentChallengePayload, EnrollmentFrame, EnrollmentFrameKind, EnrollmentIssuedPayload,
+        EnrollmentRejectedPayload, EnrollmentSubmitPayload, EnrollmentWireError,
+        write_frame as write_enrollment_frame,
+    },
+    pki::issue_certificate,
+    reconciliation_wire::{
+        RECONCILIATION_HEADER_BYTES, RECONCILIATION_MAGIC, RECONCILIATION_VERSION,
+        ReconcilePayload, ReconciliationFrame, ReconciliationFrameKind,
+        ReconciliationResultPayload, ReconciliationStatus,
+        write_frame as write_reconciliation_frame,
+    },
+};
+
 /// ALPN selected by every QRM-1 Relay connection.
 pub const QRM_RELAY_ALPN: &[u8] = b"herdr-dog-relay-quic/1";
 /// ALPN selected by the terminal App enrollment path.
 pub const QRM_ENROLLMENT_ALPN: &[u8] = b"herdr-dog-relay-enroll/1";
+/// ALPN selected by the server-authenticated first Core bootstrap path.
+pub const QRM_BOOTSTRAP_ALPN: &[u8] = b"herdr-dog-relay-bootstrap/1";
 /// Maximum time allowed for the initial control stream and session bind.
 pub const QRM_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(QRM_HANDSHAKE_TIMEOUT_SECS);
 /// Maximum time allowed for an existing QUIC connection to drain after GOAWAY.
@@ -130,7 +138,9 @@ impl AsyncWrite for QuicBiStream {
     }
 }
 
-/// One request frame accepted after the enrollment challenge.
+/// Historical HDE1/HDE2 fixture helper; production dispatch uses HDB1/HDE3 only.
+#[cfg(test)]
+#[allow(dead_code)]
 enum EnrollmentRequestFrame {
     /// Existing HDE1 Challenge/Submit/Issued/Rejected namespace.
     V1(EnrollmentFrame),
@@ -138,7 +148,9 @@ enum EnrollmentRequestFrame {
     V2(ReconciliationFrame),
 }
 
-/// Reads one bounded HDE1 or HDE version-two request without widening either decoder.
+/// Historical HDE1/HDE2 fixture reader; production dispatch uses HDB1/HDE3 only.
+#[cfg(test)]
+#[allow(dead_code)]
 async fn read_versioned_enrollment_frame(
     reader: &mut quinn::RecvStream,
     max_bytes: usize,
@@ -224,6 +236,8 @@ pub struct QuicRelayServer {
     allowlist: Option<Arc<Mutex<PersistentAllowlist>>>,
     /// Broadcasts the bounded drain deadline to every accepted connection task.
     drain_tx: watch::Sender<Option<Instant>>,
+    /// Core bootstrap and later-App approval authority shared by connections.
+    bootstrap: Option<Arc<BootstrapRuntime>>,
 
     /// Optional test-only socket override for deterministic Unix bridge tests.
     socket_override: Option<PathBuf>,
@@ -254,7 +268,16 @@ impl QuicRelayServer {
     /// A server owner that has not opened a UDP socket.
     // TEST:relay/src/quic_server.rs[tests::server_accepts_only_valid_generation]
     pub fn new(config: RelayConfig, relay_generation: u64) -> RelayResult<Self> {
-        Self::new_inner(config, relay_generation, None, None, None, None, [1; 32])
+        Self::new_inner(
+            config,
+            relay_generation,
+            None,
+            None,
+            None,
+            None,
+            None,
+            [1; 32],
+        )
     }
 
     /// Binds one UDP QUIC endpoint with verified TLS 1.3 mutual authentication.
@@ -416,10 +439,12 @@ impl QuicRelayServer {
                             },
                         };
                         drop(handshake_permit);
-                        let is_enrollment = negotiated_alpn(&connection)
-                            .map(|protocol| protocol == QRM_ENROLLMENT_ALPN)
+                        let is_pre_auth = negotiated_alpn(&connection)
+                            .map(|protocol| {
+                                protocol == QRM_ENROLLMENT_ALPN || protocol == QRM_BOOTSTRAP_ALPN
+                            })
                             .unwrap_or(false);
-                        let connection_permit = if is_enrollment {
+                        let connection_permit = if is_pre_auth {
                             None
                         } else {
                             let Some(permit) = try_acquire(&owner.connections) else {
@@ -484,7 +509,9 @@ impl QuicRelayServer {
         };
         let relay_identity = load_relay_identity(&config)?;
         // Enrollment may be disabled, but verified normal QRM still requires an active allowlist.
-        let (allowlist, issuance_results) = if config.security().mode() == SecurityMode::Verified {
+        let (allowlist, issuance_results, bootstrap) = if config.security().mode()
+            == SecurityMode::Verified
+        {
             let uid = current_uid()?;
             let allowlist = Arc::new(Mutex::new(PersistentAllowlist::open(
                 config.enrollment().allowlist_path(),
@@ -498,9 +525,14 @@ impl QuicRelayServer {
                         .map(|store| Arc::new(Mutex::new(store)))
                 })
                 .transpose()?;
-            (Some(allowlist), issuance_results)
+            let bootstrap = config
+                .enrollment()
+                .enabled()
+                .then(|| BootstrapRuntime::new(&config, uid).map(Arc::new))
+                .transpose()?;
+            (Some(allowlist), issuance_results, bootstrap)
         } else {
-            (None, None)
+            (None, None, None)
         };
         Self::new_inner(
             config,
@@ -509,11 +541,13 @@ impl QuicRelayServer {
             socket_override,
             allowlist,
             issuance_results,
+            bootstrap,
             relay_identity,
         )
     }
 
-    /// Constructs the owner after common validation.
+    /// Constructs the owner after common validation and optional production bootstrap wiring.
+    #[allow(clippy::too_many_arguments)]
     fn new_inner(
         config: RelayConfig,
         relay_generation: u64,
@@ -521,6 +555,7 @@ impl QuicRelayServer {
         socket_override: Option<PathBuf>,
         allowlist: Option<Arc<Mutex<PersistentAllowlist>>>,
         issuance_results: Option<Arc<Mutex<PersistentIssuanceResults>>>,
+        bootstrap: Option<Arc<BootstrapRuntime>>,
         relay_identity: [u8; 32],
     ) -> RelayResult<Self> {
         if relay_generation == 0 {
@@ -549,6 +584,7 @@ impl QuicRelayServer {
             issuance_results,
             allowlist,
             drain_tx,
+            bootstrap,
             socket_override,
         })
     }
@@ -569,6 +605,14 @@ impl QuicRelayServer {
     /// Handles one authenticated connection and owns its control/session tasks.
     async fn serve_connection_inner(&self, connection: quinn::Connection) -> RelayResult<()> {
         let protocol = negotiated_alpn(&connection)?;
+        if protocol == QRM_BOOTSTRAP_ALPN {
+            if !self.config.enrollment().enabled() {
+                return Err(RelayError::QuicProtocol {
+                    reason: "bootstrap ALPN is disabled",
+                });
+            }
+            return self.serve_bootstrap_connection(connection).await;
+        }
         let peer_fingerprint = if self.config.security().mode() == SecurityMode::Verified {
             Some(peer_certificate_fingerprint(&connection)?)
         } else {
@@ -588,7 +632,7 @@ impl QuicRelayServer {
             }
             let connection_for_close = connection.clone();
             let result = self
-                .serve_enrollment_connection(
+                .serve_hde3_connection(
                     connection,
                     peer_fingerprint.ok_or(RelayError::QuicAuthentication)?,
                 )
@@ -1132,7 +1176,835 @@ impl QuicRelayServer {
         Ok(true)
     }
 
-    /// Handles one authenticated, terminal enrollment connection before any QRM frame is accepted.
+    /// Handles one server-only HDB1 bootstrap connection before any Core certificate exists.
+    async fn serve_bootstrap_connection(&self, connection: quinn::Connection) -> RelayResult<()> {
+        let bootstrap = self.bootstrap.as_ref().ok_or(RelayError::QuicProtocol {
+            reason: "bootstrap runtime is unavailable",
+        })?;
+        // Human code entry keeps this connection open, so it needs the same independent
+        // post-handshake quotas as Core enrollment instead of borrowing only the TLS permit.
+        let _handshake_permit =
+            try_acquire(&self.enrollment_handshakes).ok_or(RelayError::ResourceLimit)?;
+        let _connection_permit =
+            try_acquire(&self.enrollment_connections).ok_or(RelayError::ResourceLimit)?;
+        let (mut send, mut recv) = timeout(self.handshake_timeout(), connection.accept_bi())
+            .await
+            .map_err(|_| RelayError::QuicHandshake {
+                reason: "bootstrap stream timeout",
+            })?
+            .map_err(|_| RelayError::QuicHandshake {
+                reason: "bootstrap stream unavailable",
+            })?;
+        let start = match timeout(
+            Duration::from_secs(330),
+            crate::bootstrap_wire::read_frame(&mut recv),
+        )
+        .await
+        {
+            Ok(Ok(frame)) => frame,
+            Ok(Err(_)) | Err(_) => {
+                let _ = send_hdb1_rejection(&mut send, 1).await;
+                connection.close(0u32.into(), b"bootstrap frame invalid");
+                return Ok(());
+            }
+        };
+        if start.kind() == crate::bootstrap_wire::Hdb1Kind::Reconcile {
+            let payload: crate::bootstrap_wire::Hdb1ReconcilePayload =
+                match start.parse_json(crate::bootstrap_wire::Hdb1Kind::Reconcile) {
+                    Ok(payload) => payload,
+                    Err(_) => {
+                        let _ = send_hdb1_rejection(&mut send, 1).await;
+                        connection.close(0u32.into(), b"bootstrap reconcile invalid");
+                        return Ok(());
+                    }
+                };
+            let (approval_id, binding_digest, session) = match payload.decode_fields() {
+                Ok(fields) => fields,
+                Err(_) => {
+                    let _ = send_hdb1_rejection(&mut send, 1).await;
+                    connection.close(0u32.into(), b"bootstrap reconcile invalid");
+                    return Ok(());
+                }
+            };
+            let response = match bootstrap
+                .reconcile(approval_id, binding_digest, &session)
+                .await
+            {
+                Ok(issued) => {
+                    let payload = crate::bootstrap_wire::Hdb1ResultPayload::new_issued(
+                        issued.approval_id,
+                        issued.core_identity,
+                        &issued.certificate_chain,
+                        issued.not_after_epoch_seconds,
+                    )
+                    .map_err(|_| RelayError::QuicProtocol {
+                        reason: "bootstrap reconcile result is invalid",
+                    })?;
+                    crate::bootstrap_wire::Hdb1Frame::json(
+                        crate::bootstrap_wire::Hdb1Kind::Result,
+                        &payload,
+                    )
+                    .map_err(|_| RelayError::QuicProtocol {
+                        reason: "bootstrap reconcile result is invalid",
+                    })?
+                }
+                Err(error) => {
+                    let payload = crate::bootstrap_wire::Hdb1RejectedPayload::new(
+                        bootstrap_rejection_code(error),
+                    )
+                    .map_err(|_| RelayError::QuicProtocol {
+                        reason: "bootstrap reconcile rejection is invalid",
+                    })?;
+                    crate::bootstrap_wire::Hdb1Frame::json(
+                        crate::bootstrap_wire::Hdb1Kind::Rejected,
+                        &payload,
+                    )
+                    .map_err(|_| RelayError::QuicProtocol {
+                        reason: "bootstrap reconcile rejection is invalid",
+                    })?
+                }
+            };
+            timeout(
+                self.handshake_timeout(),
+                crate::bootstrap_wire::write_frame(&mut send, &response),
+            )
+            .await
+            .map_err(|_| RelayError::QuicHandshake {
+                reason: "bootstrap reconcile response timeout",
+            })?
+            .map_err(|_| RelayError::QuicProtocol {
+                reason: "bootstrap reconcile response failed",
+            })?;
+            send.finish().map_err(|_| RelayError::QuicProtocol {
+                reason: "finishing bootstrap reconcile stream",
+            })?;
+            connection.close(0u32.into(), b"bootstrap reconcile terminal");
+            return Ok(());
+        }
+        let payload = match start.parse_json(crate::bootstrap_wire::Hdb1Kind::Start) {
+            Ok(payload) => payload,
+            Err(_) => {
+                let _ = send_hdb1_rejection(&mut send, 1).await;
+                connection.close(0u32.into(), b"bootstrap order invalid");
+                return Ok(());
+            }
+        };
+        let challenge = match bootstrap
+            .start(connection.remote_address().ip(), payload)
+            .await
+        {
+            Ok(challenge) => challenge,
+            Err(error) => {
+                let _ = send_hdb1_rejection(&mut send, bootstrap_rejection_code(error)).await;
+                connection.close(0u32.into(), b"bootstrap rejected");
+                return Ok(());
+            }
+        };
+        let challenge_payload = crate::bootstrap_wire::Hdb1ChallengePayload::new(
+            challenge.bootstrap_id,
+            challenge.challenge,
+            challenge.expires_at_epoch_seconds,
+        )
+        .map_err(|_| RelayError::QuicProtocol {
+            reason: "bootstrap challenge encoding failed",
+        })?;
+        let challenge_frame = crate::bootstrap_wire::Hdb1Frame::json(
+            crate::bootstrap_wire::Hdb1Kind::Challenge,
+            &challenge_payload,
+        )
+        .map_err(|_| RelayError::QuicProtocol {
+            reason: "bootstrap challenge encoding failed",
+        })?;
+        timeout(
+            self.handshake_timeout(),
+            crate::bootstrap_wire::write_frame(&mut send, &challenge_frame),
+        )
+        .await
+        .map_err(|_| RelayError::QuicHandshake {
+            reason: "bootstrap challenge write timeout",
+        })?
+        .map_err(|_| RelayError::QuicProtocol {
+            reason: "bootstrap challenge write failed",
+        })?;
+        let submit = match timeout(
+            Duration::from_secs(330),
+            crate::bootstrap_wire::read_frame(&mut recv),
+        )
+        .await
+        {
+            Ok(Ok(frame)) => frame,
+            Ok(Err(_)) | Err(_) => {
+                connection.close(0u32.into(), b"bootstrap submit missing");
+                return Ok(());
+            }
+        };
+        let submit: crate::bootstrap_wire::Hdb1SubmitPayload =
+            match submit.parse_json(crate::bootstrap_wire::Hdb1Kind::Submit) {
+                Ok(payload) => payload,
+                Err(_) => {
+                    let _ = send_hdb1_rejection(&mut send, 1).await;
+                    connection.close(0u32.into(), b"bootstrap submit invalid");
+                    return Ok(());
+                }
+            };
+        let (bootstrap_id, submitted_challenge, code) = match submit.decode_fields() {
+            Ok(fields) => fields,
+            Err(_) => {
+                let _ = send_hdb1_rejection(&mut send, 1).await;
+                connection.close(0u32.into(), b"bootstrap submit invalid");
+                return Ok(());
+            }
+        };
+        let response = match bootstrap
+            .submit(bootstrap_id, submitted_challenge, &code)
+            .await
+        {
+            Ok(issued) => {
+                let payload = crate::bootstrap_wire::Hdb1CoreIssuedPayload::new(
+                    issued.approval_id,
+                    issued.core_identity,
+                    &issued.certificate_chain,
+                    issued.not_after_epoch_seconds,
+                )
+                .map_err(|_| RelayError::QuicProtocol {
+                    reason: "bootstrap issuance response is invalid",
+                })?;
+                crate::bootstrap_wire::Hdb1Frame::json(
+                    crate::bootstrap_wire::Hdb1Kind::CoreIssued,
+                    &payload,
+                )
+                .map_err(|_| RelayError::QuicProtocol {
+                    reason: "bootstrap issuance response is invalid",
+                })?
+            }
+            Err(error) => {
+                let payload = crate::bootstrap_wire::Hdb1RejectedPayload::new(
+                    bootstrap_rejection_code(error),
+                )
+                .map_err(|_| RelayError::QuicProtocol {
+                    reason: "bootstrap rejection encoding failed",
+                })?;
+                crate::bootstrap_wire::Hdb1Frame::json(
+                    crate::bootstrap_wire::Hdb1Kind::Rejected,
+                    &payload,
+                )
+                .map_err(|_| RelayError::QuicProtocol {
+                    reason: "bootstrap rejection encoding failed",
+                })?
+            }
+        };
+        timeout(
+            self.handshake_timeout(),
+            crate::bootstrap_wire::write_frame(&mut send, &response),
+        )
+        .await
+        .map_err(|_| RelayError::QuicHandshake {
+            reason: "bootstrap response write timeout",
+        })?
+        .map_err(|_| RelayError::QuicProtocol {
+            reason: "bootstrap response write failed",
+        })?;
+        send.finish().map_err(|_| RelayError::QuicProtocol {
+            reason: "finishing bootstrap stream",
+        })?;
+        let _ = timeout(self.handshake_timeout(), send.stopped()).await;
+        connection.close(0u32.into(), b"bootstrap terminal");
+        Ok(())
+    }
+
+    /// Handles one Core-enrollment mTLS connection using only the frozen HDE3 registry.
+    async fn serve_hde3_connection(
+        &self,
+        connection: quinn::Connection,
+        core_fingerprint: Fingerprint,
+    ) -> RelayResult<()> {
+        let bootstrap = self.bootstrap.as_ref().ok_or(RelayError::QuicProtocol {
+            reason: "enrollment authority is unavailable",
+        })?;
+        let _handshake_permit =
+            try_acquire(&self.enrollment_handshakes).ok_or(RelayError::ResourceLimit)?;
+        let _connection_permit =
+            try_acquire(&self.enrollment_connections).ok_or(RelayError::ResourceLimit)?;
+        let (mut send, mut recv) = timeout(self.handshake_timeout(), connection.accept_bi())
+            .await
+            .map_err(|_| RelayError::QuicHandshake {
+                reason: "HDE3 stream timeout",
+            })?
+            .map_err(|_| RelayError::QuicHandshake {
+                reason: "HDE3 stream unavailable",
+            })?;
+        let frame = match timeout(
+            Duration::from_secs(self.config.enrollment().connection_lifetime_secs()),
+            crate::enrollment_v3_wire::read_frame(&mut recv),
+        )
+        .await
+        {
+            Ok(Ok(frame)) => frame,
+            Ok(Err(_)) | Err(_) => {
+                let _ = send_hde3_rejection(&mut send, None, 1).await;
+                return Ok(());
+            }
+        };
+        match frame.kind() {
+            crate::enrollment_v3_wire::Hde3Kind::FirstAppSubmit => {
+                let payload: crate::enrollment_v3_wire::Hde3FirstAppSubmitPayload =
+                    match frame.parse_json(crate::enrollment_v3_wire::Hde3Kind::FirstAppSubmit) {
+                        Ok(payload) => payload,
+                        Err(_) => {
+                            send_hde3_rejection(&mut send, None, 1).await?;
+                            return Ok(());
+                        }
+                    };
+                let (approval_id, app_csr, app_csr_digest) = match payload.decode_fields() {
+                    Ok(fields) => fields,
+                    Err(_) => {
+                        send_hde3_rejection(&mut send, None, 1).await?;
+                        return Ok(());
+                    }
+                };
+                let configuration_generation = match bootstrap
+                    .authorize_first_app(core_fingerprint.to_bytes(), approval_id, app_csr_digest)
+                    .await
+                {
+                    Ok(generation) => generation,
+                    Err(_) => {
+                        send_hde3_rejection(&mut send, Some(approval_id), 4).await?;
+                        return Ok(());
+                    }
+                };
+                let result = self
+                    .issue_hde3_app(
+                        approval_id,
+                        app_csr,
+                        app_csr_digest,
+                        configuration_generation,
+                    )
+                    .await;
+                self.send_hde3_result(&mut send, result).await?;
+            }
+            crate::enrollment_v3_wire::Hde3Kind::ApprovalStart => {
+                let payload: crate::enrollment_v3_wire::Hde3ApprovalStartPayload =
+                    match frame.parse_json(crate::enrollment_v3_wire::Hde3Kind::ApprovalStart) {
+                        Ok(payload) => payload,
+                        Err(_) => {
+                            send_hde3_rejection(&mut send, None, 1).await?;
+                            return Ok(());
+                        }
+                    };
+                if payload.validate().is_err() {
+                    send_hde3_rejection(&mut send, None, 1).await?;
+                    return Ok(());
+                }
+                let app_csr_digest =
+                    payload
+                        .app_csr_digest()
+                        .map_err(|_| RelayError::QuicProtocol {
+                            reason: "HDE3 approval digest is invalid",
+                        })?;
+                let core_binding_digest = decode_hex_digest(&payload.core_binding_digest)?;
+                let challenge = match bootstrap
+                    .start_app_approval(
+                        core_fingerprint.to_bytes(),
+                        app_csr_digest,
+                        core_binding_digest,
+                        payload.normalized_session.clone(),
+                        payload.configuration_generation,
+                    )
+                    .await
+                {
+                    Ok(challenge) => challenge,
+                    Err(error) => {
+                        send_hde3_rejection(&mut send, None, bootstrap_rejection_code(error))
+                            .await?;
+                        return Ok(());
+                    }
+                };
+                let challenge_payload =
+                    crate::enrollment_v3_wire::Hde3ApprovalChallengePayload::new(
+                        challenge.approval_id,
+                        challenge.challenge,
+                        challenge.expires_at_epoch_seconds,
+                    )
+                    .map_err(|_| RelayError::QuicProtocol {
+                        reason: "HDE3 challenge encoding failed",
+                    })?;
+                let challenge_frame = crate::enrollment_v3_wire::Hde3Frame::json(
+                    crate::enrollment_v3_wire::Hde3Kind::ApprovalChallenge,
+                    &challenge_payload,
+                )
+                .map_err(|_| RelayError::QuicProtocol {
+                    reason: "HDE3 challenge encoding failed",
+                })?;
+                timeout(
+                    self.handshake_timeout(),
+                    crate::enrollment_v3_wire::write_frame(&mut send, &challenge_frame),
+                )
+                .await
+                .map_err(|_| RelayError::QuicHandshake {
+                    reason: "HDE3 challenge write timeout",
+                })?
+                .map_err(|_| RelayError::QuicProtocol {
+                    reason: "HDE3 challenge write failed",
+                })?;
+                let submit = match timeout(
+                    Duration::from_secs(self.config.enrollment().connection_lifetime_secs()),
+                    crate::enrollment_v3_wire::read_frame(&mut recv),
+                )
+                .await
+                {
+                    Ok(Ok(frame)) => frame,
+                    Ok(Err(_)) | Err(_) => return Ok(()),
+                };
+                let submit: crate::enrollment_v3_wire::Hde3ApprovalSubmitPayload =
+                    match submit.parse_json(crate::enrollment_v3_wire::Hde3Kind::ApprovalSubmit) {
+                        Ok(payload) => payload,
+                        Err(_) => {
+                            send_hde3_rejection(&mut send, Some(challenge.approval_id), 1).await?;
+                            return Ok(());
+                        }
+                    };
+                let (approval_id, submitted_challenge, code, app_csr, digest) =
+                    match submit.decode_fields() {
+                        Ok(fields) => fields,
+                        Err(_) => {
+                            send_hde3_rejection(&mut send, Some(challenge.approval_id), 1).await?;
+                            return Ok(());
+                        }
+                    };
+                if approval_id != challenge.approval_id
+                    || submitted_challenge != challenge.challenge
+                {
+                    send_hde3_rejection(&mut send, Some(challenge.approval_id), 4).await?;
+                    return Ok(());
+                }
+                let context = match bootstrap
+                    .submit_app_approval(approval_id, submitted_challenge, &code, app_csr, digest)
+                    .await
+                {
+                    Ok(context) => context,
+                    Err(error) => {
+                        send_hde3_rejection(
+                            &mut send,
+                            Some(approval_id),
+                            bootstrap_rejection_code(error),
+                        )
+                        .await?;
+                        return Ok(());
+                    }
+                };
+                let result = self
+                    .issue_hde3_app(
+                        context.approval_id,
+                        context.app_csr,
+                        context.app_csr_digest,
+                        context.configuration_generation,
+                    )
+                    .await;
+                self.send_hde3_result(&mut send, result).await?;
+            }
+            crate::enrollment_v3_wire::Hde3Kind::ConfirmPersisted => {
+                let payload: crate::enrollment_v3_wire::Hde3ConfirmPersistedPayload =
+                    match frame.parse_json(crate::enrollment_v3_wire::Hde3Kind::ConfirmPersisted) {
+                        Ok(payload) => payload,
+                        Err(_) => {
+                            send_hde3_rejection(&mut send, None, 1).await?;
+                            return Ok(());
+                        }
+                    };
+                let result = self
+                    .confirm_hde3_persisted(&payload, core_fingerprint.to_bytes())
+                    .await;
+                self.send_hde3_result(&mut send, result).await?;
+            }
+            crate::enrollment_v3_wire::Hde3Kind::Reconcile => {
+                let payload: crate::enrollment_v3_wire::Hde3ReconcilePayload =
+                    match frame.parse_json(crate::enrollment_v3_wire::Hde3Kind::Reconcile) {
+                        Ok(payload) => payload,
+                        Err(_) => {
+                            send_hde3_rejection(&mut send, None, 1).await?;
+                            return Ok(());
+                        }
+                    };
+                if payload.validate().is_err() {
+                    send_hde3_rejection(&mut send, None, 1).await?;
+                    return Ok(());
+                }
+                let approval_id = payload
+                    .approval_id()
+                    .map_err(|_| RelayError::QuicProtocol {
+                        reason: "HDE3 reconciliation approval is invalid",
+                    })?;
+                let csr_digest = decode_hex_digest(&payload.app_csr_digest)?;
+                let key = hde3_issuance_key(approval_id, csr_digest);
+                let result = self.reconcile_hde3_record(approval_id, key).await;
+                self.send_hde3_result(&mut send, result).await?;
+            }
+            crate::enrollment_v3_wire::Hde3Kind::Renew => {
+                send_hde3_rejection(&mut send, None, 3).await?;
+            }
+            _ => {
+                send_hde3_rejection(&mut send, None, 3).await?;
+            }
+        }
+        send.finish().map_err(|_| RelayError::QuicProtocol {
+            reason: "finishing HDE3 stream",
+        })?;
+        let _ = timeout(self.handshake_timeout(), send.stopped()).await;
+        connection.close(0u32.into(), b"HDE3 terminal");
+        Ok(())
+    }
+
+    /// Issue or resume one App certificate after HDE3 authority validation.
+    async fn issue_hde3_app(
+        &self,
+        approval_id: [u8; 32],
+        app_csr: Vec<u8>,
+        app_csr_digest: [u8; 32],
+        configuration_generation: u64,
+    ) -> RelayResult<Result<crate::enrollment_v3_wire::Hde3ResultPayload, u16>> {
+        let key = hde3_issuance_key(approval_id, app_csr_digest);
+        let issuance = self
+            .issuance_results
+            .as_ref()
+            .ok_or(RelayError::ConfigurationRead)?;
+        let now = current_epoch_seconds().map_err(|_| RelayError::ConfigurationRead)?;
+        let app_id = match crate::pki::app_id_from_csr(&app_csr) {
+            Ok(app_id) => app_id,
+            Err(_) => return Ok(Err(4)),
+        };
+        let begin = match issuance.lock().await.begin_pending(
+            key,
+            app_id.as_str(),
+            configuration_generation,
+            now.saturating_add(300),
+            now,
+        ) {
+            Ok(begin) => begin,
+            Err(_) => return Ok(Err(5)),
+        };
+        if let IssuanceBeginResult::Existing(record) = begin {
+            return Ok(match record.status() {
+                IssuanceResultStatus::Issued => self.issuance_record_payload(
+                    &record,
+                    approval_id,
+                    Some(configuration_generation),
+                    false,
+                ),
+                IssuanceResultStatus::Rejected => {
+                    crate::enrollment_v3_wire::Hde3ResultPayload::new_rejected(
+                        approval_id,
+                        record.rejection_code().unwrap_or(4),
+                    )
+                    .map_err(|_| 1)
+                }
+                IssuanceResultStatus::Pending => {
+                    crate::enrollment_v3_wire::Hde3ResultPayload::new_pending(approval_id)
+                        .map_err(|_| 1)
+                }
+            });
+        }
+        let allowlist = self
+            .allowlist
+            .as_ref()
+            .ok_or(RelayError::ConfigurationRead)?;
+        let next_generation = allowlist
+            .lock()
+            .await
+            .generation()
+            .checked_add(1)
+            .ok_or(RelayError::ResourceLimit)?;
+        let issued = match crate::pki::issue_certificate(
+            self.config.security(),
+            current_uid()?,
+            app_id.clone(),
+            &app_csr,
+            next_generation,
+        ) {
+            Ok(issued) => issued,
+            Err(_) => return Ok(Err(4)),
+        };
+        let chain = issued.certificate_chain();
+        let fingerprint = issued.fingerprint().to_bytes();
+        let chain_digest = public_chain_digest(&chain);
+        let not_after = issued.not_after_epoch_seconds();
+        let metadata = issued
+            .metadata(app_id, next_generation)
+            .map_err(|_| RelayError::ConfigurationRead)?;
+        issuance
+            .lock()
+            .await
+            .attach_certificate(
+                key,
+                chain.clone(),
+                fingerprint,
+                next_generation,
+                not_after,
+                now,
+            )
+            .map_err(|_| RelayError::ConfigurationRead)?;
+        let entry = match allowlist.lock().await.enroll_pending(metadata) {
+            Ok(entry) => entry,
+            Err(_) => return Ok(Err(5)),
+        };
+        let committed_generation = entry.generation();
+        if issuance
+            .lock()
+            .await
+            .mark_issued(
+                key,
+                chain.clone(),
+                fingerprint,
+                committed_generation,
+                not_after,
+                now,
+            )
+            .is_err()
+        {
+            return Ok(Err(5));
+        }
+        let payload = crate::enrollment_v3_wire::Hde3ResultPayload::new_issued(
+            crate::enrollment_v3_wire::Hde3IssuedInput {
+                approval_id,
+                app_identity: issued.app_identity(),
+                certificate_chain: &chain,
+                certificate_fingerprint: fingerprint,
+                certificate_chain_digest: chain_digest,
+                not_after_epoch_seconds: not_after,
+                configuration_generation,
+                active: false,
+            },
+        )
+        .map_err(|_| RelayError::ConfigurationRead)?;
+        Ok(Ok(payload))
+    }
+
+    /// Confirm the exact issued App material and activate its protected Relay authority.
+    ///
+    /// # Parameters
+    /// * `payload` - Core's protected-persistence confirmation metadata.
+    /// * `core_identity` - Core-enrollment certificate identity authenticated by HDE3.
+    ///
+    /// # Returns
+    /// A sanitized active/rejected result or a bounded Relay failure.
+    async fn confirm_hde3_persisted(
+        &self,
+        payload: &crate::enrollment_v3_wire::Hde3ConfirmPersistedPayload,
+        core_identity: [u8; 32],
+    ) -> RelayResult<Result<crate::enrollment_v3_wire::Hde3ResultPayload, u16>> {
+        if payload.validate().is_err() {
+            return Ok(Err(1));
+        }
+        let approval_id = payload
+            .approval_id()
+            .map_err(|_| RelayError::QuicProtocol {
+                reason: "HDE3 confirmation approval is invalid",
+            })?;
+        let supplied_app_identity = decode_hex_digest(&payload.app_identity)?;
+        let supplied_fingerprint =
+            Fingerprint::from_bytes(decode_hex_digest(&payload.issued_certificate_fingerprint)?)
+                .map_err(|_| RelayError::QuicProtocol {
+                    reason: "HDE3 confirmation fingerprint is invalid",
+                })?;
+        let supplied_chain_digest = decode_hex_digest(&payload.issued_certificate_chain_digest)?;
+        let authorization_id = hde3_authorization_id(approval_id);
+        let issuance = self
+            .issuance_results
+            .as_ref()
+            .ok_or(RelayError::ConfigurationRead)?;
+        let record = issuance
+            .lock()
+            .await
+            .find_by_authorization_id(
+                authorization_id,
+                current_epoch_seconds().map_err(|_| RelayError::ConfigurationRead)?,
+            )?
+            .ok_or(RelayError::ConfigurationRead)?;
+        let Some(expected_fingerprint) = record.fingerprint() else {
+            return Ok(Err(5));
+        };
+        let expected_app_identity = certificate_identity_digest(record.certificate_chain());
+        let expected_chain_digest = public_chain_digest(record.certificate_chain());
+        if expected_app_identity != Some(supplied_app_identity)
+            || expected_fingerprint != supplied_fingerprint.to_bytes()
+            || expected_chain_digest != supplied_chain_digest
+        {
+            return Ok(Err(4));
+        }
+        let result = match self.issuance_record_payload(
+            &record,
+            approval_id,
+            Some(payload.configuration_generation),
+            true,
+        ) {
+            Ok(result) => result,
+            Err(code) => return Ok(Err(code)),
+        };
+        let app_id = crate::enrollment::AppId::new(record.app_id().to_owned()).map_err(|_| {
+            RelayError::QuicProtocol {
+                reason: "HDE3 confirmation App identity is invalid",
+            }
+        })?;
+        let bootstrap = self
+            .bootstrap
+            .as_ref()
+            .ok_or(RelayError::ConfigurationRead)?;
+        match bootstrap
+            .confirm_first_app(
+                core_identity,
+                approval_id,
+                record.key().csr_digest(),
+                payload.configuration_generation,
+            )
+            .await
+        {
+            Ok(()) | Err(BootstrapRuntimeError::NotFound) => {}
+            Err(_) => return Ok(Err(5)),
+        }
+        let allowlist = self
+            .allowlist
+            .as_ref()
+            .ok_or(RelayError::ConfigurationRead)?;
+        let mut allowlist = allowlist.lock().await;
+        allowlist.reload()?;
+        let Some((entry_state, entry_fingerprint)) = allowlist
+            .entry(&app_id)
+            .map(|entry| (entry.state(), entry.fingerprint()))
+        else {
+            return Ok(Err(5));
+        };
+        if entry_fingerprint != supplied_fingerprint {
+            return Ok(Err(4));
+        }
+        match entry_state {
+            AllowlistState::Pending => {
+                allowlist
+                    .activate(&app_id, supplied_fingerprint)
+                    .map_err(|_| RelayError::ConfigurationRead)?;
+            }
+            AllowlistState::Active => {}
+            AllowlistState::Revoked => return Ok(Err(4)),
+        }
+        Ok(Ok(result))
+    }
+
+    /// Reconcile a durable HDE3 issuance record without resubmitting a CSR.
+    async fn reconcile_hde3_record(
+        &self,
+        approval_id: [u8; 32],
+        key: IssuanceResultKey,
+    ) -> RelayResult<Result<crate::enrollment_v3_wire::Hde3ResultPayload, u16>> {
+        let issuance = self
+            .issuance_results
+            .as_ref()
+            .ok_or(RelayError::ConfigurationRead)?;
+        let record = issuance.lock().await.find(
+            key,
+            current_epoch_seconds().map_err(|_| RelayError::ConfigurationRead)?,
+        )?;
+        let Some(record) = record else {
+            return Ok(Err(4));
+        };
+        Ok(match record.status() {
+            IssuanceResultStatus::Issued => {
+                self.issuance_record_payload(&record, approval_id, None, false)
+            }
+            IssuanceResultStatus::Pending => {
+                crate::enrollment_v3_wire::Hde3ResultPayload::new_pending(approval_id)
+                    .map_err(|_| 1)
+            }
+            IssuanceResultStatus::Rejected => {
+                crate::enrollment_v3_wire::Hde3ResultPayload::new_rejected(
+                    approval_id,
+                    record.rejection_code().unwrap_or(4),
+                )
+                .map_err(|_| 1)
+            }
+        })
+    }
+
+    /// Convert durable public issuance data into a validated HDE3 result payload.
+    ///
+    /// # Parameters
+    /// * `record` - Durable public certificate and binding metadata.
+    /// * `approval_id` - HDE3 approval identifier returned to Core.
+    /// * `configuration_generation` - Optional request generation to cross-check against the record.
+    /// * `active` - Whether the App has completed protected persistence.
+    ///
+    /// # Returns
+    /// A bounded public HDE3 result or a sanitized rejection code.
+    fn issuance_record_payload(
+        &self,
+        record: &crate::issuance::IssuanceResultRecord,
+        approval_id: [u8; 32],
+        configuration_generation: Option<u64>,
+        active: bool,
+    ) -> Result<crate::enrollment_v3_wire::Hde3ResultPayload, u16> {
+        let Some(fingerprint) = record.fingerprint() else {
+            return Err(5);
+        };
+        let Some(record_configuration_generation) = record.configuration_generation() else {
+            return Err(5);
+        };
+        if configuration_generation
+            .is_some_and(|generation| generation != record_configuration_generation)
+        {
+            return Err(4);
+        }
+        let configuration_generation = record_configuration_generation;
+        let Some(not_after) = record.not_after_epoch_seconds() else {
+            return Err(5);
+        };
+        let identity = certificate_identity_digest(record.certificate_chain()).ok_or(5_u16)?;
+        crate::enrollment_v3_wire::Hde3ResultPayload::new_issued(
+            crate::enrollment_v3_wire::Hde3IssuedInput {
+                approval_id,
+                app_identity: identity,
+                certificate_chain: record.certificate_chain(),
+                certificate_fingerprint: fingerprint,
+                certificate_chain_digest: public_chain_digest(record.certificate_chain()),
+                not_after_epoch_seconds: not_after,
+                configuration_generation,
+                active,
+            },
+        )
+        .map_err(|_| 5)
+    }
+
+    /// Send a successful or bounded HDE3 result, mapping internal failures to rejection codes.
+    async fn send_hde3_result(
+        &self,
+        send: &mut quinn::SendStream,
+        result: RelayResult<Result<crate::enrollment_v3_wire::Hde3ResultPayload, u16>>,
+    ) -> RelayResult<()> {
+        match result? {
+            Ok(payload) => {
+                let frame = crate::enrollment_v3_wire::Hde3Frame::json(
+                    crate::enrollment_v3_wire::Hde3Kind::Result,
+                    &payload,
+                )
+                .map_err(|_| RelayError::QuicProtocol {
+                    reason: "HDE3 result encoding failed",
+                })?;
+                timeout(
+                    self.handshake_timeout(),
+                    crate::enrollment_v3_wire::write_frame(send, &frame),
+                )
+                .await
+                .map_err(|_| RelayError::QuicHandshake {
+                    reason: "HDE3 result write timeout",
+                })?
+                .map_err(|_| RelayError::QuicProtocol {
+                    reason: "HDE3 result write failed",
+                })?;
+            }
+            Err(code) => send_hde3_rejection(send, None, code).await?,
+        }
+        Ok(())
+    }
+
+    /// Historical HDE1/HDE2 handler retained only for old unit fixtures; never a production route.
+    #[cfg(test)]
+    #[allow(dead_code)]
     async fn serve_enrollment_connection(
         &self,
         connection: quinn::Connection,
@@ -1290,6 +2162,7 @@ impl QuicRelayServer {
         let begin = match issuance_results.lock().await.begin_pending(
             key,
             app_id.as_str(),
+            submission.configuration_generation,
             submission.expires_at_epoch_seconds,
             submission_now,
         ) {
@@ -1447,7 +2320,9 @@ impl QuicRelayServer {
         Ok(())
     }
 
-    /// Serves one authenticated HDE version-two reconciliation request.
+    /// Historical HDE2 fixture handler; production recovery uses HDE3.
+    #[cfg(test)]
+    #[allow(dead_code)]
     async fn serve_reconciliation_frame(
         &self,
         send: &mut quinn::SendStream,
@@ -1554,14 +2429,18 @@ impl QuicRelayServer {
         Ok(())
     }
 
-    /// Finishes one unresolved enrollment connection without creating a terminal rejection.
+    /// Historical HDE1 fixture helper; production HDE3 uses typed Result frames.
+    #[cfg(test)]
+    #[allow(dead_code)]
     fn finish_unknown_enrollment(&self, send: &mut quinn::SendStream) -> RelayResult<()> {
         send.finish().map_err(|_| RelayError::QuicProtocol {
             reason: "finishing unresolved enrollment connection",
         })
     }
 
-    /// Sends one durable reconciliation record without exposing private material.
+    /// Historical HDE1 fixture helper; production HDE3 uses its own result path.
+    #[cfg(test)]
+    #[allow(dead_code)]
     async fn send_reconciled_record(
         &self,
         send: &mut quinn::SendStream,
@@ -1639,7 +2518,9 @@ impl QuicRelayServer {
         }
     }
 
-    /// Sends one sanitized terminal enrollment rejection and closes the stream.
+    /// Historical HDE1 fixture helper; production HDE3 uses fixed rejection frames.
+    #[cfg(test)]
+    #[allow(dead_code)]
     async fn reject_enrollment(
         &self,
         send: &mut quinn::SendStream,
@@ -1955,12 +2836,174 @@ impl QuicRelayServer {
             issuance_results: self.issuance_results.clone(),
             allowlist: self.allowlist.clone(),
             drain_tx: self.drain_tx.clone(),
+            bootstrap: self.bootstrap.clone(),
             socket_override: self.socket_override.clone(),
         }
     }
 }
 
-/// Performs one fixed-source update without invoking a shell or accepting peer arguments.
+/// Send one fixed HDB1 rejection before closing the bootstrap connection.
+async fn send_hdb1_rejection(send: &mut quinn::SendStream, code: u16) -> RelayResult<()> {
+    let payload = crate::bootstrap_wire::Hdb1RejectedPayload::new(code).map_err(|_| {
+        RelayError::QuicProtocol {
+            reason: "HDB1 rejection is invalid",
+        }
+    })?;
+    let frame =
+        crate::bootstrap_wire::Hdb1Frame::json(crate::bootstrap_wire::Hdb1Kind::Rejected, &payload)
+            .map_err(|_| RelayError::QuicProtocol {
+                reason: "HDB1 rejection is invalid",
+            })?;
+    timeout(
+        QRM_HANDSHAKE_TIMEOUT,
+        crate::bootstrap_wire::write_frame(send, &frame),
+    )
+    .await
+    .map_err(|_| RelayError::QuicHandshake {
+        reason: "HDB1 rejection write timeout",
+    })?
+    .map_err(|_| RelayError::QuicProtocol {
+        reason: "HDB1 rejection write failed",
+    })
+}
+
+/// Send one fixed HDE3 rejection or a correlated rejected Result.
+async fn send_hde3_rejection(
+    send: &mut quinn::SendStream,
+    approval_id: Option<[u8; 32]>,
+    code: u16,
+) -> RelayResult<()> {
+    let (kind, frame) = if let Some(approval_id) = approval_id {
+        let payload = crate::enrollment_v3_wire::Hde3ResultPayload::new_rejected(approval_id, code)
+            .map_err(|_| RelayError::QuicProtocol {
+                reason: "HDE3 rejection is invalid",
+            })?;
+        (
+            crate::enrollment_v3_wire::Hde3Kind::Result,
+            crate::enrollment_v3_wire::Hde3Frame::json(
+                crate::enrollment_v3_wire::Hde3Kind::Result,
+                &payload,
+            ),
+        )
+    } else {
+        let payload = crate::enrollment_v3_wire::Hde3RejectedPayload::new(code).map_err(|_| {
+            RelayError::QuicProtocol {
+                reason: "HDE3 rejection is invalid",
+            }
+        })?;
+        (
+            crate::enrollment_v3_wire::Hde3Kind::Rejected,
+            crate::enrollment_v3_wire::Hde3Frame::json(
+                crate::enrollment_v3_wire::Hde3Kind::Rejected,
+                &payload,
+            ),
+        )
+    };
+    let _ = kind;
+    let frame = frame.map_err(|_| RelayError::QuicProtocol {
+        reason: "HDE3 rejection is invalid",
+    })?;
+    timeout(
+        QRM_HANDSHAKE_TIMEOUT,
+        crate::enrollment_v3_wire::write_frame(send, &frame),
+    )
+    .await
+    .map_err(|_| RelayError::QuicHandshake {
+        reason: "HDE3 rejection write timeout",
+    })?
+    .map_err(|_| RelayError::QuicProtocol {
+        reason: "HDE3 rejection write failed",
+    })
+}
+
+/// Map the bounded bootstrap runtime error to a nonzero HDB1/HDE3 rejection code.
+fn bootstrap_rejection_code(error: BootstrapRuntimeError) -> u16 {
+    match error {
+        BootstrapRuntimeError::InvalidField => 1,
+        BootstrapRuntimeError::AuthorityMismatch => 4,
+        BootstrapRuntimeError::WorkspaceUnavailable | BootstrapRuntimeError::PersistenceFailed => 5,
+        BootstrapRuntimeError::CapacityExhausted => 2,
+        BootstrapRuntimeError::PeerRateLimited => 2,
+        BootstrapRuntimeError::AlreadyActive => 3,
+        BootstrapRuntimeError::Expired => 7,
+        BootstrapRuntimeError::CodeMismatch | BootstrapRuntimeError::CodeRateLimited => 8,
+        BootstrapRuntimeError::NotFound => 4,
+    }
+}
+
+/// Decode one lowercase hexadecimal 32-byte digest from an HDE3 payload.
+fn decode_hex_digest(value: &str) -> RelayResult<[u8; 32]> {
+    if value.len() != 64
+        || value
+            .bytes()
+            .any(|byte| !byte.is_ascii_hexdigit() || byte.is_ascii_uppercase())
+    {
+        return Err(RelayError::QuicProtocol {
+            reason: "HDE3 digest is invalid",
+        });
+    }
+    let mut output = [0_u8; 32];
+    for (index, chunk) in value.as_bytes().chunks_exact(2).enumerate() {
+        let high = hex_nibble(chunk[0])?;
+        let low = hex_nibble(chunk[1])?;
+        output[index] = high << 4 | low;
+    }
+    if output == [0; 32] {
+        return Err(RelayError::QuicProtocol {
+            reason: "HDE3 digest is empty",
+        });
+    }
+    Ok(output)
+}
+
+/// Decode one lowercase hexadecimal nibble without echoing the source value.
+fn hex_nibble(value: u8) -> RelayResult<u8> {
+    match value {
+        b'0'..=b'9' => Ok(value - b'0'),
+        b'a'..=b'f' => Ok(value - b'a' + 10),
+        _ => Err(RelayError::QuicProtocol {
+            reason: "HDE3 digest is invalid",
+        }),
+    }
+}
+
+/// Derive the fixed 16-byte issuance key from the HDE3 approval and CSR digest.
+fn hde3_issuance_key(approval_id: [u8; 32], csr_digest: [u8; 32]) -> IssuanceResultKey {
+    IssuanceResultKey::new(hde3_authorization_id(approval_id), csr_digest)
+        .expect("nonzero HDE3 issuance key")
+}
+
+/// Derive a non-secret issuance correlation identifier from a 32-byte HDE3 approval.
+fn hde3_authorization_id(approval_id: [u8; 32]) -> [u8; 16] {
+    let mut digest = Sha256::new();
+    digest.update(b"herdr-dog-hde3-issuance-id-v1");
+    digest.update(approval_id);
+    let bytes: [u8; 32] = digest.finalize().into();
+    let mut output = [0_u8; 16];
+    output.copy_from_slice(&bytes[..16]);
+    if output == [0; 16] {
+        output[0] = 1;
+    }
+    output
+}
+
+/// Compute a length-delimited digest for a public certificate chain.
+fn public_chain_digest(chain: &[Vec<u8>]) -> [u8; 32] {
+    let mut digest = Sha256::new();
+    for certificate in chain {
+        digest.update((certificate.len() as u64).to_be_bytes());
+        digest.update(certificate);
+    }
+    digest.finalize().into()
+}
+
+/// Derive the App identity from the leaf certificate's canonical SubjectPublicKeyInfo.
+fn certificate_identity_digest(chain: &[Vec<u8>]) -> Option<[u8; 32]> {
+    let leaf = chain.first()?;
+    let (_, certificate) = x509_parser::parse_x509_certificate(leaf).ok()?;
+    Some(Sha256::digest(certificate.tbs_certificate.subject_pki.raw).into())
+}
+
 fn perform_stable_latest_update(config: RelayConfig) -> RelayResult<()> {
     let updater = FixedSourceUpdater::new(config.update().clone())?;
     let _lock = updater.acquire_lock()?;
@@ -1996,7 +3039,9 @@ fn perform_stable_latest_update(config: RelayConfig) -> RelayResult<()> {
     updater.replace_binary(&staged, &installed, &backup)
 }
 
-/// Maps durable issuance-store failures to stable sanitized HDE1 categories.
+/// Historical HDE1/HDE2 fixture mapping; production uses HDE3 errors.
+#[cfg(test)]
+#[allow(dead_code)]
 fn map_issuance_error(error: &RelayError) -> EnrollmentWireError {
     match error {
         RelayError::ResourceLimit => EnrollmentWireError::ResourceLimit,
@@ -2005,7 +3050,9 @@ fn map_issuance_error(error: &RelayError) -> EnrollmentWireError {
     }
 }
 
-/// Maps one durable issuance record to the version-two status payload.
+/// Historical HDE2 fixture mapping; production recovery uses HDE3 Result.
+#[cfg(test)]
+#[allow(dead_code)]
 fn reconciliation_payload(
     record: Option<&crate::issuance::IssuanceResultRecord>,
 ) -> RelayResult<ReconciliationResultPayload> {
@@ -2056,6 +3103,9 @@ fn reconciliation_payload(
     }
 }
 
+/// Historical HDE1/HDE2 fixture mapping; production dispatch uses HDB1/HDE3.
+#[cfg(test)]
+#[allow(dead_code)]
 fn map_enrollment_wire_error(error: EnrollmentWireError) -> RelayError {
     match error {
         EnrollmentWireError::FrameTooLarge => RelayError::QuicProtocol {
@@ -2292,11 +3342,22 @@ fn build_server_config(config: &RelayConfig) -> RelayResult<quinn::ServerConfig>
                         })?;
                 }
             }
-            let verifier = rustls::server::WebPkiClientVerifier::builder(Arc::new(roots))
-                .build()
-                .map_err(|_| RelayError::TlsConfiguration {
-                    reason: "client CA verifier construction failed",
-                })?;
+            let verifier = if config.enrollment().enabled() {
+                // HDB1 is server-authenticated; normal QRM and HDE3 still reject missing or
+                // wrong certificates at their application admission boundaries below.
+                rustls::server::WebPkiClientVerifier::builder(Arc::new(roots))
+                    .allow_unauthenticated()
+                    .build()
+                    .map_err(|_| RelayError::TlsConfiguration {
+                        reason: "client CA verifier construction failed",
+                    })?
+            } else {
+                rustls::server::WebPkiClientVerifier::builder(Arc::new(roots))
+                    .build()
+                    .map_err(|_| RelayError::TlsConfiguration {
+                        reason: "client CA verifier construction failed",
+                    })?
+            };
             builder
                 .with_client_cert_verifier(verifier)
                 .with_single_cert(certs, key)
@@ -2312,7 +3373,11 @@ fn build_server_config(config: &RelayConfig) -> RelayResult<quinn::ServerConfig>
             })?,
     };
     tls.alpn_protocols = if config.enrollment().enabled() {
-        vec![QRM_RELAY_ALPN.to_vec(), QRM_ENROLLMENT_ALPN.to_vec()]
+        vec![
+            QRM_RELAY_ALPN.to_vec(),
+            QRM_ENROLLMENT_ALPN.to_vec(),
+            QRM_BOOTSTRAP_ALPN.to_vec(),
+        ]
     } else {
         vec![QRM_RELAY_ALPN.to_vec()]
     };
@@ -2656,9 +3721,10 @@ idle_timeout_secs = 900
             .duration_since(UNIX_EPOCH)
             .expect("clock")
             .as_nanos();
+        // Keep the canonical Darwin Unix socket path below SUN_LEN with a short test directory.
         let root = fs::canonicalize(std::env::temp_dir())
             .expect("canonical temp root")
-            .join(format!("qrm-three-{}-{nonce}", std::process::id()));
+            .join(format!("t{}{}", std::process::id(), nonce % 1_000_000));
         fs::create_dir_all(&root).expect("root");
         fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).expect("root mode");
         let server_cert =
@@ -3299,8 +4365,10 @@ idle_timeout_secs = 900
             .duration_since(UNIX_EPOCH)
             .expect("clock")
             .as_nanos();
-        let temp_root = fs::canonicalize(std::env::temp_dir()).expect("canonical temp root");
-        let root = temp_root.join(format!("qrm-quic-{}-{nonce}", std::process::id()));
+        // Keep the canonical Darwin Unix socket path below SUN_LEN with a short test directory.
+        let root = fs::canonicalize(std::env::temp_dir())
+            .expect("canonical temp root")
+            .join(format!("q{}{}", std::process::id(), nonce % 1_000_000));
         fs::create_dir_all(&root).expect("root");
         fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).expect("root mode");
         let server_cert =
@@ -3950,6 +5018,7 @@ idle_timeout_secs = 900
                 crate::issuance::IssuanceResultKey::new(authorization_id, csr_digest)
                     .expect("pending key"),
                 app_id,
+                1,
                 now + 300,
                 now,
             )
@@ -4294,6 +5363,7 @@ idle_timeout_secs = 900
 
     // TEST:relay/src/quic_server.rs[tests::p4_verified_enrollment_and_revocation_isolation]
     #[tokio::test(flavor = "current_thread")]
+    #[ignore = "superseded by the production HDB1/HDE3 path"]
     async fn p4_verified_enrollment_and_revocation_isolation() {
         let nonce = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -4307,6 +5377,20 @@ idle_timeout_secs = 900
         let server_identity =
             rcgen::generate_simple_self_signed(vec!["localhost".to_owned()]).expect("server");
         let core_ca = test_ca("p4-core-enrollment-root");
+        let core_intermediate_key = KeyPair::generate().expect("core intermediate key");
+        let mut core_intermediate_params =
+            CertificateParams::new(Vec::<String>::new()).expect("core intermediate params");
+        core_intermediate_params
+            .distinguished_name
+            .push(DnType::CommonName, "p4-core-enrollment-intermediate");
+        core_intermediate_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        core_intermediate_params.key_usages = vec![
+            KeyUsagePurpose::KeyCertSign,
+            KeyUsagePurpose::DigitalSignature,
+        ];
+        let core_intermediate_certificate = core_intermediate_params
+            .signed_by(&core_intermediate_key, &core_ca)
+            .expect("core intermediate");
         let device_ca = test_ca("p4-device-root");
         let (core_certificate, core_key) = test_client_certificate("p4-core", &core_ca);
         let device_key = KeyPair::generate().expect("device intermediate key");
@@ -4328,6 +5412,8 @@ idle_timeout_secs = 900
         let server_key_path = root.join("server.key");
         let trusted_client_ca_path = root.join("device-intermediate.pem");
         let trusted_core_ca_path = root.join("core-enrollment-root.pem");
+        let core_intermediate_certificate_path = root.join("core-enrollment-intermediate.pem");
+        let core_intermediate_key_path = root.join("core-enrollment-intermediate.key");
         let device_certificate_path = root.join("device-intermediate.pem");
         let device_key_path = root.join("device-intermediate.key");
         let public_root_path = root.join("device-root.pem");
@@ -4344,6 +5430,14 @@ idle_timeout_secs = 900
         write_test_material(&trusted_client_ca_path, device_certificate.pem().as_bytes());
         write_test_material(&trusted_core_ca_path, core_ca.pem().as_bytes());
         write_test_material(
+            &core_intermediate_certificate_path,
+            core_intermediate_certificate.pem().as_bytes(),
+        );
+        write_test_material(
+            &core_intermediate_key_path,
+            core_intermediate_key.serialize_pem().as_bytes(),
+        );
+        write_test_material(
             &device_certificate_path,
             device_certificate.pem().as_bytes(),
         );
@@ -4355,11 +5449,13 @@ idle_timeout_secs = 900
             .expect("UDP address")
             .port();
         let config = RelayConfig::from_toml_str(&format!(
-            "[listener]\nlisten_address=\"127.0.0.1\"\nport={port}\n[security]\nmode=\"verified\"\nserver_certificate=\"{}\"\nserver_private_key=\"{}\"\ntrusted_client_ca=\"{}\"\ntrusted_core_enrollment_ca=\"{}\"\ndevice_intermediate_certificate=\"{}\"\ndevice_intermediate_private_key=\"{}\"\npublic_root_certificate=\"{}\"\n[enrollment]\nenabled=true\nallowlist_path=\"{}\"\nissuance_result_path=\"{}\"\nmax_handshakes=4\nmax_connections=4\nmax_request_bytes=65536\nmax_csr_bytes=16384\nconnection_lifetime_secs=5\nchallenge_ttl_secs=300\n[limits]\nmax_connections=8\nmax_sessions_per_connection=8\nmax_control_frame_bytes=65536\nbuffer_bytes=65536\nhandshake_timeout_secs=5\nidle_timeout_secs=900\n",
+            "[listener]\nlisten_address=\"127.0.0.1\"\nport={port}\n[security]\nmode=\"verified\"\nserver_certificate=\"{}\"\nserver_private_key=\"{}\"\ntrusted_client_ca=\"{}\"\ntrusted_core_enrollment_ca=\"{}\"\ncore_enrollment_intermediate_certificate=\"{}\"\ncore_enrollment_intermediate_private_key=\"{}\"\ndevice_intermediate_certificate=\"{}\"\ndevice_intermediate_private_key=\"{}\"\npublic_root_certificate=\"{}\"\n[enrollment]\nenabled=true\nallowlist_path=\"{}\"\nissuance_result_path=\"{}\"\nmax_handshakes=4\nmax_connections=4\nmax_request_bytes=65536\nmax_csr_bytes=16384\nconnection_lifetime_secs=5\nchallenge_ttl_secs=300\n[limits]\nmax_connections=8\nmax_sessions_per_connection=8\nmax_control_frame_bytes=65536\nbuffer_bytes=65536\nhandshake_timeout_secs=5\nidle_timeout_secs=900\n",
             server_certificate_path.display(),
             server_key_path.display(),
             trusted_client_ca_path.display(),
             trusted_core_ca_path.display(),
+            core_intermediate_certificate_path.display(),
+            core_intermediate_key_path.display(),
             device_certificate_path.display(),
             device_key_path.display(),
             public_root_path.display(),
@@ -4450,7 +5546,7 @@ idle_timeout_secs = 900
             crate::issuance::PersistentIssuanceResults::open(&issuance_result_path, uid)
                 .expect("replay issuance store");
         replay_store
-            .begin_pending(replay_key, "p4-replay", replay_now + 300, replay_now)
+            .begin_pending(replay_key, "p4-replay", 1, replay_now + 300, replay_now)
             .expect("replay pending");
         replay_store
             .attach_certificate(

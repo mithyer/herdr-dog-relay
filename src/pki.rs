@@ -28,6 +28,8 @@ pub struct IssuedCertificate {
     certificate_chain: Vec<Vec<u8>>,
     /// Public leaf certificate fingerprint.
     fingerprint: Fingerprint,
+    /// SHA-256 digest of the CSR SubjectPublicKeyInfo used as the identity.
+    app_identity: [u8; 32],
     /// Bounded public serial derived from the leaf digest.
     serial: u64,
     /// Validity start epoch seconds.
@@ -56,7 +58,27 @@ impl IssuedCertificate {
         self.certificate_chain.clone()
     }
 
-    /// Returns public certificate metadata for allowlist persistence.
+    /// Returns the public leaf fingerprint.
+    pub const fn fingerprint(&self) -> Fingerprint {
+        self.fingerprint
+    }
+
+    /// Returns the public SubjectPublicKeyInfo identity digest.
+    pub const fn app_identity(&self) -> [u8; 32] {
+        self.app_identity
+    }
+
+    /// Returns the public certificate expiry.
+    pub const fn not_after_epoch_seconds(&self) -> u64 {
+        self.not_after_epoch_seconds
+    }
+
+    /// Returns the public certificate serial.
+    pub const fn serial(&self) -> u64 {
+        self.serial
+    }
+
+    /// Returns the public certificate metadata for allowlist persistence.
     pub fn metadata(
         &self,
         app_id: AppId,
@@ -73,13 +95,72 @@ impl IssuedCertificate {
     }
 }
 
-/// Issues one bounded App certificate using the configured device Intermediate CA.
+/// Issues one App-client certificate using the configured device Intermediate CA.
 pub fn issue_certificate(
     config: &SecurityConfig,
     expected_uid: u32,
     app_id: AppId,
     csr_bytes: &[u8],
     allowlist_generation: u64,
+) -> Result<IssuedCertificate, EnrollmentError> {
+    issue_certificate_with_intermediate(
+        config,
+        expected_uid,
+        app_id,
+        csr_bytes,
+        allowlist_generation,
+        config.device_intermediate_certificate(),
+        config.device_intermediate_private_key(),
+    )
+}
+
+/// Issues one Core-enrollment certificate using the dedicated Intermediate CA.
+///
+/// Core bootstrap is a separate trust domain from normal App QRM. This function therefore never
+/// reads the App-client Intermediate paths and returns only the public leaf/Intermediate chain.
+pub fn issue_core_certificate(
+    config: &SecurityConfig,
+    expected_uid: u32,
+    csr_bytes: &[u8],
+) -> Result<IssuedCertificate, EnrollmentError> {
+    let app_id = app_id_from_csr(csr_bytes)?;
+    issue_certificate_with_intermediate(
+        config,
+        expected_uid,
+        app_id,
+        csr_bytes,
+        1,
+        config.core_enrollment_intermediate_certificate(),
+        config.core_enrollment_intermediate_private_key(),
+    )
+}
+
+/// Parse and verify the bounded CSR Common Name used as the Core/App identity label.
+pub fn app_id_from_csr(csr_bytes: &[u8]) -> Result<AppId, EnrollmentError> {
+    let (_, parsed_csr) =
+        X509CertificationRequest::from_der(csr_bytes).map_err(|_| EnrollmentError::InvalidCsr)?;
+    parsed_csr
+        .verify_signature()
+        .map_err(|_| EnrollmentError::InvalidCsr)?;
+    let common_name = parsed_csr
+        .certification_request_info
+        .subject
+        .iter_common_name()
+        .next()
+        .and_then(|value| value.as_str().ok())
+        .ok_or(EnrollmentError::CsrMismatch)?;
+    AppId::new(common_name.to_owned())
+}
+
+/// Issue one bounded clientAuth leaf from a selected purpose-specific Intermediate CA.
+fn issue_certificate_with_intermediate(
+    config: &SecurityConfig,
+    expected_uid: u32,
+    app_id: AppId,
+    csr_bytes: &[u8],
+    allowlist_generation: u64,
+    intermediate_certificate_path: &std::path::Path,
+    intermediate_key_path: &std::path::Path,
 ) -> Result<IssuedCertificate, EnrollmentError> {
     let csr_metadata = CsrMetadata::from_bytes(app_id.clone(), csr_bytes)?;
     if allowlist_generation == 0 {
@@ -101,16 +182,21 @@ pub fn issue_certificate(
     if common_name != app_id.as_str() {
         return Err(EnrollmentError::CsrMismatch);
     }
+    let app_identity: [u8; 32] =
+        Sha256::digest(parsed_csr.certification_request_info.subject_pki.raw).into();
+    if app_identity == [0; 32] {
+        return Err(EnrollmentError::InvalidCsr);
+    }
 
     let intermediate_certificate = read_protected_file(
-        config.device_intermediate_certificate(),
+        intermediate_certificate_path,
         expected_uid,
         ProtectedFileKind::Public,
         MAX_PUBLIC_MATERIAL_BYTES,
     )
     .map_err(|_| EnrollmentError::InvalidMetadata)?;
     let intermediate_key = read_protected_file(
-        config.device_intermediate_private_key(),
+        intermediate_key_path,
         expected_uid,
         ProtectedFileKind::Private,
         MAX_PRIVATE_MATERIAL_BYTES,
@@ -129,7 +215,6 @@ pub fn issue_certificate(
         .map_err(|_| EnrollmentError::InvalidMetadata)?;
     let (_, parsed_root) = x509_parser::parse_x509_certificate(root_certificate.as_ref())
         .map_err(|_| EnrollmentError::InvalidMetadata)?;
-    // Verify the configured device Intermediate is a currently valid CA signed by the configured Root.
     validate_device_intermediate_chain(&parsed_intermediate, &parsed_root)?;
     let issuer_key = KeyPair::from_pem(
         std::str::from_utf8(&intermediate_key).map_err(|_| EnrollmentError::InvalidMetadata)?,
@@ -169,9 +254,7 @@ pub fn issue_certificate(
         .signed_by(&issuer)
         .map_err(|_| EnrollmentError::InvalidMetadata)?;
     let leaf = certificate.der().to_vec();
-    let mut digest = Sha256::new();
-    digest.update(&leaf);
-    let digest_bytes: [u8; 32] = digest.finalize().into();
+    let digest_bytes: [u8; 32] = Sha256::digest(&leaf).into();
     let fingerprint = Fingerprint::from_bytes(digest_bytes)?;
     let mut serial_bytes = [0_u8; 8];
     serial_bytes.copy_from_slice(&digest_bytes[..8]);
@@ -186,6 +269,7 @@ pub fn issue_certificate(
     Ok(IssuedCertificate {
         certificate_chain: vec![leaf, issuer_certificate.to_vec()],
         fingerprint,
+        app_identity,
         serial,
         not_before_epoch_seconds,
         not_after_epoch_seconds,

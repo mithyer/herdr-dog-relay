@@ -14,15 +14,12 @@ compile_error!("herdr-dog-relay currently supports Unix hosts only");
 #[path = "bootstrap_test_support.rs"]
 pub mod contract_test_support;
 
-/// Maximum normalized HDB1 session name shared by test-gated wire and authority validation.
-#[cfg(any(test, feature = "contract-test-support"))]
+/// Maximum normalized HDB1 session name shared by production and test validation.
 pub(crate) const HDB1_MAX_SESSION_BYTES: usize = 64;
-/// Maximum HDB1 CSR size shared by test-gated wire and authority validation.
-#[cfg(any(test, feature = "contract-test-support"))]
+/// Maximum HDB1 CSR size shared by production and test validation.
 pub(crate) const HDB1_MAX_CSR_BYTES: usize = 16 * 1024;
 
-/// Validate the source-aligned normalized Herdr session name for HDB1 test support.
-#[cfg(any(test, feature = "contract-test-support"))]
+/// Validate the source-aligned normalized Herdr session name.
 pub(crate) fn is_valid_hdb1_session(value: &str) -> bool {
     !value.is_empty()
         && value.len() <= HDB1_MAX_SESSION_BYTES
@@ -39,12 +36,13 @@ pub mod allowlist;
 #[cfg(any(test, feature = "contract-test-support"))]
 #[allow(dead_code)]
 pub(crate) mod bootstrap;
+/// Production Relay-side HDB1 bootstrap workspace and approval authority.
+pub(crate) mod bootstrap_runtime;
 /// Core-to-Relay HDB1 stream dispatcher for local contract tests.
 #[cfg(any(test, feature = "contract-test-support"))]
 #[allow(dead_code)]
 pub(crate) mod bootstrap_session;
 /// Frozen server-authenticated HDB1 bootstrap frame codec.
-#[cfg(any(test, feature = "contract-test-support"))]
 #[allow(dead_code)]
 pub(crate) mod bootstrap_wire;
 /// Bounded opaque bidirectional byte forwarding.
@@ -58,7 +56,6 @@ pub mod enrollment;
 #[allow(dead_code)]
 pub(crate) mod enrollment_v3_session;
 /// Frozen Core-enrollment HDE3 frame codec.
-#[cfg(any(test, feature = "contract-test-support"))]
 #[allow(dead_code)]
 pub(crate) mod enrollment_v3_wire;
 /// Bounded same-port enrollment frame codec.

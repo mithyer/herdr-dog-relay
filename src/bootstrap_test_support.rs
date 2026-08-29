@@ -60,7 +60,7 @@ pub const HDB1_CONTRACT_KIND_VALUES: [u8; 7] = [
 /// `true` when the candidate satisfies the frozen HDB1 session contract.
 // TEST:core/tests/hdb1_relay_loopback.rs[core_and_relay_contract_constants_match]
 pub fn accepts_session_name(value: &str) -> bool {
-    Hdb1StartPayload::new([1; 16], b"test-csr", [1; 32], value.to_owned(), [1; 32]).is_ok()
+    Hdb1StartPayload::new([1; 16], b"test-csr", [1; 32], value.to_owned(), [1; 32], 1).is_ok()
 }
 
 #[derive(Clone, Copy, Eq, PartialEq)]
