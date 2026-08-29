@@ -59,7 +59,7 @@ const PEER_START_WINDOW_SECS: u64 = 15 * 60;
 /// Human code-entry lifetime.
 const BOOTSTRAP_CODE_TTL_SECS: u64 = 300;
 /// Hard lifetime for an HDB1 attempt.
-const BOOTSTRAP_HARD_LIFETIME_SECS: u64 = 330;
+pub(crate) const BOOTSTRAP_HARD_LIFETIME_SECS: u64 = 330;
 /// Maximum failed code submissions for one approval.
 const MAX_CODE_FAILURES: u8 = 5;
 /// Maximum time for one fixed Herdr operation.
@@ -1026,6 +1026,9 @@ impl BootstrapRuntime {
                     .map_err(|_| BootstrapRuntimeError::PersistenceFailed)?;
                 return Err(BootstrapRuntimeError::CodeRateLimited);
             }
+            self.store
+                .persist(&state)
+                .map_err(|_| BootstrapRuntimeError::PersistenceFailed)?;
             return Err(BootstrapRuntimeError::CodeMismatch);
         }
         let workspace_id = attempt.workspace_id.clone();
@@ -1306,6 +1309,9 @@ impl BootstrapRuntime {
                     .map_err(|_| BootstrapRuntimeError::PersistenceFailed)?;
                 return Err(BootstrapRuntimeError::CodeRateLimited);
             }
+            self.store
+                .persist(&state)
+                .map_err(|_| BootstrapRuntimeError::PersistenceFailed)?;
             return Err(BootstrapRuntimeError::CodeMismatch);
         }
         let workspace_id = approval.workspace_id.clone();

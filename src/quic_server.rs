@@ -25,7 +25,7 @@ use tokio::{
 
 use crate::{
     allowlist::PersistentAllowlist,
-    bootstrap_runtime::{BootstrapRuntime, BootstrapRuntimeError},
+    bootstrap_runtime::{BOOTSTRAP_HARD_LIFETIME_SECS, BootstrapRuntime, BootstrapRuntimeError},
     bridge::{self, BridgeLimits},
     config::{QRM_HANDSHAKE_TIMEOUT_SECS, RelayConfig, SecurityMode},
     enrollment::{AllowlistState, Fingerprint, STABLE_LATEST_SELECTOR},
@@ -223,6 +223,10 @@ pub struct QuicRelayServer {
     connections: Arc<Semaphore>,
     /// Independent bounded TLS handshakes before ALPN dispatch.
     pre_auth_handshakes: Arc<Semaphore>,
+    /// Independent post-ALPN bootstrap handshake budget.
+    bootstrap_handshakes: Arc<Semaphore>,
+    /// Independent post-ALPN bootstrap connection budget.
+    bootstrap_connections: Arc<Semaphore>,
     /// Independent pre-authentication enrollment budget.
     enrollment_handshakes: Arc<Semaphore>,
     /// Independent post-ALPN enrollment connection budget.
@@ -574,6 +578,8 @@ impl QuicRelayServer {
                     .max_connections()
                     .saturating_add(config.enrollment().max_handshakes()),
             )),
+            bootstrap_handshakes: Arc::new(Semaphore::new(config.enrollment().max_handshakes())),
+            bootstrap_connections: Arc::new(Semaphore::new(config.enrollment().max_connections())),
             enrollment_handshakes: Arc::new(Semaphore::new(config.enrollment().max_handshakes())),
             enrollment_connections: Arc::new(Semaphore::new(config.enrollment().max_connections())),
             config,
@@ -1176,27 +1182,85 @@ impl QuicRelayServer {
         Ok(true)
     }
 
+    /// Builds one HDB1 response for a fresh or resumed code submission.
+    async fn bootstrap_submit_response(
+        &self,
+        bootstrap: &BootstrapRuntime,
+        frame: crate::bootstrap_wire::Hdb1Frame,
+    ) -> RelayResult<crate::bootstrap_wire::Hdb1Frame> {
+        let submit: crate::bootstrap_wire::Hdb1SubmitPayload =
+            match frame.parse_json(crate::bootstrap_wire::Hdb1Kind::Submit) {
+                Ok(payload) => payload,
+                Err(_) => return hdb1_rejection_frame(1),
+            };
+        let (bootstrap_id, submitted_challenge, code) = match submit.decode_fields() {
+            Ok(fields) => fields,
+            Err(_) => return hdb1_rejection_frame(1),
+        };
+        match bootstrap
+            .submit(bootstrap_id, submitted_challenge, &code)
+            .await
+        {
+            Ok(issued) => {
+                let payload = crate::bootstrap_wire::Hdb1CoreIssuedPayload::new(
+                    issued.approval_id,
+                    issued.core_identity,
+                    &issued.certificate_chain,
+                    issued.not_after_epoch_seconds,
+                )
+                .map_err(|_| RelayError::QuicProtocol {
+                    reason: "bootstrap issuance response is invalid",
+                })?;
+                crate::bootstrap_wire::Hdb1Frame::json(
+                    crate::bootstrap_wire::Hdb1Kind::CoreIssued,
+                    &payload,
+                )
+                .map_err(|_| RelayError::QuicProtocol {
+                    reason: "bootstrap issuance response is invalid",
+                })
+            }
+            Err(error) => {
+                let payload = crate::bootstrap_wire::Hdb1RejectedPayload::new(
+                    bootstrap_rejection_code(error),
+                )
+                .map_err(|_| RelayError::QuicProtocol {
+                    reason: "bootstrap rejection encoding failed",
+                })?;
+                crate::bootstrap_wire::Hdb1Frame::json(
+                    crate::bootstrap_wire::Hdb1Kind::Rejected,
+                    &payload,
+                )
+                .map_err(|_| RelayError::QuicProtocol {
+                    reason: "bootstrap rejection encoding failed",
+                })
+            }
+        }
+    }
+
     /// Handles one server-only HDB1 bootstrap connection before any Core certificate exists.
     async fn serve_bootstrap_connection(&self, connection: quinn::Connection) -> RelayResult<()> {
         let bootstrap = self.bootstrap.as_ref().ok_or(RelayError::QuicProtocol {
             reason: "bootstrap runtime is unavailable",
         })?;
-        // Human code entry keeps this connection open, so it needs the same independent
-        // post-handshake quotas as Core enrollment instead of borrowing only the TLS permit.
         let _handshake_permit =
-            try_acquire(&self.enrollment_handshakes).ok_or(RelayError::ResourceLimit)?;
+            try_acquire(&self.bootstrap_handshakes).ok_or(RelayError::ResourceLimit)?;
         let _connection_permit =
-            try_acquire(&self.enrollment_connections).ok_or(RelayError::ResourceLimit)?;
-        let (mut send, mut recv) = timeout(self.handshake_timeout(), connection.accept_bi())
-            .await
-            .map_err(|_| RelayError::QuicHandshake {
-                reason: "bootstrap stream timeout",
-            })?
-            .map_err(|_| RelayError::QuicHandshake {
-                reason: "bootstrap stream unavailable",
-            })?;
+            try_acquire(&self.bootstrap_connections).ok_or(RelayError::ResourceLimit)?;
+        let connection_deadline =
+            Instant::now() + Duration::from_secs(BOOTSTRAP_HARD_LIFETIME_SECS);
+        let (mut send, mut recv) = timeout(
+            bounded_bootstrap_timeout(connection_deadline, self.handshake_timeout()),
+            connection.accept_bi(),
+        )
+        .await
+        .map_err(|_| RelayError::QuicHandshake {
+            reason: "bootstrap stream timeout",
+        })?
+        .map_err(|_| RelayError::QuicHandshake {
+            reason: "bootstrap stream unavailable",
+        })?;
         let start = match timeout(
-            Duration::from_secs(330),
+            remaining_bootstrap_time(connection_deadline),
             crate::bootstrap_wire::read_frame(&mut recv),
         )
         .await
@@ -1208,6 +1272,29 @@ impl QuicRelayServer {
                 return Ok(());
             }
         };
+        if start.kind() == crate::bootstrap_wire::Hdb1Kind::Submit {
+            let response = self.bootstrap_submit_response(bootstrap, start).await?;
+            timeout(
+                bounded_bootstrap_timeout(connection_deadline, self.handshake_timeout()),
+                crate::bootstrap_wire::write_frame(&mut send, &response),
+            )
+            .await
+            .map_err(|_| RelayError::QuicHandshake {
+                reason: "bootstrap resumed response timeout",
+            })?
+            .map_err(|_| RelayError::QuicProtocol {
+                reason: "bootstrap resumed response failed",
+            })?;
+            send.finish().map_err(|_| RelayError::QuicProtocol {
+                reason: "finishing resumed bootstrap stream",
+            })?;
+            let _ = timeout(
+                bounded_bootstrap_timeout(connection_deadline, self.handshake_timeout()),
+                send.stopped(),
+            )
+            .await;
+            return Ok(());
+        }
         if start.kind() == crate::bootstrap_wire::Hdb1Kind::Reconcile {
             let payload: crate::bootstrap_wire::Hdb1ReconcilePayload =
                 match start.parse_json(crate::bootstrap_wire::Hdb1Kind::Reconcile) {
@@ -1265,7 +1352,7 @@ impl QuicRelayServer {
                 }
             };
             timeout(
-                self.handshake_timeout(),
+                bounded_bootstrap_timeout(connection_deadline, self.handshake_timeout()),
                 crate::bootstrap_wire::write_frame(&mut send, &response),
             )
             .await
@@ -1316,7 +1403,7 @@ impl QuicRelayServer {
             reason: "bootstrap challenge encoding failed",
         })?;
         timeout(
-            self.handshake_timeout(),
+            bounded_bootstrap_timeout(connection_deadline, self.handshake_timeout()),
             crate::bootstrap_wire::write_frame(&mut send, &challenge_frame),
         )
         .await
@@ -1327,7 +1414,7 @@ impl QuicRelayServer {
             reason: "bootstrap challenge write failed",
         })?;
         let submit = match timeout(
-            Duration::from_secs(330),
+            remaining_bootstrap_time(connection_deadline),
             crate::bootstrap_wire::read_frame(&mut recv),
         )
         .await
@@ -1338,63 +1425,9 @@ impl QuicRelayServer {
                 return Ok(());
             }
         };
-        let submit: crate::bootstrap_wire::Hdb1SubmitPayload =
-            match submit.parse_json(crate::bootstrap_wire::Hdb1Kind::Submit) {
-                Ok(payload) => payload,
-                Err(_) => {
-                    let _ = send_hdb1_rejection(&mut send, 1).await;
-                    connection.close(0u32.into(), b"bootstrap submit invalid");
-                    return Ok(());
-                }
-            };
-        let (bootstrap_id, submitted_challenge, code) = match submit.decode_fields() {
-            Ok(fields) => fields,
-            Err(_) => {
-                let _ = send_hdb1_rejection(&mut send, 1).await;
-                connection.close(0u32.into(), b"bootstrap submit invalid");
-                return Ok(());
-            }
-        };
-        let response = match bootstrap
-            .submit(bootstrap_id, submitted_challenge, &code)
-            .await
-        {
-            Ok(issued) => {
-                let payload = crate::bootstrap_wire::Hdb1CoreIssuedPayload::new(
-                    issued.approval_id,
-                    issued.core_identity,
-                    &issued.certificate_chain,
-                    issued.not_after_epoch_seconds,
-                )
-                .map_err(|_| RelayError::QuicProtocol {
-                    reason: "bootstrap issuance response is invalid",
-                })?;
-                crate::bootstrap_wire::Hdb1Frame::json(
-                    crate::bootstrap_wire::Hdb1Kind::CoreIssued,
-                    &payload,
-                )
-                .map_err(|_| RelayError::QuicProtocol {
-                    reason: "bootstrap issuance response is invalid",
-                })?
-            }
-            Err(error) => {
-                let payload = crate::bootstrap_wire::Hdb1RejectedPayload::new(
-                    bootstrap_rejection_code(error),
-                )
-                .map_err(|_| RelayError::QuicProtocol {
-                    reason: "bootstrap rejection encoding failed",
-                })?;
-                crate::bootstrap_wire::Hdb1Frame::json(
-                    crate::bootstrap_wire::Hdb1Kind::Rejected,
-                    &payload,
-                )
-                .map_err(|_| RelayError::QuicProtocol {
-                    reason: "bootstrap rejection encoding failed",
-                })?
-            }
-        };
+        let response = self.bootstrap_submit_response(bootstrap, submit).await?;
         timeout(
-            self.handshake_timeout(),
+            bounded_bootstrap_timeout(connection_deadline, self.handshake_timeout()),
             crate::bootstrap_wire::write_frame(&mut send, &response),
         )
         .await
@@ -1407,7 +1440,11 @@ impl QuicRelayServer {
         send.finish().map_err(|_| RelayError::QuicProtocol {
             reason: "finishing bootstrap stream",
         })?;
-        let _ = timeout(self.handshake_timeout(), send.stopped()).await;
+        let _ = timeout(
+            bounded_bootstrap_timeout(connection_deadline, self.handshake_timeout()),
+            send.stopped(),
+        )
+        .await;
         connection.close(0u32.into(), b"bootstrap terminal");
         Ok(())
     }
@@ -1446,6 +1483,48 @@ impl QuicRelayServer {
             }
         };
         match frame.kind() {
+            crate::enrollment_v3_wire::Hde3Kind::ApprovalSubmit => {
+                let payload: crate::enrollment_v3_wire::Hde3ApprovalSubmitPayload =
+                    match frame.parse_json(crate::enrollment_v3_wire::Hde3Kind::ApprovalSubmit) {
+                        Ok(payload) => payload,
+                        Err(_) => {
+                            send_hde3_rejection(&mut send, None, 1).await?;
+                            return Ok(());
+                        }
+                    };
+                let (approval_id, submitted_challenge, code, app_csr, digest) =
+                    match payload.decode_fields() {
+                        Ok(fields) => fields,
+                        Err(_) => {
+                            send_hde3_rejection(&mut send, None, 1).await?;
+                            return Ok(());
+                        }
+                    };
+                let context = match bootstrap
+                    .submit_app_approval(approval_id, submitted_challenge, &code, app_csr, digest)
+                    .await
+                {
+                    Ok(context) => context,
+                    Err(error) => {
+                        send_hde3_rejection(
+                            &mut send,
+                            Some(approval_id),
+                            bootstrap_rejection_code(error),
+                        )
+                        .await?;
+                        return Ok(());
+                    }
+                };
+                let result = self
+                    .issue_hde3_app(
+                        context.approval_id,
+                        context.app_csr,
+                        context.app_csr_digest,
+                        context.configuration_generation,
+                    )
+                    .await;
+                self.send_hde3_result(&mut send, result).await?;
+            }
             crate::enrollment_v3_wire::Hde3Kind::FirstAppSubmit => {
                 let payload: crate::enrollment_v3_wire::Hde3FirstAppSubmitPayload =
                     match frame.parse_json(crate::enrollment_v3_wire::Hde3Kind::FirstAppSubmit) {
@@ -2831,6 +2910,8 @@ impl QuicRelayServer {
             endpoint: None,
             connections: Arc::clone(&self.connections),
             pre_auth_handshakes: Arc::clone(&self.pre_auth_handshakes),
+            bootstrap_handshakes: Arc::clone(&self.bootstrap_handshakes),
+            bootstrap_connections: Arc::clone(&self.bootstrap_connections),
             enrollment_handshakes: Arc::clone(&self.enrollment_handshakes),
             enrollment_connections: Arc::clone(&self.enrollment_connections),
             issuance_results: self.issuance_results.clone(),
@@ -2842,18 +2923,22 @@ impl QuicRelayServer {
     }
 }
 
-/// Send one fixed HDB1 rejection before closing the bootstrap connection.
-async fn send_hdb1_rejection(send: &mut quinn::SendStream, code: u16) -> RelayResult<()> {
+/// Builds one fixed HDB1 rejection frame without retaining payload material.
+fn hdb1_rejection_frame(code: u16) -> RelayResult<crate::bootstrap_wire::Hdb1Frame> {
     let payload = crate::bootstrap_wire::Hdb1RejectedPayload::new(code).map_err(|_| {
         RelayError::QuicProtocol {
             reason: "HDB1 rejection is invalid",
         }
     })?;
-    let frame =
-        crate::bootstrap_wire::Hdb1Frame::json(crate::bootstrap_wire::Hdb1Kind::Rejected, &payload)
-            .map_err(|_| RelayError::QuicProtocol {
-                reason: "HDB1 rejection is invalid",
-            })?;
+    crate::bootstrap_wire::Hdb1Frame::json(crate::bootstrap_wire::Hdb1Kind::Rejected, &payload)
+        .map_err(|_| RelayError::QuicProtocol {
+            reason: "HDB1 rejection is invalid",
+        })
+}
+
+/// Send one fixed HDB1 rejection before closing the bootstrap connection.
+async fn send_hdb1_rejection(send: &mut quinn::SendStream, code: u16) -> RelayResult<()> {
+    let frame = hdb1_rejection_frame(code)?;
     timeout(
         QRM_HANDSHAKE_TIMEOUT,
         crate::bootstrap_wire::write_frame(send, &frame),
@@ -2916,6 +3001,16 @@ async fn send_hde3_rejection(
     })
 }
 
+/// Return the remaining absolute lifetime for one HDB1 connection.
+fn remaining_bootstrap_time(deadline: Instant) -> Duration {
+    deadline.saturating_duration_since(Instant::now())
+}
+
+/// Bound one bootstrap operation by both the connection deadline and its local timeout.
+fn bounded_bootstrap_timeout(deadline: Instant, operation: Duration) -> Duration {
+    remaining_bootstrap_time(deadline).min(operation)
+}
+
 /// Map the bounded bootstrap runtime error to a nonzero HDB1/HDE3 rejection code.
 fn bootstrap_rejection_code(error: BootstrapRuntimeError) -> u16 {
     match error {
@@ -2926,7 +3021,8 @@ fn bootstrap_rejection_code(error: BootstrapRuntimeError) -> u16 {
         BootstrapRuntimeError::PeerRateLimited => 2,
         BootstrapRuntimeError::AlreadyActive => 3,
         BootstrapRuntimeError::Expired => 7,
-        BootstrapRuntimeError::CodeMismatch | BootstrapRuntimeError::CodeRateLimited => 8,
+        BootstrapRuntimeError::CodeMismatch => 8,
+        BootstrapRuntimeError::CodeRateLimited => 6,
         BootstrapRuntimeError::NotFound => 4,
     }
 }

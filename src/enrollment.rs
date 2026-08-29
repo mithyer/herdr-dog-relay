@@ -33,7 +33,7 @@ impl AppId {
     /// Parse one bounded App identity.
     ///
     /// # Parameters
-    /// * `value` - Stable App installation identity.
+    /// * `value` - Canonical App certificate identity.
     ///
     /// # Returns
     /// A validated App identity or a sanitized enrollment error.
@@ -1038,7 +1038,7 @@ impl FakeRelayEnrollment {
     /// * `core_identity` - Existing active Core client certificate identity.
     /// * `pairing_id` - Exact Profile identity.
     /// * `target_id` - Stable Target identity.
-    /// * `app_id` - App installation identity.
+    /// * `app_id` - Canonical App certificate identity derived from the CSR public key.
     /// * `configuration_generation` - Current Profile generation.
     /// * `now_epoch_seconds` - Current fake time.
     ///

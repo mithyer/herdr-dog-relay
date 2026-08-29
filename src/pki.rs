@@ -103,10 +103,14 @@ pub fn issue_certificate(
     csr_bytes: &[u8],
     allowlist_generation: u64,
 ) -> Result<IssuedCertificate, EnrollmentError> {
+    let derived_app_id = app_id_from_csr(csr_bytes)?;
+    if derived_app_id != app_id {
+        return Err(EnrollmentError::CsrMismatch);
+    }
     issue_certificate_with_intermediate(
         config,
         expected_uid,
-        app_id,
+        derived_app_id,
         csr_bytes,
         allowlist_generation,
         config.device_intermediate_certificate(),
@@ -135,21 +139,23 @@ pub fn issue_core_certificate(
     )
 }
 
-/// Parse and verify the bounded CSR Common Name used as the Core/App identity label.
+/// Parse a verified CSR and derive its identity from canonical SubjectPublicKeyInfo bytes.
 pub fn app_id_from_csr(csr_bytes: &[u8]) -> Result<AppId, EnrollmentError> {
     let (_, parsed_csr) =
         X509CertificationRequest::from_der(csr_bytes).map_err(|_| EnrollmentError::InvalidCsr)?;
     parsed_csr
         .verify_signature()
         .map_err(|_| EnrollmentError::InvalidCsr)?;
-    let common_name = parsed_csr
-        .certification_request_info
-        .subject
-        .iter_common_name()
-        .next()
-        .and_then(|value| value.as_str().ok())
-        .ok_or(EnrollmentError::CsrMismatch)?;
-    AppId::new(common_name.to_owned())
+    let identity: [u8; 32] =
+        Sha256::digest(parsed_csr.certification_request_info.subject_pki.raw).into();
+    if identity == [0; 32] {
+        return Err(EnrollmentError::InvalidCsr);
+    }
+    let identity = identity
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    AppId::new(identity)
 }
 
 /// Issue one bounded clientAuth leaf from a selected purpose-specific Intermediate CA.
@@ -330,20 +336,42 @@ pub fn current_epoch_seconds() -> Result<u64, EnrollmentError> {
 mod tests {
     use super::*;
     use rcgen::{
-        BasicConstraints, CertificateParams, CertifiedIssuer, IsCa, KeyPair, KeyUsagePurpose,
+        BasicConstraints, CertificateParams, CertificateSigningRequest, CertifiedIssuer, IsCa,
+        KeyPair, KeyUsagePurpose,
     };
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    /// Build a CSR whose Common Name is the canonical SPKI-derived identity.
+    fn derived_csr(key: &KeyPair) -> (CertificateSigningRequest, AppId) {
+        let mut probe_params = CertificateParams::new(vec![]).expect("probe params");
+        probe_params
+            .distinguished_name
+            .push(DnType::CommonName, "probe");
+        let probe = probe_params.serialize_request(key).expect("probe csr");
+        let (_, parsed) = X509CertificationRequest::from_der(probe.der()).expect("probe parse");
+        let identity: [u8; 32] =
+            Sha256::digest(parsed.certification_request_info.subject_pki.raw).into();
+        let identity = identity
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        let mut params = CertificateParams::new(vec![]).expect("params");
+        params
+            .distinguished_name
+            .push(DnType::CommonName, identity.as_str());
+        let csr = params.serialize_request(key).expect("csr");
+        (csr, AppId::new(identity).expect("app identity"))
+    }
 
     // TEST:relay/src/pki.rs[tests::csr_identity_is_bound]
     #[test]
     fn csr_identity_is_bound() {
         let key = KeyPair::generate().expect("key");
-        let mut params = CertificateParams::new(vec![]).expect("params");
-        params.distinguished_name.push(DnType::CommonName, "app-a");
-        let csr = params.serialize_request(&key).expect("csr");
-        let app = AppId::new("app-a").expect("app");
+        let (csr, app) = derived_csr(&key);
         let metadata = CsrMetadata::from_bytes(app.clone(), csr.der()).expect("metadata");
         assert_eq!(metadata.app_id(), &app);
+        assert_eq!(app.as_str().len(), 64);
+        assert!(app.as_str().bytes().all(|byte| byte.is_ascii_hexdigit()));
     }
 
     // TEST:relay/src/pki.rs[tests::protected_material_can_issue_leaf]
@@ -419,18 +447,17 @@ mod tests {
         ))
         .expect("config");
         let app_key = KeyPair::generate().expect("app key");
-        let mut params = CertificateParams::new(vec![]).expect("params");
-        params.distinguished_name.push(DnType::CommonName, "app-a");
-        let csr = params.serialize_request(&app_key).expect("csr");
-        let issued = issue_certificate(
-            config.security(),
-            uid,
-            AppId::new("app-a").expect("app"),
-            csr.der(),
-            2,
-        )
-        .expect("issued");
+        let (csr, app) = derived_csr(&app_key);
+        let issued =
+            issue_certificate(config.security(), uid, app.clone(), csr.der(), 2).expect("issued");
         assert_eq!(issued.certificate_chain().len(), 2);
+
+        // The issuer must reject a caller-supplied identity that differs from CSR SPKI.
+        let wrong_app = AppId::new("wrong-app-id").expect("wrong app identity");
+        assert!(matches!(
+            issue_certificate(config.security(), uid, wrong_app, csr.der(), 2),
+            Err(EnrollmentError::CsrMismatch)
+        ));
 
         // A different CA may be syntactically valid but must not authorize this device Intermediate.
         let mut unrelated_params =
@@ -456,16 +483,7 @@ mod tests {
             MAX_PUBLIC_MATERIAL_BYTES,
         )
         .expect("replace root");
-        assert!(
-            issue_certificate(
-                config.security(),
-                uid,
-                AppId::new("app-a").expect("app"),
-                csr.der(),
-                2,
-            )
-            .is_err()
-        );
+        assert!(issue_certificate(config.security(), uid, app, csr.der(), 2,).is_err());
         std::fs::remove_dir_all(directory).expect("cleanup");
     }
 }
