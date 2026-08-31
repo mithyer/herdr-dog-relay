@@ -16,7 +16,11 @@ use crate::{
         RelayBootstrapVerifier,
     },
     bootstrap_wire::{
-        self, Hdb1CoreIssuedPayload, Hdb1Error, Hdb1Frame, Hdb1Kind, Hdb1RejectedPayload,
+        self, HDB1_REJECTION_ALREADY_ACTIVE, HDB1_REJECTION_AUTHORITY_MISMATCH,
+        HDB1_REJECTION_CODE_MISMATCH, HDB1_REJECTION_CODE_RATE_LIMITED, HDB1_REJECTION_EXPIRED,
+        HDB1_REJECTION_INVALID_FIELD, HDB1_REJECTION_INVALID_STATE, HDB1_REJECTION_ISSUANCE_FAILED,
+        HDB1_REJECTION_OVERFLOW, HDB1_REJECTION_RESOURCE_LIMITED, HDB1_REJECTION_WORKSPACE_FAILURE,
+        Hdb1CoreIssuedPayload, Hdb1Error, Hdb1Frame, Hdb1Kind, Hdb1RejectedPayload,
         Hdb1ResultPayload, Hdb1StartPayload, Hdb1SubmitPayload,
     },
     enrollment::CsrDigest,
@@ -269,24 +273,31 @@ fn decode_start(
     .map_err(|_| Hdb1RelaySessionError::Wire(Hdb1Error::InvalidField))
 }
 
-/// Map internal fake failures to fixed nonzero HDB1 rejection codes.
+/// Map internal fake failures to the shared fixed HDB1 rejection registry.
 fn rejection_code(error: RelayBootstrapError) -> u16 {
     match error {
         RelayBootstrapError::InvalidValue
         | RelayBootstrapError::InvalidSession
         | RelayBootstrapError::InvalidGeneration
-        | RelayBootstrapError::InvalidCsr => 1,
-        RelayBootstrapError::CapacityExhausted | RelayBootstrapError::PeerRateLimited => 2,
-        RelayBootstrapError::AlreadyActive => 3,
-        RelayBootstrapError::NotFound => 4,
-        RelayBootstrapError::AuthorityMismatch => 5,
-        RelayBootstrapError::InvalidChallenge => 6,
-        RelayBootstrapError::Expired => 7,
-        RelayBootstrapError::CodeMismatch | RelayBootstrapError::CodeRateLimited => 8,
-        RelayBootstrapError::WorkspaceFailure | RelayBootstrapError::CleanupPending => 9,
-        RelayBootstrapError::InvalidState | RelayBootstrapError::AlreadyTerminal => 10,
-        RelayBootstrapError::IssuanceFailed => 11,
-        RelayBootstrapError::Overflow => 12,
+        | RelayBootstrapError::InvalidCsr => HDB1_REJECTION_INVALID_FIELD,
+        RelayBootstrapError::CapacityExhausted | RelayBootstrapError::PeerRateLimited => {
+            HDB1_REJECTION_RESOURCE_LIMITED
+        }
+        RelayBootstrapError::AlreadyActive => HDB1_REJECTION_ALREADY_ACTIVE,
+        RelayBootstrapError::NotFound
+        | RelayBootstrapError::AuthorityMismatch
+        | RelayBootstrapError::InvalidChallenge => HDB1_REJECTION_AUTHORITY_MISMATCH,
+        RelayBootstrapError::Expired => HDB1_REJECTION_EXPIRED,
+        RelayBootstrapError::CodeMismatch => HDB1_REJECTION_CODE_MISMATCH,
+        RelayBootstrapError::CodeRateLimited => HDB1_REJECTION_CODE_RATE_LIMITED,
+        RelayBootstrapError::WorkspaceFailure | RelayBootstrapError::CleanupPending => {
+            HDB1_REJECTION_WORKSPACE_FAILURE
+        }
+        RelayBootstrapError::InvalidState | RelayBootstrapError::AlreadyTerminal => {
+            HDB1_REJECTION_INVALID_STATE
+        }
+        RelayBootstrapError::IssuanceFailed => HDB1_REJECTION_ISSUANCE_FAILED,
+        RelayBootstrapError::Overflow => HDB1_REJECTION_OVERFLOW,
     }
 }
 

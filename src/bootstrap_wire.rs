@@ -33,6 +33,30 @@ pub(crate) const HDB1_MAX_SESSION_BYTES: usize = crate::HDB1_MAX_SESSION_BYTES;
 pub(crate) const HDB1_MAX_CHAIN_BYTES: usize = 46 * 1024;
 /// Maximum number of certificates in one public chain.
 pub(crate) const HDB1_MAX_CHAIN_CERTIFICATES: usize = 8;
+/// Stable rejection code for malformed HDB1/HDE3 fields.
+pub(crate) const HDB1_REJECTION_INVALID_FIELD: u16 = 1;
+/// Stable rejection code for exhausted bounded resources.
+pub(crate) const HDB1_REJECTION_RESOURCE_LIMITED: u16 = 2;
+/// Stable rejection code for an already active session.
+pub(crate) const HDB1_REJECTION_ALREADY_ACTIVE: u16 = 3;
+/// Stable rejection code for an authorization or binding mismatch.
+pub(crate) const HDB1_REJECTION_AUTHORITY_MISMATCH: u16 = 4;
+/// Stable rejection code for protected persistence or workspace failure.
+pub(crate) const HDB1_REJECTION_PERSISTENCE_FAILED: u16 = 5;
+/// Stable rejection code for an exhausted verification-code budget.
+pub(crate) const HDB1_REJECTION_CODE_RATE_LIMITED: u16 = 6;
+/// Stable rejection code for an expired challenge or approval.
+pub(crate) const HDB1_REJECTION_EXPIRED: u16 = 7;
+/// Stable rejection code for a known verification-code mismatch.
+pub(crate) const HDB1_REJECTION_CODE_MISMATCH: u16 = 8;
+/// Stable rejection code for a workspace cleanup failure in the local fake.
+pub(crate) const HDB1_REJECTION_WORKSPACE_FAILURE: u16 = 9;
+/// Stable rejection code for an invalid fake lifecycle state.
+pub(crate) const HDB1_REJECTION_INVALID_STATE: u16 = 10;
+/// Stable rejection code for a certificate issuance failure in the local fake.
+pub(crate) const HDB1_REJECTION_ISSUANCE_FAILED: u16 = 11;
+/// Stable rejection code for an arithmetic overflow in the local fake.
+pub(crate) const HDB1_REJECTION_OVERFLOW: u16 = 12;
 
 /// Decoded HDB1 Start fields returned to Relay-owned callers.
 type Hdb1StartFields = (

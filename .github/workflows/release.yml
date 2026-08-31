@@ -48,10 +48,11 @@ jobs:
         with:
           ref: ${{ github.event.inputs.tag || github.ref }}
 
-      # Use the repository lockfile so release dependencies cannot drift silently.
+      # Keep release archives reproducible with the fixed Rust build baseline.
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:
+          toolchain: 1.94.1
           targets: ${{ matrix.target }}
 
       # Confirm that the release tag and embedded CLI version cannot drift apart.

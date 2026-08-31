@@ -6,7 +6,7 @@
 use std::{
     collections::BTreeMap,
     env,
-    net::SocketAddr,
+    net::{IpAddr, SocketAddr},
     path::{Path, PathBuf},
     pin::Pin,
     sync::Arc,
@@ -26,6 +26,12 @@ use tokio::{
 use crate::{
     allowlist::PersistentAllowlist,
     bootstrap_runtime::{BOOTSTRAP_HARD_LIFETIME_SECS, BootstrapRuntime, BootstrapRuntimeError},
+    bootstrap_wire::{
+        HDB1_REJECTION_ALREADY_ACTIVE, HDB1_REJECTION_AUTHORITY_MISMATCH,
+        HDB1_REJECTION_CODE_MISMATCH, HDB1_REJECTION_CODE_RATE_LIMITED, HDB1_REJECTION_EXPIRED,
+        HDB1_REJECTION_INVALID_FIELD, HDB1_REJECTION_PERSISTENCE_FAILED,
+        HDB1_REJECTION_RESOURCE_LIMITED,
+    },
     bridge::{self, BridgeLimits},
     config::{QRM_HANDSHAKE_TIMEOUT_SECS, RelayConfig, SecurityMode},
     enrollment::{AllowlistState, Fingerprint, STABLE_LATEST_SELECTOR},
@@ -1182,6 +1188,7 @@ impl QuicRelayServer {
     async fn bootstrap_submit_response(
         &self,
         bootstrap: &BootstrapRuntime,
+        peer_ip: IpAddr,
         frame: crate::bootstrap_wire::Hdb1Frame,
     ) -> RelayResult<crate::bootstrap_wire::Hdb1Frame> {
         let submit: crate::bootstrap_wire::Hdb1SubmitPayload =
@@ -1194,7 +1201,7 @@ impl QuicRelayServer {
             Err(_) => return hdb1_rejection_frame(1),
         };
         match bootstrap
-            .submit(bootstrap_id, submitted_challenge, &code)
+            .submit(peer_ip, bootstrap_id, submitted_challenge, &code)
             .await
         {
             Ok(issued) => {
@@ -1269,7 +1276,9 @@ impl QuicRelayServer {
             }
         };
         if start.kind() == crate::bootstrap_wire::Hdb1Kind::Submit {
-            let response = self.bootstrap_submit_response(bootstrap, start).await?;
+            let response = self
+                .bootstrap_submit_response(bootstrap, connection.remote_address().ip(), start)
+                .await?;
             timeout(
                 bounded_bootstrap_timeout(connection_deadline, self.handshake_timeout()),
                 crate::bootstrap_wire::write_frame(&mut send, &response),
@@ -1289,6 +1298,7 @@ impl QuicRelayServer {
                 send.stopped(),
             )
             .await;
+            connection.close(0u32.into(), b"bootstrap resumed terminal");
             return Ok(());
         }
         if start.kind() == crate::bootstrap_wire::Hdb1Kind::Reconcile {
@@ -1383,32 +1393,43 @@ impl QuicRelayServer {
                 return Ok(());
             }
         };
-        let challenge_payload = crate::bootstrap_wire::Hdb1ChallengePayload::new(
-            challenge.bootstrap_id,
-            challenge.challenge,
-            challenge.expires_at_epoch_seconds,
-        )
-        .map_err(|_| RelayError::QuicProtocol {
-            reason: "bootstrap challenge encoding failed",
-        })?;
-        let challenge_frame = crate::bootstrap_wire::Hdb1Frame::json(
-            crate::bootstrap_wire::Hdb1Kind::Challenge,
-            &challenge_payload,
-        )
-        .map_err(|_| RelayError::QuicProtocol {
-            reason: "bootstrap challenge encoding failed",
-        })?;
-        timeout(
-            bounded_bootstrap_timeout(connection_deadline, self.handshake_timeout()),
-            crate::bootstrap_wire::write_frame(&mut send, &challenge_frame),
-        )
-        .await
-        .map_err(|_| RelayError::QuicHandshake {
-            reason: "bootstrap challenge write timeout",
-        })?
-        .map_err(|_| RelayError::QuicProtocol {
-            reason: "bootstrap challenge write failed",
-        })?;
+        // Challenge delivery is the boundary between aborting an attempt and retaining it for an
+        // explicit fresh Submit. Clean up any attempt whose challenge cannot be fully delivered.
+        let challenge_delivery = async {
+            let challenge_payload = crate::bootstrap_wire::Hdb1ChallengePayload::new(
+                challenge.bootstrap_id,
+                challenge.challenge,
+                challenge.expires_at_epoch_seconds,
+            )
+            .map_err(|_| RelayError::QuicProtocol {
+                reason: "bootstrap challenge encoding failed",
+            })?;
+            let challenge_frame = crate::bootstrap_wire::Hdb1Frame::json(
+                crate::bootstrap_wire::Hdb1Kind::Challenge,
+                &challenge_payload,
+            )
+            .map_err(|_| RelayError::QuicProtocol {
+                reason: "bootstrap challenge encoding failed",
+            })?;
+            timeout(
+                bounded_bootstrap_timeout(connection_deadline, self.handshake_timeout()),
+                crate::bootstrap_wire::write_frame(&mut send, &challenge_frame),
+            )
+            .await
+            .map_err(|_| RelayError::QuicHandshake {
+                reason: "bootstrap challenge write timeout",
+            })?
+            .map_err(|_| RelayError::QuicProtocol {
+                reason: "bootstrap challenge write failed",
+            })?;
+            Ok::<(), RelayError>(())
+        }
+        .await;
+        if let Err(error) = challenge_delivery {
+            let _ = bootstrap.abort(challenge.bootstrap_id).await;
+            connection.close(0u32.into(), b"bootstrap challenge delivery failed");
+            return Err(error);
+        }
         let submit = match timeout(
             remaining_bootstrap_time(connection_deadline),
             crate::bootstrap_wire::read_frame(&mut recv),
@@ -1421,7 +1442,9 @@ impl QuicRelayServer {
                 return Ok(());
             }
         };
-        let response = self.bootstrap_submit_response(bootstrap, submit).await?;
+        let response = self
+            .bootstrap_submit_response(bootstrap, connection.remote_address().ip(), submit)
+            .await?;
         timeout(
             bounded_bootstrap_timeout(connection_deadline, self.handshake_timeout()),
             crate::bootstrap_wire::write_frame(&mut send, &response),
@@ -1497,7 +1520,14 @@ impl QuicRelayServer {
                         }
                     };
                 let context = match bootstrap
-                    .submit_app_approval(approval_id, submitted_challenge, &code, app_csr, digest)
+                    .submit_app_approval(
+                        core_identity,
+                        approval_id,
+                        submitted_challenge,
+                        &code,
+                        app_csr,
+                        digest,
+                    )
                     .await
                 {
                     Ok(context) => context,
@@ -1542,8 +1572,13 @@ impl QuicRelayServer {
                     .await
                 {
                     Ok(generation) => generation,
-                    Err(_) => {
-                        send_hde3_rejection(&mut send, Some(approval_id), 4).await?;
+                    Err(error) => {
+                        send_hde3_rejection(
+                            &mut send,
+                            Some(approval_id),
+                            bootstrap_rejection_code(error),
+                        )
+                        .await?;
                         return Ok(());
                     }
                 };
@@ -1653,7 +1688,14 @@ impl QuicRelayServer {
                     return Ok(());
                 }
                 let context = match bootstrap
-                    .submit_app_approval(approval_id, submitted_challenge, &code, app_csr, digest)
+                    .submit_app_approval(
+                        core_identity,
+                        approval_id,
+                        submitted_challenge,
+                        &code,
+                        app_csr,
+                        digest,
+                    )
                     .await
                 {
                     Ok(context) => context,
@@ -3005,19 +3047,22 @@ fn bounded_bootstrap_timeout(deadline: Instant, operation: Duration) -> Duration
     remaining_bootstrap_time(deadline).min(operation)
 }
 
-/// Map the bounded bootstrap runtime error to a nonzero HDB1/HDE3 rejection code.
+/// Map the bounded bootstrap runtime error to the shared HDB1/HDE3 rejection registry.
 fn bootstrap_rejection_code(error: BootstrapRuntimeError) -> u16 {
     match error {
-        BootstrapRuntimeError::InvalidField => 1,
-        BootstrapRuntimeError::AuthorityMismatch => 4,
-        BootstrapRuntimeError::WorkspaceUnavailable | BootstrapRuntimeError::PersistenceFailed => 5,
-        BootstrapRuntimeError::CapacityExhausted => 2,
-        BootstrapRuntimeError::PeerRateLimited => 2,
-        BootstrapRuntimeError::AlreadyActive => 3,
-        BootstrapRuntimeError::Expired => 7,
-        BootstrapRuntimeError::CodeMismatch => 8,
-        BootstrapRuntimeError::CodeRateLimited => 6,
-        BootstrapRuntimeError::NotFound => 4,
+        BootstrapRuntimeError::InvalidField => HDB1_REJECTION_INVALID_FIELD,
+        BootstrapRuntimeError::AuthorityMismatch => HDB1_REJECTION_AUTHORITY_MISMATCH,
+        BootstrapRuntimeError::WorkspaceUnavailable | BootstrapRuntimeError::PersistenceFailed => {
+            HDB1_REJECTION_PERSISTENCE_FAILED
+        }
+        BootstrapRuntimeError::CapacityExhausted | BootstrapRuntimeError::PeerRateLimited => {
+            HDB1_REJECTION_RESOURCE_LIMITED
+        }
+        BootstrapRuntimeError::AlreadyActive => HDB1_REJECTION_ALREADY_ACTIVE,
+        BootstrapRuntimeError::Expired => HDB1_REJECTION_EXPIRED,
+        BootstrapRuntimeError::CodeMismatch => HDB1_REJECTION_CODE_MISMATCH,
+        BootstrapRuntimeError::CodeRateLimited => HDB1_REJECTION_CODE_RATE_LIMITED,
+        BootstrapRuntimeError::NotFound => HDB1_REJECTION_AUTHORITY_MISMATCH,
     }
 }
 
@@ -5888,14 +5933,47 @@ idle_timeout_secs = 900
     #[test]
     fn production_rejection_codes_are_wire_stable() {
         let cases = [
-            (BootstrapRuntimeError::InvalidField, 1),
-            (BootstrapRuntimeError::CapacityExhausted, 2),
-            (BootstrapRuntimeError::AlreadyActive, 3),
-            (BootstrapRuntimeError::AuthorityMismatch, 4),
-            (BootstrapRuntimeError::PersistenceFailed, 5),
-            (BootstrapRuntimeError::CodeRateLimited, 6),
-            (BootstrapRuntimeError::Expired, 7),
-            (BootstrapRuntimeError::CodeMismatch, 8),
+            (
+                BootstrapRuntimeError::InvalidField,
+                HDB1_REJECTION_INVALID_FIELD,
+            ),
+            (
+                BootstrapRuntimeError::CapacityExhausted,
+                HDB1_REJECTION_RESOURCE_LIMITED,
+            ),
+            (
+                BootstrapRuntimeError::PeerRateLimited,
+                HDB1_REJECTION_RESOURCE_LIMITED,
+            ),
+            (
+                BootstrapRuntimeError::AlreadyActive,
+                HDB1_REJECTION_ALREADY_ACTIVE,
+            ),
+            (
+                BootstrapRuntimeError::AuthorityMismatch,
+                HDB1_REJECTION_AUTHORITY_MISMATCH,
+            ),
+            (
+                BootstrapRuntimeError::NotFound,
+                HDB1_REJECTION_AUTHORITY_MISMATCH,
+            ),
+            (
+                BootstrapRuntimeError::WorkspaceUnavailable,
+                HDB1_REJECTION_PERSISTENCE_FAILED,
+            ),
+            (
+                BootstrapRuntimeError::PersistenceFailed,
+                HDB1_REJECTION_PERSISTENCE_FAILED,
+            ),
+            (
+                BootstrapRuntimeError::CodeRateLimited,
+                HDB1_REJECTION_CODE_RATE_LIMITED,
+            ),
+            (BootstrapRuntimeError::Expired, HDB1_REJECTION_EXPIRED),
+            (
+                BootstrapRuntimeError::CodeMismatch,
+                HDB1_REJECTION_CODE_MISMATCH,
+            ),
         ];
         for (error, expected_code) in cases {
             assert_eq!(bootstrap_rejection_code(error), expected_code);

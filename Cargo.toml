@@ -2,6 +2,8 @@
 name = "herdr-dog-relay"
 version = "0.1.1"
 edition = "2024"
+# Keep Relay source and release builds on the fixed Rust baseline.
+rust-version = "1.94.1"
 license = "AGPL-3.0-or-later"
 description = "Authenticated bounded byte relay for Herdr-dog Core"
 

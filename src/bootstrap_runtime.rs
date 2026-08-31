@@ -413,6 +413,8 @@ async fn read_json_line(stream: &mut UnixStream) -> Result<Value, BootstrapRunti
 
 /// One pending HDB1 server-only bootstrap attempt.
 struct BootstrapAttempt {
+    /// Relay-observed peer IP bound to this in-memory attempt.
+    peer_ip: IpAddr,
     /// Durable approval identifier minted for later HDE3.
     approval_id: [u8; HDB1_ID_BYTES],
     /// Relay challenge returned to Core.
@@ -939,8 +941,13 @@ impl BootstrapRuntime {
         if state.active_sessions.contains(&normalized_session) {
             return Err(BootstrapRuntimeError::AlreadyActive);
         }
+        // Prune every expired peer bucket before admitting a new unauthenticated Start so an
+        // internet-facing server cannot retain one stale map entry per historical source IP.
+        state.peer_starts.retain(|_, history| {
+            history.retain(|timestamp| now.saturating_sub(*timestamp) < PEER_START_WINDOW_SECS);
+            !history.is_empty()
+        });
         let peer_history = state.peer_starts.entry(peer_ip).or_default();
-        peer_history.retain(|timestamp| now.saturating_sub(*timestamp) < PEER_START_WINDOW_SECS);
         if peer_history.len() >= MAX_PEER_STARTS {
             return Err(BootstrapRuntimeError::PeerRateLimited);
         }
@@ -962,6 +969,7 @@ impl BootstrapRuntime {
         state.attempts.insert(
             bootstrap_id,
             BootstrapAttempt {
+                peer_ip,
                 approval_id,
                 challenge,
                 code,
@@ -989,9 +997,53 @@ impl BootstrapRuntime {
         })
     }
 
+    /// Abort one HDB1 attempt when challenge delivery cannot complete.
+    ///
+    /// # Parameters
+    /// * `bootstrap_id` - In-memory attempt whose hidden workspace must be cleaned.
+    ///
+    /// # Returns
+    /// `Ok(())` after the attempt is removed and cleanup is requested, or a sanitized cleanup or
+    /// persistence error. The method never exposes the code, workspace title or CSR.
+    // TEST:relay/src/bootstrap_runtime.rs[tests::production_challenge_abort_cleans_attempt]
+    pub(crate) async fn abort(
+        &self,
+        bootstrap_id: [u8; HDB1_ID_BYTES],
+    ) -> Result<(), BootstrapRuntimeError> {
+        let mut state = self.state.lock().await;
+        let Some(attempt) = state.attempts.remove(&bootstrap_id) else {
+            return Ok(());
+        };
+        let session = attempt.normalized_session.clone();
+        let workspace_id = attempt.workspace_id.clone();
+        state.active_sessions.remove(&session);
+        let cleanup_failed = self.workspace.close(&workspace_id).await.is_err();
+        if cleanup_failed {
+            state.orphaned_workspaces.push((session, workspace_id));
+        }
+        self.store
+            .persist(&state)
+            .map_err(|_| BootstrapRuntimeError::PersistenceFailed)?;
+        if cleanup_failed {
+            return Err(BootstrapRuntimeError::WorkspaceUnavailable);
+        }
+        Ok(())
+    }
+
     /// Verify one HDB1 code, close the workspace and issue one Core certificate.
+    ///
+    /// # Parameters
+    /// * `peer_ip` - Relay-observed peer IP that must match the Start connection.
+    /// * `bootstrap_id` - Active HDB1 attempt identifier.
+    /// * `challenge` - Challenge returned by the matching Start connection.
+    /// * `code` - User-entered six-digit verification code.
+    ///
+    /// # Returns
+    /// Public Core certificate metadata or a sanitized bounded failure.
+    // TEST:relay/src/bootstrap_runtime.rs[tests::production_submit_enforces_code_limit]
     pub(crate) async fn submit(
         &self,
+        peer_ip: IpAddr,
         bootstrap_id: [u8; HDB1_ID_BYTES],
         challenge: [u8; HDB1_DIGEST_BYTES],
         code: &str,
@@ -1004,7 +1056,7 @@ impl BootstrapRuntime {
             .attempts
             .get_mut(&bootstrap_id)
             .ok_or(BootstrapRuntimeError::NotFound)?;
-        if attempt.challenge != challenge {
+        if attempt.peer_ip != peer_ip || attempt.challenge != challenge {
             return Err(BootstrapRuntimeError::AuthorityMismatch);
         }
         if now > attempt.expires_at_epoch_seconds || now > attempt.hard_expires_at_epoch_seconds {
@@ -1304,8 +1356,20 @@ impl BootstrapRuntime {
     }
 
     /// Verify a later App code and return its transient CSR context after cleanup.
+    ///
+    /// # Parameters
+    /// * `core_identity` - Authenticated HDE3 Core identity that started the approval.
+    /// * `approval_id` - Relay approval identifier bound to the challenge.
+    /// * `challenge` - Challenge returned by the matching ApprovalStart.
+    /// * `code` - User-entered six-digit verification code.
+    /// * `app_csr` - Transient public App CSR used for issuance.
+    /// * `app_csr_digest` - Digest of the exact App CSR bytes.
+    ///
+    /// # Returns
+    /// The exact approved CSR context or a sanitized bounded failure.
     pub(crate) async fn submit_app_approval(
         &self,
+        core_identity: [u8; HDB1_DIGEST_BYTES],
         approval_id: [u8; HDB1_ID_BYTES],
         challenge: [u8; HDB1_DIGEST_BYTES],
         code: &str,
@@ -1326,7 +1390,10 @@ impl BootstrapRuntime {
             .app_approvals
             .get_mut(&approval_id)
             .ok_or(BootstrapRuntimeError::NotFound)?;
-        if approval.challenge != challenge || approval.app_csr_digest != app_csr_digest {
+        if approval.core_identity != core_identity
+            || approval.challenge != challenge
+            || approval.app_csr_digest != app_csr_digest
+        {
             return Err(BootstrapRuntimeError::AuthorityMismatch);
         }
         if now > approval.expires_at_epoch_seconds {
@@ -1557,12 +1624,22 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .expect("clock")
             .as_nanos();
-        let root = fs::canonicalize(std::env::temp_dir())
-            .expect("canonical temp root")
-            .join(format!("herdr-dog-bootstrap-runtime-{nonce}"));
-        fs::create_dir(&root).expect("test root");
-        fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).expect("test root mode");
-        root
+        let temp_root = fs::canonicalize(std::env::temp_dir()).expect("canonical temp root");
+        let prefix = format!("herdr-dog-bootstrap-runtime-{}-{nonce}", std::process::id());
+        // Exclusive creation with retries prevents concurrent cargo test processes from colliding.
+        for attempt in 0..32 {
+            let root = temp_root.join(format!("{prefix}-{attempt}"));
+            match fs::create_dir(&root) {
+                Ok(()) => {
+                    fs::set_permissions(&root, fs::Permissions::from_mode(0o700))
+                        .expect("test root mode");
+                    return root;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(error) => panic!("test root: {error}"),
+            }
+        }
+        panic!("test root: could not allocate unique directory");
     }
 
     /// Build a production-shaped runtime with injected test socket and protected state paths.
@@ -1696,28 +1773,130 @@ mod tests {
             )
             .await
             .expect("start");
+        let peer_mismatch = runtime
+            .submit(
+                "127.0.0.2".parse().expect("different peer IP"),
+                challenge.bootstrap_id,
+                challenge.challenge,
+                "000000",
+            )
+            .await;
+        assert_eq!(peer_mismatch, Err(BootstrapRuntimeError::AuthorityMismatch));
         for _ in 0..4 {
             assert_eq!(
                 runtime
-                    .submit(challenge.bootstrap_id, challenge.challenge, "000000")
+                    .submit(
+                        "127.0.0.1".parse().expect("peer IP"),
+                        challenge.bootstrap_id,
+                        challenge.challenge,
+                        "000000",
+                    )
                     .await,
                 Err(BootstrapRuntimeError::CodeMismatch)
             );
         }
         assert_eq!(
             runtime
-                .submit(challenge.bootstrap_id, challenge.challenge, "000000")
+                .submit(
+                    "127.0.0.1".parse().expect("peer IP"),
+                    challenge.bootstrap_id,
+                    challenge.challenge,
+                    "000000",
+                )
                 .await,
             Err(BootstrapRuntimeError::CodeRateLimited)
         );
         assert_eq!(
             runtime
-                .submit(challenge.bootstrap_id, challenge.challenge, "000000")
+                .submit(
+                    "127.0.0.1".parse().expect("peer IP"),
+                    challenge.bootstrap_id,
+                    challenge.challenge,
+                    "000000",
+                )
                 .await,
             Err(BootstrapRuntimeError::NotFound)
         );
         workspace_task.await.expect("workspace task");
         fs::remove_dir_all(socket_dir).expect("workspace socket directory cleanup");
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    /// Verify challenge-delivery failure cleanup removes the active session and workspace.
+    // TEST:relay/src/bootstrap_runtime.rs[tests::production_challenge_abort_cleans_attempt]
+    #[tokio::test(flavor = "current_thread")]
+    async fn production_challenge_abort_cleans_attempt() {
+        let root = test_root();
+        let socket_dir = PathBuf::from(format!(
+            "/private/tmp/hbr-abort-{}-{}",
+            std::process::id(),
+            root.file_name().expect("root name").to_string_lossy()
+        ));
+        fs::create_dir(&socket_dir).expect("workspace socket directory");
+        fs::set_permissions(&socket_dir, fs::Permissions::from_mode(0o700))
+            .expect("workspace socket directory mode");
+        let socket_path = socket_dir.join("s");
+        let workspace_task = spawn_workspace_server(socket_path.clone());
+        let runtime = test_runtime(&root, socket_path);
+        let challenge = runtime
+            .start(
+                "127.0.0.1".parse().expect("peer IP"),
+                test_start_payload("default"),
+            )
+            .await
+            .expect("start");
+        runtime.abort(challenge.bootstrap_id).await.expect("abort");
+        assert_eq!(
+            runtime
+                .submit(
+                    "127.0.0.1".parse().expect("peer IP"),
+                    challenge.bootstrap_id,
+                    challenge.challenge,
+                    "000000",
+                )
+                .await,
+            Err(BootstrapRuntimeError::NotFound)
+        );
+        workspace_task.await.expect("workspace task");
+        fs::remove_dir_all(socket_dir).expect("workspace socket directory cleanup");
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    /// Verify a resumed HDE3 approval cannot be submitted by another Core identity.
+    // TEST:relay/src/bootstrap_runtime.rs[tests::production_app_approval_rejects_core_identity_mismatch]
+    #[tokio::test(flavor = "current_thread")]
+    async fn production_app_approval_rejects_core_identity_mismatch() {
+        let root = test_root();
+        let runtime = test_runtime(&root, root.join("missing.sock"));
+        let approval_id = [1_u8; HDB1_ID_BYTES];
+        let app_csr = vec![1_u8, 2, 3];
+        let app_csr_digest = digest(&app_csr);
+        runtime.state.lock().await.app_approvals.insert(
+            approval_id,
+            AppApproval {
+                core_identity: [2; HDB1_DIGEST_BYTES],
+                app_csr_digest,
+                core_binding_digest: [3; HDB1_DIGEST_BYTES],
+                normalized_session: "default".to_owned(),
+                configuration_generation: 1,
+                challenge: [4; HDB1_DIGEST_BYTES],
+                code: *b"123456",
+                workspace_id: "test-workspace".to_owned(),
+                expires_at_epoch_seconds: u64::MAX,
+                failed_codes: 0,
+            },
+        );
+        let result = runtime
+            .submit_app_approval(
+                [9; HDB1_DIGEST_BYTES],
+                approval_id,
+                [4; HDB1_DIGEST_BYTES],
+                "123456",
+                app_csr,
+                app_csr_digest,
+            )
+            .await;
+        assert_eq!(result, Err(BootstrapRuntimeError::AuthorityMismatch));
         fs::remove_dir_all(root).expect("cleanup");
     }
 
