@@ -62,6 +62,8 @@ pub(crate) mod enrollment_v3_wire;
 pub mod enrollment_wire;
 /// Redacted Relay errors.
 pub mod error;
+/// iroh-native application Relay Endpoint/Router and bounded HDP1 control handler.
+pub mod iroh_endpoint;
 /// Protected durable enrollment issuance-result records.
 pub mod issuance;
 /// Protected-file validation and transient deployment material loading.

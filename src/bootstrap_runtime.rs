@@ -228,7 +228,7 @@ impl fmt::Debug for AppApprovalContext {
 
 /// Exact workspace authority used by the production verifier.
 #[derive(Clone)]
-struct HerdrWorkspaceClient {
+pub(crate) struct HerdrWorkspaceClient {
     /// Validated session-specific Unix socket connector.
     socket: UnixSocketConnector,
     /// Remote cwd used only by workspace.create.
@@ -251,7 +251,7 @@ impl fmt::Debug for HerdrWorkspaceClient {
 
 impl HerdrWorkspaceClient {
     /// Construct the fixed-session verifier after validating the non-secret remote cwd.
-    fn new(
+    pub(crate) fn new(
         socket_path: PathBuf,
         expected_uid: u32,
         verification_cwd: String,
@@ -276,14 +276,17 @@ impl HerdrWorkspaceClient {
     }
 
     /// Create the hidden workspace and verify its label with a fresh get operation.
-    async fn create_and_verify(&self, title: &str) -> Result<String, BootstrapRuntimeError> {
+    pub(crate) async fn create_and_verify(
+        &self,
+        title: &str,
+    ) -> Result<String, BootstrapRuntimeError> {
         if title.is_empty() || title.len() > WORKSPACE_TITLE_MAX_BYTES {
             return Err(BootstrapRuntimeError::InvalidField);
         }
         let result = self
             .request(
                 "workspace.create",
-                json!({"cwd": self.verification_cwd, "label": title, "focus": false}),
+                json!({"cwd": self.verification_cwd, "label": title, "focus": false, "env": {}}),
             )
             .await?;
         let workspace = result
@@ -322,7 +325,7 @@ impl HerdrWorkspaceClient {
     }
 
     /// Close one known hidden workspace; an already-missing workspace is reconciled.
-    async fn close(&self, workspace_id: &str) -> Result<(), BootstrapRuntimeError> {
+    pub(crate) async fn close(&self, workspace_id: &str) -> Result<(), BootstrapRuntimeError> {
         if workspace_id.is_empty() || workspace_id.len() > WORKSPACE_ID_MAX_BYTES {
             return Err(BootstrapRuntimeError::InvalidField);
         }
@@ -1456,7 +1459,7 @@ impl BootstrapRuntime {
 }
 
 /// Build the platform-neutral Herdr socket path for the selected session.
-fn session_socket_path(session: &str) -> PathBuf {
+pub(crate) fn session_socket_path(session: &str) -> PathBuf {
     let root = std::env::var_os("XDG_CONFIG_HOME")
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".config")))
@@ -1530,7 +1533,7 @@ fn mint_id(state: &BootstrapState) -> [u8; 32] {
 }
 
 /// Generate a uniformly distributed six-digit code without exposing it in diagnostics.
-fn random_code() -> [u8; 6] {
+pub(crate) fn random_code() -> [u8; 6] {
     const CODE_RANGE: u32 = 900_000;
     // Reject the incomplete final range so every six-digit value has equal probability.
     let sample = loop {
@@ -1548,7 +1551,7 @@ fn random_code() -> [u8; 6] {
 }
 
 /// Format the user-visible code-first title with the Relay host's local UTC offset.
-fn verification_title(
+pub(crate) fn verification_title(
     code: [u8; 6],
     expires_at_epoch_seconds: u64,
 ) -> Result<String, BootstrapRuntimeError> {
@@ -1583,7 +1586,7 @@ fn parse_code(value: &str) -> Result<[u8; 6], BootstrapRuntimeError> {
 }
 
 /// Compare two six-digit codes without early exit on a mismatch.
-fn constant_time_equal(left: &[u8; 6], right: &[u8; 6]) -> bool {
+pub(crate) fn constant_time_equal(left: &[u8; 6], right: &[u8; 6]) -> bool {
     let mut difference = 0_u8;
     for (left, right) in left.iter().zip(right.iter()) {
         difference |= left ^ right;

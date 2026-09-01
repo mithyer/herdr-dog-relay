@@ -17,6 +17,8 @@ name = "herdr_dog_relay"
 path = "src/lib.rs"
 
 [dependencies]
+# The application Relay owns an iroh endpoint/Router; network-relay service code stays separate.
+iroh = { version = "1.1.0", default-features = false, features = ["metrics", "tls-ring"] }
 ipnet = { version = "2.11", features = ["serde"] }
 libc = "0.2"
 rand = "0.9"
