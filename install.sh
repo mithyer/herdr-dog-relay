@@ -211,4 +211,4 @@ INSTALL_COMPLETED=1
 # Report the stable install location and leave configuration untouched.
 printf 'Installed herdogrelay %s to %s/herdogrelay\n' "$RELEASE_VERSION" "$INSTALL_DIRECTORY"
 printf 'Create or review a config with: herdogrelay --print-default-config\n'
-printf 'Run with: herdogrelay --config ~/.config/herdr-dog/relay.toml\n'
+printf 'Run with: herdogrelay --config ~/.config/herdr-dog/iroh-relay.toml\n'

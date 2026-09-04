@@ -8,7 +8,7 @@
     <array>
         <string>/Users/REPLACE/.local/bin/herdogrelay</string>
         <string>--config</string>
-        <string>/Users/REPLACE/.config/herdr-dog/relay.toml</string>
+        <string>/Users/REPLACE/.config/herdr-dog/iroh-relay.toml</string>
     </array>
     <key>RunAtLoad</key>
     <true/>

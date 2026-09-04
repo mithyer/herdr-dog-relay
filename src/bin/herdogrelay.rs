@@ -1,24 +1,28 @@
-//! Command-line host for the QRM-1 single-device QUIC Relay.
+//! Command-line host for the iroh application Relay.
 
 use herdr_dog_relay::{
-    config::{DEFAULT_CONFIG_TOML, RelayConfig, SecurityMode},
+    config::{DEFAULT_IROH_CONFIG_TOML, IrohRuntimeConfig, RelayConfig, SecurityMode},
     error::RelayError,
-    quic_server::QuicRelayServer,
+    iroh_endpoint::{
+        HerdrWorkspacePairingVerifier, IrohRelayEndpoint, PairingVerifier, RejectAllPairing,
+    },
 };
-use std::{env, fmt, path::PathBuf};
+use std::{env, fmt, path::PathBuf, sync::Arc};
 
 /// Command name used in diagnostics.
 const COMMAND_NAME: &str = "herdogrelay";
 /// Safe command-line usage text.
-const HELP_TEXT: &str = "herdogrelay - single-device QUIC TLS 1.3 Relay\n\nUsage:\n  herdogrelay [--config PATH] [--port PORT]\n  herdogrelay update --config PATH\n  herdogrelay revoke --config PATH --app-id APP_ID\n  herdogrelay --print-default-config\n  herdogrelay --help\n  herdogrelay --version\n";
+const HELP_TEXT: &str = "herdogrelay - iroh application Relay\n\nUsage:\n  herdogrelay [run] [--config PATH] [--port PORT] [--provision-development-identity]\n  herdogrelay update --config PATH\n  herdogrelay revoke --config PATH --app-id APP_ID\n  herdogrelay --print-default-config\n  herdogrelay --help\n  herdogrelay --version\n\nThe run command reads an iroh [iroh] configuration and keeps the endpoint alive until shutdown.\n";
 
 /// One bounded CLI operation.
 #[derive(Debug, Eq, PartialEq)]
 enum CliCommand {
-    /// Starts one configured Relay server.
+    /// Starts one configured iroh application Relay endpoint.
     Run {
         config_path: PathBuf,
         port: Option<u16>,
+        /// Explicitly provisions a generated local development identity.
+        provision_development_identity: bool,
     },
     /// Performs one explicit stable-latest local update.
     Update { config_path: PathBuf },
@@ -69,10 +73,14 @@ async fn main() {
             Ok(())
         }
         Ok(CliCommand::PrintDefaultConfig) => {
-            print!("{DEFAULT_CONFIG_TOML}");
+            print!("{DEFAULT_IROH_CONFIG_TOML}");
             Ok(())
         }
-        Ok(CliCommand::Run { config_path, port }) => run(config_path, port).await,
+        Ok(CliCommand::Run {
+            config_path,
+            port,
+            provision_development_identity,
+        }) => run_iroh(config_path, port, provision_development_identity).await,
         Ok(CliCommand::Update { config_path }) => update(config_path).await,
         Ok(CliCommand::Revoke {
             config_path,
@@ -119,7 +127,12 @@ where
     }
     let mut config_path = None;
     let mut port = None;
-    let mut index = 0;
+    let mut provision_development_identity = false;
+    let mut index = if arguments.first().is_some_and(|argument| argument == "run") {
+        1
+    } else {
+        0
+    };
     while index < arguments.len() {
         match arguments[index].as_str() {
             "--config" | "-c" => {
@@ -142,12 +155,18 @@ where
                 port = Some(parsed);
                 index += 2;
             }
+            "--provision-development-identity" => {
+                provision_development_identity = true;
+                index += 1;
+            }
             option => return Err(CliError::Usage(format!("unknown option: {option}"))),
         }
     }
     Ok(CliCommand::Run {
-        config_path: config_path.unwrap_or_else(|| PathBuf::from(".config/herdr-dog/relay.toml")),
+        config_path: config_path
+            .unwrap_or_else(|| PathBuf::from(".config/herdr-dog/iroh-relay.toml")),
         port,
+        provision_development_identity,
     })
 }
 
@@ -188,7 +207,7 @@ fn parse_control_command(arguments: &[String]) -> Result<CliCommand, CliError> {
     }
 }
 
-/// Executes one fixed-source stable-latest update and leaves restart to the supervisor/operator.
+/// Executes the retained legacy fixed-source updater path.
 async fn update(config_path: PathBuf) -> Result<(), CliError> {
     let config = RelayConfig::from_path(&config_path).map_err(CliError::Relay)?;
     require_verified_security(&config)?;
@@ -255,28 +274,56 @@ fn revoke(config_path: PathBuf, app_id: String) -> Result<(), CliError> {
     Ok(())
 }
 
-/// Loads validated configuration, binds the UDP listener and serves until termination.
-async fn run(config_path: PathBuf, port: Option<u16>) -> Result<(), CliError> {
-    let config = RelayConfig::from_path(&config_path).map_err(CliError::Relay)?;
-    require_verified_security(&config)?;
+/// Loads the iroh runtime configuration, binds the endpoint and drains it on termination.
+///
+/// The endpoint owner remains in this function until the signal branch completes, which makes
+/// Router handler drain and final endpoint-socket closure part of the CLI lifecycle.
+// TEST:relay/src/bin/herdogrelay.rs[tests::development_identity_requires_recovery_directory]
+async fn run_iroh(
+    config_path: PathBuf,
+    port: Option<u16>,
+    provision_development_identity: bool,
+) -> Result<(), CliError> {
+    let config = IrohRuntimeConfig::from_path(&config_path).map_err(CliError::Relay)?;
     let config = if let Some(port) = port {
-        config.with_port(port).map_err(CliError::Relay)?
+        config.with_bind_port(port).map_err(CliError::Relay)?
     } else {
         config
     };
-    let generation = rand::random::<u64>().max(1);
-    let server = QuicRelayServer::bind(config, generation)
+    let endpoint_config = config.to_endpoint_config().map_err(CliError::Relay)?;
+    if provision_development_identity && config.development_recovery_directory().is_none() {
+        return Err(CliError::Usage(
+            "--provision-development-identity requires development_recovery_directory".to_owned(),
+        ));
+    }
+    let verifier: Arc<dyn PairingVerifier> = match config.pairing() {
+        Some(pairing) => Arc::new(
+            HerdrWorkspacePairingVerifier::from_runtime_config(pairing)
+                .map_err(RelayError::from)
+                .map_err(CliError::Relay)?,
+        ),
+        None => Arc::new(RejectAllPairing),
+    };
+    let endpoint = if provision_development_identity {
+        IrohRelayEndpoint::provision_development_identity(endpoint_config, verifier).await
+    } else {
+        IrohRelayEndpoint::bind(endpoint_config, verifier).await
+    }
+    .map_err(RelayError::from)
+    .map_err(CliError::Relay)?;
+    eprintln!(
+        "{COMMAND_NAME}: iroh application Relay started; pairing verifier configured={}",
+        config.pairing().is_some()
+    );
+    shutdown_signal().await;
+    endpoint
+        .shutdown()
         .await
-        .map_err(CliError::Relay)?;
-    let address = server.local_addr().map_err(CliError::Relay)?;
-    eprintln!("{COMMAND_NAME}: listening on UDP {address}");
-    server
-        .serve_until(shutdown_signal())
-        .await
+        .map_err(RelayError::from)
         .map_err(CliError::Relay)
 }
 
-/// Rejects the test-only relaxed TLS mode at the production CLI boundary.
+/// Rejects the test-only relaxed TLS mode at the legacy control-command boundary.
 fn require_verified_security(config: &RelayConfig) -> Result<(), CliError> {
     if config.security().mode() != SecurityMode::Verified {
         return Err(CliError::Usage(
@@ -305,7 +352,11 @@ async fn shutdown_signal() {
 #[cfg(test)]
 mod tests {
     use super::{CliCommand, parse_args};
-    use std::path::PathBuf;
+    use std::{
+        fs,
+        path::PathBuf,
+        time::{SystemTime, UNIX_EPOCH},
+    };
 
     // TEST:relay/src/bin/herdogrelay.rs[tests::qrm_run_arguments_are_bounded]
     #[test]
@@ -314,11 +365,53 @@ mod tests {
             parse_args(["--config", "/tmp/relay.toml", "--port", "18743"]).expect("parse"),
             CliCommand::Run {
                 config_path: PathBuf::from("/tmp/relay.toml"),
-                port: Some(18_743)
+                port: Some(18_743),
+                provision_development_identity: false,
             }
         );
         assert!(parse_args(["--port", "0"]).is_err());
         assert!(parse_args(["--unknown"]).is_err());
+    }
+
+    // TEST:relay/src/bin/herdogrelay.rs[tests::development_identity_flag_is_explicit]
+    #[test]
+    fn development_identity_flag_is_explicit() {
+        let command = parse_args([
+            "run",
+            "--config",
+            "/tmp/relay.toml",
+            "--provision-development-identity",
+        ])
+        .expect("provision command");
+        assert!(matches!(
+            command,
+            CliCommand::Run {
+                provision_development_identity: true,
+                ..
+            }
+        ));
+    }
+
+    // TEST:relay/src/bin/herdogrelay.rs[tests::development_identity_requires_recovery_directory]
+    #[tokio::test(flavor = "current_thread")]
+    async fn development_identity_requires_recovery_directory() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time")
+            .as_nanos();
+        let config_path = std::env::temp_dir().join(format!(
+            "herdr-dog-relay-cli-{}-{nonce}.toml",
+            std::process::id()
+        ));
+        fs::write(&config_path, "[iroh]\n").expect("runtime config");
+        // The CLI guard runs before endpoint binding, so this remains an offline test.
+        let result = super::run_iroh(config_path.clone(), None, true).await;
+        assert!(matches!(
+            result,
+            Err(super::CliError::Usage(message))
+                if message == "--provision-development-identity requires development_recovery_directory"
+        ));
+        fs::remove_file(config_path).expect("remove runtime config");
     }
 
     // TEST:relay/src/bin/herdogrelay.rs[tests::qrm_cli_rejects_development_security]

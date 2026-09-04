@@ -10,6 +10,7 @@ use std::{
     future::Future,
     net::SocketAddr,
     pin::Pin,
+    str::FromStr,
     sync::{
         Arc, Mutex, MutexGuard,
         atomic::{AtomicU64, Ordering},
@@ -20,19 +21,21 @@ use std::{
 #[cfg(any(test, feature = "contract-test-support"))]
 use iroh::EndpointAddr;
 use iroh::{
-    Endpoint, EndpointId, RelayMode, SecretKey,
+    Endpoint, EndpointId, RelayMode, RelayUrl, SecretKey,
     endpoint::{Connection, RecvStream, SendStream, presets},
     protocol::{AcceptError, ProtocolHandler, Router},
 };
 use rand::Rng;
+use serde::{Deserialize, Serialize};
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf},
-    sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot},
+    sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot, watch},
     task::JoinSet,
     time::timeout,
 };
 
 use crate::{
+    authority_store::{AuthorityStoreError, FileAuthorityStore},
     bridge::{self, BridgeLimits},
     quic_wire::{
         HDQM_HEADER_BYTES, HDQM_MAGIC, HDQS_MAGIC, HdqmFrame, HdqmKind, HdqsBinding, HdqsReason,
@@ -56,7 +59,7 @@ const HDQM_PAYLOAD_LENGTH_BYTES: usize = std::mem::size_of::<u32>();
 /// Maximum number of accepted connections owned by one endpoint.
 pub const MAX_IROH_CONNECTIONS: usize = 1024;
 /// Maximum number of pairing records retained by one Relay process.
-pub const MAX_PAIRING_RECORDS: usize = MAX_IROH_CONNECTIONS;
+pub const MAX_PAIRING_RECORDS: usize = 64;
 /// Maximum number of failed pairing submissions retained per peer attempt window.
 pub const MAX_PAIRING_ATTEMPTS: usize = 5;
 /// Maximum number of pairing challenges one peer may start in one window.
@@ -67,6 +70,36 @@ pub const PAIRING_CHALLENGE_WINDOW: Duration = Duration::from_secs(60);
 pub const DEFAULT_CONTROL_TIMEOUT: Duration = Duration::from_secs(5);
 /// Maximum time allowed for a human to submit a code after a challenge is created.
 pub const PAIRING_CHALLENGE_TTL_SECS: u64 = 300;
+/// Host namespace for the Relay-owned iroh identity record.
+const RELAY_IDENTITY_STORAGE_KEY: &str = "herdr-dog/relay/iroh-identity";
+/// Fixed filename for the Relay-owned iroh identity record.
+const RELAY_IDENTITY_FILENAME: &str = "relay-iroh-identity.json";
+/// Record kind for the Relay-owned iroh identity.
+const RELAY_IDENTITY_RECORD_KIND: &str = "core_identity";
+/// Maximum JSON payload used by the development identity record.
+const MAX_RELAY_IDENTITY_PAYLOAD_BYTES: usize = 1024;
+/// Initial generation used by a newly created Relay identity.
+const INITIAL_IDENTITY_GENERATION: u64 = 1;
+/// Initial pairing-attempt identifier for a process with no recovered metadata.
+const INITIAL_PAIRING_ATTEMPT_ID: u64 = 1;
+/// Initial pairing-authority generation for a newly observed peer.
+const INITIAL_PAIRING_GENERATION: u64 = 1;
+/// Initial peer identity generation until the wire contract carries a newer value.
+const INITIAL_PEER_IDENTITY_GENERATION: u64 = 1;
+/// Host namespace for the Relay pairing-authority record.
+const PAIRING_AUTHORITY_STORAGE_KEY: &str = "herdr-dog/relay/iroh-pairing-authority";
+/// Fixed filename for the Relay pairing-authority record.
+const PAIRING_AUTHORITY_FILENAME: &str = "relay-iroh-pairing-authority.json";
+/// Record kind for the Relay pairing-authority record.
+const PAIRING_AUTHORITY_RECORD_KIND: &str = "pairing_authority";
+/// Host namespace for the Relay runtime-fence record.
+const RUNTIME_FENCE_STORAGE_KEY: &str = "herdr-dog/relay/iroh-runtime-fence";
+/// Fixed filename for the Relay runtime-fence record.
+const RUNTIME_FENCE_FILENAME: &str = "relay-iroh-runtime-fence.json";
+/// Record kind for the Relay runtime-fence record.
+const RUNTIME_FENCE_RECORD_KIND: &str = "runtime_fence";
+/// Maximum persisted pairing relations accepted during restart recovery.
+const MAX_PERSISTED_PAIRING_RELATIONS: usize = MAX_PAIRING_RECORDS;
 
 /// Stable HDP1 control kinds exchanged on the one control stream.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -233,9 +266,179 @@ pub enum IrohEndpointError {
     /// The iroh Router could not shut down cleanly.
     #[error("iroh Relay Router shutdown failed")]
     Shutdown,
+    /// The selected provider cannot be mapped to the local iroh runtime.
+    #[error("iroh Relay provider is unavailable")]
+    ProviderUnavailable,
+    /// A development recovery record failed closed.
+    #[error("iroh Relay authority storage failed")]
+    AuthorityStorage,
 }
 
-/// A narrow Relay-side pairing verifier.
+/// Development-only payload for the Relay-owned `core_identity` record.
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct PersistedRelayIdentity {
+    /// Public EndpointId derived from the protected private key.
+    endpoint_id: [u8; 32],
+    /// Private key bytes retained only by this explicitly insecure local profile.
+    secret_key: [u8; 32],
+}
+
+/// Own transient identity payload bytes and clear them on every return path.
+struct ZeroizingIdentityBytes(Vec<u8>);
+
+impl ZeroizingIdentityBytes {
+    /// Wrap serialized identity bytes before passing them to the local record store.
+    fn new(bytes: Vec<u8>) -> Self {
+        Self(bytes)
+    }
+
+    /// Borrow the serialized bytes for one bounded store operation.
+    fn as_slice(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+impl Drop for ZeroizingIdentityBytes {
+    /// Clear serialized identity bytes before releasing the allocation.
+    fn drop(&mut self) {
+        self.0.fill(0);
+    }
+}
+
+/// Serialize a Relay identity for the explicitly development-insecure recovery profile.
+fn encode_relay_identity(
+    secret_key: &SecretKey,
+) -> Result<ZeroizingIdentityBytes, IrohEndpointError> {
+    let mut identity = PersistedRelayIdentity {
+        endpoint_id: *secret_key.public().as_bytes(),
+        secret_key: secret_key.to_bytes(),
+    };
+    let payload = serde_json::to_vec(&identity);
+    identity.secret_key.fill(0);
+    let payload = payload.map_err(|_| IrohEndpointError::AuthorityStorage)?;
+    if payload.len() > MAX_RELAY_IDENTITY_PAYLOAD_BYTES {
+        return Err(IrohEndpointError::AuthorityStorage);
+    }
+    Ok(ZeroizingIdentityBytes::new(payload))
+}
+
+/// Decode and validate one persisted Relay identity without exposing its key or endpoint ID.
+fn decode_relay_identity(
+    record: crate::authority_store::StoredAuthorityRecord,
+) -> Result<(SecretKey, u64), IrohEndpointError> {
+    let (_revision, generation, state, payload) = record.into_parts();
+    let payload = ZeroizingIdentityBytes::new(payload);
+    if state != "active"
+        || generation == 0
+        || payload.as_slice().len() > MAX_RELAY_IDENTITY_PAYLOAD_BYTES
+    {
+        return Err(IrohEndpointError::AuthorityStorage);
+    }
+    let mut identity = serde_json::from_slice::<PersistedRelayIdentity>(payload.as_slice())
+        .map_err(|_| IrohEndpointError::AuthorityStorage)?;
+    let key = SecretKey::from_bytes(&identity.secret_key);
+    let valid = EndpointId::from_bytes(&identity.endpoint_id).is_ok()
+        && key.public().as_bytes() == &identity.endpoint_id;
+    identity.secret_key.fill(0);
+    if !valid {
+        return Err(IrohEndpointError::AuthorityStorage);
+    }
+    Ok((key, generation))
+}
+
+/// Load the Relay identity without creating a record for a missing recovery directory.
+fn load_relay_identity(
+    store: &FileAuthorityStore,
+) -> Result<Option<(SecretKey, u64)>, IrohEndpointError> {
+    store
+        .load(
+            RELAY_IDENTITY_STORAGE_KEY,
+            RELAY_IDENTITY_RECORD_KIND,
+            RELAY_IDENTITY_FILENAME,
+        )
+        .map_err(|_| IrohEndpointError::AuthorityStorage)?
+        .map(decode_relay_identity)
+        .transpose()
+}
+
+/// Load or explicitly create one Relay identity while reconciling a known first-writer race.
+fn load_or_create_relay_identity(
+    store: &FileAuthorityStore,
+    supplied: Option<&SecretKey>,
+) -> Result<(SecretKey, u64), IrohEndpointError> {
+    load_or_create_relay_identity_with_before_commit(store, supplied, |_| {})
+}
+
+/// Load or create one Relay identity with a hook immediately before the first commit.
+///
+/// The production caller supplies a no-op hook; focused tests use it to deterministically create
+/// a competing first writer and exercise the conflict-reconciliation branch.
+fn load_or_create_relay_identity_with_before_commit<F>(
+    store: &FileAuthorityStore,
+    supplied: Option<&SecretKey>,
+    before_commit: F,
+) -> Result<(SecretKey, u64), IrohEndpointError>
+where
+    F: FnOnce(&FileAuthorityStore),
+{
+    if let Some((recovered, generation)) = load_relay_identity(store)? {
+        if supplied
+            .is_some_and(|candidate| candidate.public().as_bytes() != recovered.public().as_bytes())
+        {
+            return Err(IrohEndpointError::AuthorityStorage);
+        }
+        // An implicit bind may adopt the identity won by another first writer.
+        return Ok((recovered, generation));
+    }
+
+    let Some(candidate) = supplied.cloned() else {
+        // Recovery bind is read-only for a missing identity; explicit key supply is the ensure path.
+        return Err(IrohEndpointError::AuthorityStorage);
+    };
+    let payload = encode_relay_identity(&candidate)?;
+    before_commit(store);
+    let commit = store.commit(
+        RELAY_IDENTITY_STORAGE_KEY,
+        RELAY_IDENTITY_RECORD_KIND,
+        RELAY_IDENTITY_FILENAME,
+        INITIAL_IDENTITY_GENERATION,
+        "active",
+        payload.as_slice(),
+        0,
+    );
+    drop(payload);
+    match commit {
+        Ok(_) => Ok((candidate, INITIAL_IDENTITY_GENERATION)),
+        Err(AuthorityStoreError::Conflict) => {
+            let Some((recovered, generation)) = load_relay_identity(store)? else {
+                return Err(IrohEndpointError::AuthorityStorage);
+            };
+            // Only an explicit identity is required to match the concurrent winner. An implicit
+            // bind may reuse that winner after the first-writer race.
+            if supplied.is_some() && recovered.public().as_bytes() != candidate.public().as_bytes()
+            {
+                return Err(IrohEndpointError::AuthorityStorage);
+            }
+            Ok((recovered, generation))
+        }
+        Err(_) => Err(IrohEndpointError::AuthorityStorage),
+    }
+}
+
+/// Resolve the Relay key and identity generation from the local recovery profile or an explicitly supplied key.
+fn resolve_relay_secret_key(
+    config: &IrohRelayConfig,
+    supplied: Option<SecretKey>,
+) -> Result<(SecretKey, u64), IrohEndpointError> {
+    match config.authority_store.as_ref() {
+        Some(store) => load_or_create_relay_identity(store, supplied.as_ref()),
+        None => Ok((
+            supplied.unwrap_or_else(SecretKey::generate),
+            INITIAL_IDENTITY_GENERATION,
+        )),
+    }
+}
 ///
 /// Production implementations are expected to run the fixed verification-workspace contract
 /// before returning. The code argument is transient and must never be logged, persisted or
@@ -369,6 +572,38 @@ impl HerdrWorkspacePairingVerifier {
         )
         .map_err(|_| IrohEndpointError::InvalidConfiguration {
             field: "enrollment.bootstrap_verification_cwd",
+        })?;
+        Ok(Self {
+            workspace,
+            attempts: Arc::new(tokio::sync::Mutex::new(BTreeMap::new())),
+        })
+    }
+
+    /// Construct the fixed verifier from the standalone iroh runtime configuration.
+    ///
+    /// # Parameters
+    /// * `config` - Validated socket, session and verification-cwd settings.
+    ///
+    /// # Returns
+    /// A verifier that performs only the fixed workspace create/get/close exchange.
+    pub fn from_runtime_config(
+        config: &crate::config::IrohPairingConfig,
+    ) -> Result<Self, IrohEndpointError> {
+        let verification_cwd =
+            config
+                .verification_cwd()
+                .to_str()
+                .ok_or(IrohEndpointError::InvalidConfiguration {
+                    field: "iroh.pairing.verification_cwd",
+                })?;
+        let workspace = crate::bootstrap_runtime::HerdrWorkspaceClient::new(
+            config.socket_path().to_path_buf(),
+            config.expected_uid(),
+            verification_cwd.to_owned(),
+            config.session().to_owned(),
+        )
+        .map_err(|_| IrohEndpointError::InvalidConfiguration {
+            field: "iroh.pairing",
         })?;
         Ok(Self {
             workspace,
@@ -522,6 +757,8 @@ pub struct IrohRelayConfig {
     bind_addr: Option<SocketAddr>,
     /// Relay mode selected by the Core/admin-owned provider configuration.
     relay_mode: RelayMode,
+    /// Optional local recovery store for the explicitly development-insecure profile.
+    authority_store: Option<Arc<FileAuthorityStore>>,
 }
 
 impl Default for IrohRelayConfig {
@@ -535,6 +772,7 @@ impl Default for IrohRelayConfig {
             socket_connector: None,
             bind_addr: None,
             relay_mode: RelayMode::Default,
+            authority_store: None,
         }
     }
 }
@@ -605,12 +843,64 @@ impl IrohRelayConfig {
         self
     }
 
+    /// Select a bounded custom relay map from operator-provisioned HTTPS URLs.
+    ///
+    /// # Parameters
+    /// * `relay_urls` - Nonempty approved relay URL strings.
+    ///
+    /// # Returns
+    /// The same endpoint configuration with explicit custom relay mode, or a redacted validation error.
+    pub fn with_relay_urls(mut self, relay_urls: &[String]) -> Result<Self, IrohEndpointError> {
+        if relay_urls.is_empty() || relay_urls.len() > 4 {
+            return Err(IrohEndpointError::InvalidConfiguration {
+                field: "relay_urls",
+            });
+        }
+        let parsed = relay_urls
+            .iter()
+            .map(|value| RelayUrl::from_str(value))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|_| IrohEndpointError::InvalidConfiguration {
+                field: "relay_urls",
+            })?;
+        if parsed
+            .iter()
+            .any(|url| url.scheme() != "https" || url.host_str().is_none())
+        {
+            return Err(IrohEndpointError::InvalidConfiguration {
+                field: "relay_urls",
+            });
+        }
+        self.relay_mode = RelayMode::custom(parsed);
+        Ok(self)
+    }
+
     /// Disable network-relay use for deterministic local and contract tests.
     // TEST:relay/src/iroh_endpoint.rs[tests::relay_mode_defaults_to_public_and_tests_disable_relay]
     #[cfg(any(test, feature = "contract-test-support"))]
     pub fn without_network_relay_for_test(mut self) -> Self {
         self.relay_mode = RelayMode::Disabled;
         self
+    }
+
+    /// Attach an absolute local recovery directory for task #62 validation only.
+    ///
+    /// # Parameters
+    /// * `root` - Host-selected directory for bounded pairing and runtime records.
+    ///
+    /// # Returns
+    /// The same configuration with a lazy recovery store, or a sanitized path error.
+    // TEST:relay/src/iroh_endpoint.rs[tests::relay_authority_store_round_trip]
+    pub fn with_development_recovery_dir(
+        mut self,
+        root: impl AsRef<std::path::Path>,
+    ) -> Result<Self, IrohEndpointError> {
+        self.authority_store = Some(FileAuthorityStore::open(root).map_err(|_| {
+            IrohEndpointError::InvalidConfiguration {
+                field: "development_recovery_dir",
+            }
+        })?);
+        Ok(self)
     }
 
     /// Returns the configured maximum connection count.
@@ -664,16 +954,261 @@ impl IrohRelayConfig {
 /// Pairing metadata retained for one authenticated EndpointId.
 #[derive(Clone, Copy, Debug)]
 struct PairingRecord {
-    /// Monotonic pairing generation for this peer identity.
-    generation: u64,
+    /// Monotonic pairing-authority generation for this peer identity.
+    pairing_generation: u64,
+    /// Relay identity generation that owns this relation.
+    local_identity_generation: u64,
+    /// Core identity generation observed when this relation was confirmed.
+    peer_identity_generation: u64,
     /// Whether normal session admission is currently authorized.
     paired: bool,
+    /// Whether this relation is a durable revocation tombstone.
+    revoked: bool,
+    /// Last bounded wall-clock update time for audit and recovery checks.
+    updated_at_epoch_seconds: u64,
+    /// Bounded pairing-attempt identifier associated with the last update.
+    last_attempt_id: u64,
     /// Number of failed code attempts in the current bounded challenge.
     failed_attempts: usize,
     /// Start time of the per-peer challenge-rate window.
     challenge_window_started: Instant,
     /// Number of challenge workspaces started in the current rate window.
     challenge_count: usize,
+}
+
+/// JSON payload for the persistent Relay pairing-authority record.
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct PersistedPairingAuthority {
+    /// Peer relations without transient challenge or session material.
+    relations: Vec<PersistedPairingRelation>,
+}
+
+/// One persisted Relay pairing relation.
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct PersistedPairingRelation {
+    /// Authenticated Core EndpointId bytes.
+    peer_id: [u8; 32],
+    /// Relay identity generation that owns this relation.
+    local_identity_generation: u64,
+    /// Core identity generation observed when this relation was confirmed.
+    peer_identity_generation: u64,
+    /// Monotonic pairing-authority generation.
+    pairing_generation: u64,
+    /// Durable revocation marker.
+    revoked: bool,
+    /// Last bounded wall-clock update time.
+    updated_at_epoch_seconds: u64,
+    /// Bounded pairing-attempt identifier associated with the last update.
+    last_attempt_id: u64,
+}
+
+/// Return a bounded wall-clock timestamp for persisted authority metadata.
+fn authority_timestamp() -> Result<u64, AuthorityStoreError> {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs().max(1))
+        .map_err(|_| AuthorityStoreError::Unknown)
+}
+
+/// Encode only paired or revoked relations, excluding transient connection records.
+fn encode_pairing_authority(
+    pairings: &BTreeMap<EndpointId, PairingRecord>,
+) -> Result<(Vec<u8>, u64), AuthorityStoreError> {
+    let mut aggregate_generation = 1_u64;
+    let relations = pairings
+        .iter()
+        .filter(|(_, record)| record.paired || record.revoked)
+        .map(|(peer_id, record)| {
+            if record.pairing_generation == 0
+                || record.local_identity_generation == 0
+                || record.peer_identity_generation == 0
+                || record.updated_at_epoch_seconds == 0
+                || record.last_attempt_id == 0
+            {
+                return Err(AuthorityStoreError::Invalid);
+            }
+            aggregate_generation = aggregate_generation.max(record.pairing_generation);
+            Ok(PersistedPairingRelation {
+                peer_id: *peer_id.as_bytes(),
+                local_identity_generation: record.local_identity_generation,
+                peer_identity_generation: record.peer_identity_generation,
+                pairing_generation: record.pairing_generation,
+                revoked: record.revoked,
+                updated_at_epoch_seconds: record.updated_at_epoch_seconds,
+                last_attempt_id: record.last_attempt_id,
+            })
+        })
+        .collect::<Result<Vec<_>, AuthorityStoreError>>()?;
+    if relations.len() > MAX_PERSISTED_PAIRING_RELATIONS {
+        return Err(AuthorityStoreError::Invalid);
+    }
+    let payload = serde_json::to_vec(&PersistedPairingAuthority { relations })
+        .map_err(|_| AuthorityStoreError::Invalid)?;
+    if payload.len() > crate::authority_store::MAX_AUTHORITY_PAYLOAD_BYTES {
+        return Err(AuthorityStoreError::Invalid);
+    }
+    Ok((payload, aggregate_generation))
+}
+
+/// Encode an empty Relay pairing replacement while preserving authority-generation monotonicity.
+fn encode_empty_pairing_authority(generation: u64) -> Result<(Vec<u8>, u64), AuthorityStoreError> {
+    if generation == 0 {
+        return Err(AuthorityStoreError::Unknown);
+    }
+    let payload = serde_json::to_vec(&PersistedPairingAuthority {
+        relations: Vec::new(),
+    })
+    .map_err(|_| AuthorityStoreError::Invalid)?;
+    Ok((payload, generation))
+}
+
+/// Restore persistent relations while rebuilding all challenge fields as fresh process state.
+fn restore_pairing_authority(
+    store: &FileAuthorityStore,
+    expected_local_identity_generation: u64,
+) -> Result<(BTreeMap<EndpointId, PairingRecord>, u64, u64, u64), AuthorityStoreError> {
+    if expected_local_identity_generation == 0 {
+        return Err(AuthorityStoreError::Invalid);
+    }
+    let Some(record) = store.load(
+        PAIRING_AUTHORITY_STORAGE_KEY,
+        PAIRING_AUTHORITY_RECORD_KIND,
+        PAIRING_AUTHORITY_FILENAME,
+    )?
+    else {
+        return Ok((BTreeMap::new(), 0, INITIAL_PAIRING_ATTEMPT_ID, 0));
+    };
+    let (revision, aggregate_generation, state, payload) = record.into_parts();
+    if state != "active" || aggregate_generation == 0 {
+        return Err(AuthorityStoreError::Corrupt);
+    }
+    let decoded = serde_json::from_slice::<PersistedPairingAuthority>(&payload)
+        .map_err(|_| AuthorityStoreError::Corrupt)?;
+    if decoded.relations.len() > MAX_PERSISTED_PAIRING_RELATIONS {
+        return Err(AuthorityStoreError::Corrupt);
+    }
+    // An empty relation set is an explicit committed replacement; missing storage is handled above.
+    if decoded.relations.is_empty() {
+        return Ok((
+            BTreeMap::new(),
+            revision,
+            INITIAL_PAIRING_ATTEMPT_ID,
+            aggregate_generation,
+        ));
+    }
+    let now = Instant::now();
+    let mut pairings = BTreeMap::new();
+    let mut max_generation = 0_u64;
+    let mut max_attempt_id = 0_u64;
+    let mut stale_identity_generation = false;
+    for relation in decoded.relations {
+        if relation.pairing_generation == 0
+            || relation.pairing_generation > aggregate_generation
+            || relation.peer_identity_generation == 0
+            || relation.updated_at_epoch_seconds == 0
+            || relation.last_attempt_id == 0
+        {
+            return Err(AuthorityStoreError::Corrupt);
+        }
+        stale_identity_generation |=
+            relation.local_identity_generation != expected_local_identity_generation;
+        let peer_id =
+            EndpointId::from_bytes(&relation.peer_id).map_err(|_| AuthorityStoreError::Corrupt)?;
+        if pairings
+            .insert(
+                peer_id,
+                PairingRecord {
+                    pairing_generation: relation.pairing_generation,
+                    local_identity_generation: relation.local_identity_generation,
+                    peer_identity_generation: relation.peer_identity_generation,
+                    paired: !relation.revoked,
+                    revoked: relation.revoked,
+                    updated_at_epoch_seconds: relation.updated_at_epoch_seconds,
+                    last_attempt_id: relation.last_attempt_id,
+                    failed_attempts: 0,
+                    challenge_window_started: now,
+                    challenge_count: 0,
+                },
+            )
+            .is_some()
+        {
+            return Err(AuthorityStoreError::Corrupt);
+        }
+        max_generation = max_generation.max(relation.pairing_generation);
+        max_attempt_id = max_attempt_id.max(relation.last_attempt_id);
+    }
+    if max_generation != aggregate_generation {
+        return Err(AuthorityStoreError::Corrupt);
+    }
+    if stale_identity_generation {
+        // A changed Relay identity invalidates old peer relations before endpoint bind.
+        let empty_generation = aggregate_generation
+            .checked_add(1)
+            .ok_or(AuthorityStoreError::Unknown)?;
+        let (payload, generation) = encode_empty_pairing_authority(empty_generation)?;
+        let empty = BTreeMap::new();
+        let next_revision = store.commit(
+            PAIRING_AUTHORITY_STORAGE_KEY,
+            PAIRING_AUTHORITY_RECORD_KIND,
+            PAIRING_AUTHORITY_FILENAME,
+            generation,
+            "active",
+            &payload,
+            revision,
+        )?;
+        return Ok((empty, next_revision, INITIAL_PAIRING_ATTEMPT_ID, generation));
+    }
+    let next_attempt_id = max_attempt_id
+        .checked_add(1)
+        .ok_or(AuthorityStoreError::Unknown)?;
+    Ok((pairings, revision, next_attempt_id, aggregate_generation))
+}
+
+/// Install a new process runtime fence before the Router begins accepting connections.
+fn install_runtime_fence(store: &FileAuthorityStore) -> Result<u64, IrohEndpointError> {
+    let current = store
+        .load(
+            RUNTIME_FENCE_STORAGE_KEY,
+            RUNTIME_FENCE_RECORD_KIND,
+            RUNTIME_FENCE_FILENAME,
+        )
+        .map_err(|_| IrohEndpointError::AuthorityStorage)?;
+    let (revision, previous_epoch) = match current {
+        Some(record) => {
+            let (revision, generation, state, payload) = record.into_parts();
+            if state != "active"
+                || generation == 0
+                || payload.len() != std::mem::size_of::<u64>()
+                || u64::from_be_bytes(
+                    payload
+                        .as_slice()
+                        .try_into()
+                        .map_err(|_| IrohEndpointError::AuthorityStorage)?,
+                ) != generation
+            {
+                return Err(IrohEndpointError::AuthorityStorage);
+            }
+            (revision, generation)
+        }
+        None => (0, 0),
+    };
+    let next_epoch = previous_epoch
+        .checked_add(1)
+        .ok_or(IrohEndpointError::AuthorityStorage)?;
+    store
+        .commit(
+            RUNTIME_FENCE_STORAGE_KEY,
+            RUNTIME_FENCE_RECORD_KIND,
+            RUNTIME_FENCE_FILENAME,
+            next_epoch,
+            "active",
+            &next_epoch.to_be_bytes(),
+            revision,
+        )
+        .map_err(|_| IrohEndpointError::AuthorityStorage)?;
+    Ok(next_epoch)
 }
 
 /// Active connection retained so rotation/revocation can close old authority.
@@ -694,20 +1229,57 @@ struct IrohRelayState {
     pairings: Mutex<BTreeMap<EndpointId, PairingRecord>>,
     /// One active physical connection per Core EndpointId.
     active: Mutex<BTreeMap<EndpointId, ActiveConnection>>,
+    /// Broadcasts the bounded shutdown signal to every admitted handler.
+    shutdown: watch::Sender<bool>,
+    /// Optional local recovery store for pairing and runtime-fence records.
+    authority_store: Option<Arc<FileAuthorityStore>>,
+    /// Relay identity generation that owns persisted pairing relations.
+    local_identity_generation: u64,
+    /// Next transient pairing-attempt identifier.
+    next_pairing_attempt_id: AtomicU64,
+    /// Host revision for the pairing-authority record.
+    pairing_revision: Mutex<u64>,
+    /// Aggregate generation retained when the relation map is explicitly empty.
+    pairing_authority_generation: Mutex<u64>,
+    /// Nonzero process runtime epoch loaded and advanced at startup.
+    runtime_epoch: u64,
     /// Monotonic physical connection generation source.
     next_generation: AtomicU64,
 }
 
 impl IrohRelayState {
     /// Creates empty bounded admission state.
-    fn new(max_connections: usize) -> Self {
-        Self {
-            connection_limit: Arc::new(Semaphore::new(max_connections)),
-            max_pairing_records: max_connections,
-            pairings: Mutex::new(BTreeMap::new()),
-            active: Mutex::new(BTreeMap::new()),
-            next_generation: AtomicU64::new(1),
+    fn new(
+        max_connections: usize,
+        authority_store: Option<Arc<FileAuthorityStore>>,
+        runtime_epoch: u64,
+        local_identity_generation: u64,
+    ) -> Result<Self, IrohEndpointError> {
+        if local_identity_generation == 0 {
+            return Err(IrohEndpointError::AuthorityStorage);
         }
+        let (pairings, pairing_revision, next_pairing_attempt_id, pairing_authority_generation) =
+            if let Some(store) = authority_store.as_ref() {
+                restore_pairing_authority(store, local_identity_generation)
+                    .map_err(|_| IrohEndpointError::AuthorityStorage)?
+            } else {
+                (BTreeMap::new(), 0, INITIAL_PAIRING_ATTEMPT_ID, 0)
+            };
+        let (shutdown, _) = watch::channel(false);
+        Ok(Self {
+            connection_limit: Arc::new(Semaphore::new(max_connections)),
+            max_pairing_records: max_connections.min(MAX_PAIRING_RECORDS),
+            pairings: Mutex::new(pairings),
+            active: Mutex::new(BTreeMap::new()),
+            shutdown,
+            authority_store,
+            local_identity_generation,
+            next_pairing_attempt_id: AtomicU64::new(next_pairing_attempt_id),
+            pairing_revision: Mutex::new(pairing_revision),
+            pairing_authority_generation: Mutex::new(pairing_authority_generation),
+            runtime_epoch,
+            next_generation: AtomicU64::new(1),
+        })
     }
 
     /// Reserves the one physical connection slot for a peer.
@@ -716,10 +1288,17 @@ impl IrohRelayState {
         peer: EndpointId,
         connection: Connection,
     ) -> Option<ConnectionLease> {
+        if *self.shutdown.borrow() {
+            return None;
+        }
         let permit = self.connection_limit.clone().try_acquire_owned().ok()?;
-        let generation = self.next_generation.fetch_add(1, Ordering::Relaxed);
+        let local_generation = self.next_generation.fetch_add(1, Ordering::Relaxed);
+        let generation = self
+            .runtime_epoch
+            .checked_shl(32)
+            .and_then(|epoch| epoch.checked_add(local_generation))?;
         let mut active = lock(&self.active);
-        if active.contains_key(&peer) {
+        if *self.shutdown.borrow() || active.contains_key(&peer) {
             return None;
         }
         active.insert(
@@ -744,6 +1323,29 @@ impl IrohRelayState {
             .is_some_and(|record| record.paired)
     }
 
+    /// Allocate bounded metadata for a newly observed peer without persisting transient state.
+    fn new_pairing_record(&self, now: Instant) -> Option<PairingRecord> {
+        let last_attempt_id = self
+            .next_pairing_attempt_id
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                current.checked_add(1)
+            })
+            .ok()?;
+        let updated_at_epoch_seconds = authority_timestamp().ok()?;
+        Some(PairingRecord {
+            pairing_generation: INITIAL_PAIRING_GENERATION,
+            local_identity_generation: self.local_identity_generation,
+            peer_identity_generation: INITIAL_PEER_IDENTITY_GENERATION,
+            paired: false,
+            revoked: false,
+            updated_at_epoch_seconds,
+            last_attempt_id,
+            failed_attempts: 0,
+            challenge_window_started: now,
+            challenge_count: 0,
+        })
+    }
+
     /// Reserves one explicit pairing challenge under peer and registry limits.
     fn reserve_pairing_challenge(&self, peer: EndpointId) -> bool {
         let now = Instant::now();
@@ -753,13 +1355,13 @@ impl IrohRelayState {
         if peer_is_new && pairings.len() >= self.max_pairing_records {
             return false;
         }
-        let record = pairings.entry(peer).or_insert_with(|| PairingRecord {
-            generation: 1,
-            paired: false,
-            failed_attempts: 0,
-            challenge_window_started: now,
-            challenge_count: 0,
-        });
+        if peer_is_new {
+            let Some(record) = self.new_pairing_record(now) else {
+                return false;
+            };
+            pairings.insert(peer, record);
+        }
+        let record = pairings.get_mut(&peer).expect("pairing record inserted");
         if record.paired {
             return false;
         }
@@ -782,16 +1384,10 @@ impl IrohRelayState {
             if pairings.len() >= self.max_pairing_records {
                 return false;
             }
-            pairings.insert(
-                peer,
-                PairingRecord {
-                    generation: 1,
-                    paired: false,
-                    failed_attempts: 0,
-                    challenge_window_started: Instant::now(),
-                    challenge_count: 0,
-                },
-            );
+            let Some(record) = self.new_pairing_record(Instant::now()) else {
+                return false;
+            };
+            pairings.insert(peer, record);
         }
         let record = pairings.get_mut(&peer).expect("pairing record inserted");
         if record.failed_attempts >= MAX_PAIRING_ATTEMPTS {
@@ -801,41 +1397,169 @@ impl IrohRelayState {
         record.failed_attempts < MAX_PAIRING_ATTEMPTS
     }
 
-    /// Marks a peer paired when the bounded pairing registry has capacity.
-    fn mark_paired(&self, peer: EndpointId) -> bool {
+    /// Marks a peer paired when the bounded pairing registry has capacity and persists it first.
+    fn mark_paired(&self, peer: EndpointId) -> Result<bool, AuthorityStoreError> {
         let mut pairings = lock(&self.pairings);
         if !pairings.contains_key(&peer) && pairings.len() >= self.max_pairing_records {
-            return false;
+            return Ok(false);
         }
-        let record = pairings.entry(peer).or_insert(PairingRecord {
-            generation: 0,
+        let mut candidate = pairings.clone();
+        let now = Instant::now();
+        let authority_generation = *lock(&self.pairing_authority_generation);
+        let record = candidate.entry(peer).or_insert(PairingRecord {
+            pairing_generation: 0,
+            local_identity_generation: self.local_identity_generation,
+            peer_identity_generation: INITIAL_PEER_IDENTITY_GENERATION,
             paired: false,
+            revoked: false,
+            updated_at_epoch_seconds: 0,
+            last_attempt_id: 0,
             failed_attempts: 0,
-            challenge_window_started: Instant::now(),
+            challenge_window_started: now,
             challenge_count: 0,
         });
-        record.generation = record.generation.saturating_add(1).max(1);
+        if record.paired {
+            return Ok(true);
+        }
+        record.pairing_generation = if record.pairing_generation == 0 {
+            authority_generation
+                .checked_add(1)
+                .ok_or(AuthorityStoreError::Unknown)?
+                .max(INITIAL_PAIRING_GENERATION)
+        } else {
+            record
+                .pairing_generation
+                .checked_add(1)
+                .ok_or(AuthorityStoreError::Unknown)?
+        };
+        record.local_identity_generation = self.local_identity_generation;
+        record.peer_identity_generation = record
+            .peer_identity_generation
+            .max(INITIAL_PEER_IDENTITY_GENERATION);
+        record.updated_at_epoch_seconds = authority_timestamp()?;
+        record.last_attempt_id = self
+            .next_pairing_attempt_id
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                current.checked_add(1)
+            })
+            .map_err(|_| AuthorityStoreError::Unknown)?;
         record.paired = true;
+        record.revoked = false;
         record.failed_attempts = 0;
-        true
+        let next_revision = self.commit_pairings(&candidate)?;
+        *pairings = candidate;
+        *lock(&self.pairing_revision) = next_revision;
+        Ok(true)
     }
 
-    /// Revokes a peer and closes its current connection, if any.
-    fn revoke_peer(&self, peer: EndpointId) -> bool {
-        let was_paired = lock(&self.pairings)
-            .get_mut(&peer)
-            .map(|record| {
-                let previous = record.paired;
-                record.paired = false;
-                record.generation = record.generation.saturating_add(1).max(1);
-                record.failed_attempts = 0;
-                previous
-            })
-            .unwrap_or(false);
+    /// Close the active physical connection for a peer without changing durable state.
+    fn close_active_peer(&self, peer: EndpointId) {
         if let Some(active) = lock(&self.active).get(&peer) {
-            active.connection.close(0u32.into(), b"peer revoked");
+            active
+                .connection
+                .close(0u32.into(), b"peer authority unavailable");
         }
-        was_paired
+    }
+
+    /// Revokes a peer, persists the tombstone, and closes its current connection.
+    fn revoke_peer(&self, peer: EndpointId) -> Result<bool, AuthorityStoreError> {
+        let mut pairings = lock(&self.pairings);
+        let Some(current) = pairings.get(&peer).copied() else {
+            drop(pairings);
+            self.close_active_peer(peer);
+            return Ok(false);
+        };
+        let was_paired = current.paired;
+        let mut candidate = pairings.clone();
+        let update_result = (|| {
+            if !current.revoked {
+                let record = candidate.get_mut(&peer).expect("pairing relation exists");
+                record.paired = false;
+                record.revoked = true;
+                record.pairing_generation = record
+                    .pairing_generation
+                    .checked_add(1)
+                    .ok_or(AuthorityStoreError::Unknown)?;
+                record.local_identity_generation = self.local_identity_generation;
+                record.peer_identity_generation = record
+                    .peer_identity_generation
+                    .max(INITIAL_PEER_IDENTITY_GENERATION);
+                record.updated_at_epoch_seconds = authority_timestamp()?;
+                record.last_attempt_id = self
+                    .next_pairing_attempt_id
+                    .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                        current.checked_add(1)
+                    })
+                    .map_err(|_| AuthorityStoreError::Unknown)?;
+                record.failed_attempts = 0;
+                let next_revision = self.commit_pairings(&candidate)?;
+                *pairings = candidate;
+                *lock(&self.pairing_revision) = next_revision;
+            }
+            Ok::<(), AuthorityStoreError>(())
+        })();
+        if let Err(error) = update_result {
+            // A failed/unknown revoke must lose local admission until a later reconciliation.
+            if let Some(record) = pairings.get_mut(&peer) {
+                record.paired = false;
+            }
+            drop(pairings);
+            self.close_active_peer(peer);
+            return Err(error);
+        }
+        drop(pairings);
+        self.close_active_peer(peer);
+        Ok(was_paired)
+    }
+
+    /// Persist a complete pairing relation replacement through revision CAS.
+    fn commit_pairings(
+        &self,
+        candidate: &BTreeMap<EndpointId, PairingRecord>,
+    ) -> Result<u64, AuthorityStoreError> {
+        let (payload, encoded_generation) = encode_pairing_authority(candidate)?;
+        let current_generation = *lock(&self.pairing_authority_generation);
+        let generation = if candidate.is_empty() {
+            current_generation.max(INITIAL_PAIRING_GENERATION)
+        } else {
+            if encoded_generation < current_generation {
+                return Err(AuthorityStoreError::Corrupt);
+            }
+            encoded_generation
+        };
+        let next_revision = if let Some(store) = self.authority_store.as_ref() {
+            store.commit(
+                PAIRING_AUTHORITY_STORAGE_KEY,
+                PAIRING_AUTHORITY_RECORD_KIND,
+                PAIRING_AUTHORITY_FILENAME,
+                generation,
+                "active",
+                &payload,
+                *lock(&self.pairing_revision),
+            )?
+        } else {
+            *lock(&self.pairing_revision)
+        };
+        *lock(&self.pairing_authority_generation) = generation;
+        Ok(next_revision)
+    }
+
+    /// Signals every admitted handler to send GoAway before force-close.
+    // TEST:relay/src/iroh_endpoint.rs[tests::paired_connection_survives_control_silence]
+    fn begin_shutdown(&self) {
+        let _ = self.shutdown.send(true);
+    }
+
+    /// Waits a bounded interval for signaled handlers to release their active leases.
+    // TEST:relay/src/iroh_endpoint.rs[tests::paired_connection_survives_control_silence]
+    async fn drain(&self, timeout_duration: Duration) {
+        self.begin_shutdown();
+        let _ = timeout(timeout_duration, async {
+            while self.active_count() != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await;
     }
 
     /// Returns the number of active physical Core connections.
@@ -877,7 +1601,7 @@ impl Drop for ConnectionLease {
             active.remove(&self.peer);
             if pairings
                 .get(&self.peer)
-                .is_some_and(|record| !record.paired)
+                .is_some_and(|record| !record.paired && !record.revoked)
             {
                 pairings.remove(&self.peer);
             }
@@ -909,7 +1633,7 @@ impl fmt::Debug for IrohRelayEndpoint {
 }
 
 impl IrohRelayEndpoint {
-    /// Binds an endpoint with a freshly generated disposable Relay identity.
+    /// Binds an endpoint with a disposable or development-recovered Relay identity.
     ///
     /// # Parameters
     /// * `config` - Bounded endpoint and session policy.
@@ -922,13 +1646,39 @@ impl IrohRelayEndpoint {
         config: IrohRelayConfig,
         verifier: Arc<dyn PairingVerifier>,
     ) -> Result<Self, IrohEndpointError> {
+        config.validate()?;
+        let (secret_key, identity_generation) = resolve_relay_secret_key(&config, None)?;
+        Self::bind_resolved(config, verifier, secret_key, identity_generation).await
+    }
+
+    /// Provisions a generated identity only for an explicit local development startup.
+    ///
+    /// # Parameters
+    /// * `config` - Endpoint policy with a development recovery directory.
+    /// * `verifier` - Narrow pairing verifier owned by the Relay process.
+    ///
+    /// # Returns
+    /// A running endpoint/Router pair or a redacted configuration/storage error.
+    // TEST:relay/src/iroh_endpoint.rs[tests::relay_missing_identity_requires_explicit_key]
+    // TEST:relay/src/iroh_endpoint.rs[tests::development_identity_requires_recovery_directory]
+    pub async fn provision_development_identity(
+        config: IrohRelayConfig,
+        verifier: Arc<dyn PairingVerifier>,
+    ) -> Result<Self, IrohEndpointError> {
+        if config.authority_store.is_none() {
+            return Err(IrohEndpointError::InvalidConfiguration {
+                field: "development_recovery_dir",
+            });
+        }
+        // Generate only inside the Relay boundary; the raw key is immediately consumed by bind.
         Self::bind_with_secret_key(config, verifier, SecretKey::generate()).await
     }
 
-    /// Binds an endpoint using a Core/Relay protected-storage-loaded identity.
+    /// Binds an endpoint using a protected-storage-loaded or explicitly supplied identity.
     ///
-    /// The key is consumed by iroh during endpoint construction and is never returned by this
-    /// API. Callers must load it from protected storage before invoking this method.
+    /// When the development recovery profile is configured, an existing persisted identity is
+    /// reused and an explicitly supplied key must match it. A missing record is initialized from
+    /// the supplied key before the endpoint accepts any Core connection.
     ///
     /// # Parameters
     /// * `config` - Bounded endpoint and session policy.
@@ -943,6 +1693,31 @@ impl IrohRelayEndpoint {
         secret_key: SecretKey,
     ) -> Result<Self, IrohEndpointError> {
         config.validate()?;
+        let (secret_key, identity_generation) =
+            resolve_relay_secret_key(&config, Some(secret_key))?;
+        Self::bind_resolved(config, verifier, secret_key, identity_generation).await
+    }
+
+    /// Bind an endpoint after the Relay identity has been resolved and, when selected, persisted.
+    async fn bind_resolved(
+        config: IrohRelayConfig,
+        verifier: Arc<dyn PairingVerifier>,
+        secret_key: SecretKey,
+        identity_generation: u64,
+    ) -> Result<Self, IrohEndpointError> {
+        let authority_store = config.authority_store.clone();
+        // Install and restore all durable authority before binding or accepting any endpoint.
+        let runtime_epoch = authority_store
+            .as_ref()
+            .map(|store| install_runtime_fence(store))
+            .transpose()?
+            .unwrap_or(1);
+        let state = Arc::new(IrohRelayState::new(
+            config.max_connections,
+            authority_store,
+            runtime_epoch,
+            identity_generation,
+        )?);
         // Minimal starts with relay transport disabled; apply the explicit provider mode here.
         let mut builder = Endpoint::builder(presets::Minimal)
             .secret_key(secret_key)
@@ -955,7 +1730,6 @@ impl IrohRelayEndpoint {
                 .map_err(|_| IrohEndpointError::InvalidConfiguration { field: "bind_addr" })?;
         }
         let endpoint = builder.bind().await.map_err(|_| IrohEndpointError::Bind)?;
-        let state = Arc::new(IrohRelayState::new(config.max_connections));
         let handler = IrohRelayHandler {
             config,
             state: Arc::clone(&state),
@@ -1001,20 +1775,45 @@ impl IrohRelayEndpoint {
     /// * `peer` - EndpointId whose relationship must be revoked.
     ///
     /// # Returns
-    /// `true` when an active pairing relationship was revoked.
-    pub fn revoke_peer(&self, peer: EndpointId) -> bool {
-        self.state.revoke_peer(peer)
+    /// `Ok(true)` when an active pairing was durably revoked, `Ok(false)` when none existed, or a
+    /// sanitized storage failure without claiming that revocation committed.
+    pub fn try_revoke_peer(&self, peer: EndpointId) -> Result<bool, IrohEndpointError> {
+        self.state
+            .revoke_peer(peer)
+            .map_err(|_| IrohEndpointError::AuthorityStorage)
     }
 
-    /// Drains the Router and closes the process-owned endpoint.
+    /// Revokes one EndpointId and closes its current connection authority.
+    ///
+    /// # Parameters
+    /// * `peer` - EndpointId whose relationship must be revoked.
     ///
     /// # Returns
-    /// `Ok(())` after all handler shutdown hooks complete, or a redacted shutdown error.
-    pub async fn shutdown(&self) -> Result<(), IrohEndpointError> {
-        self.router
+    /// `true` when the relation was durably revoked; storage failures fail closed as `false`.
+    pub fn revoke_peer(&self, peer: EndpointId) -> bool {
+        self.try_revoke_peer(peer).unwrap_or(false)
+    }
+
+    /// Drains all handlers and closes the owned endpoint and its sockets.
+    ///
+    /// Consuming the owner ensures the final Endpoint clone is dropped after Router handlers stop.
+    ///
+    /// # Returns
+    /// `Ok(())` after the handler drain and endpoint close, or a redacted shutdown error.
+    // TEST:relay/src/iroh_endpoint.rs[tests::paired_connection_survives_control_silence]
+    pub async fn shutdown(self) -> Result<(), IrohEndpointError> {
+        let IrohRelayEndpoint {
+            endpoint,
+            router,
+            state: _,
+        } = self;
+        let result = router
             .shutdown()
             .await
-            .map_err(|_| IrohEndpointError::Shutdown)
+            .map_err(|_| IrohEndpointError::Shutdown);
+        drop(router);
+        endpoint.close().await;
+        result
     }
 }
 
@@ -1068,8 +1867,11 @@ impl ProtocolHandler for IrohRelayHandler {
         Ok(())
     }
 
-    /// Closes no independent resource because Router owns endpoint shutdown.
-    async fn shutdown(&self) {}
+    /// Signals active handlers to send bounded GoAway frames before Router force-close.
+    // TEST:relay/src/iroh_endpoint.rs[tests::paired_connection_survives_control_silence]
+    async fn shutdown(&self) {
+        self.state.drain(self.config.control_timeout).await;
+    }
 }
 
 /// Redacted internal connection-handler failures.
@@ -1084,6 +1886,9 @@ enum IrohConnectionError {
     /// A control operation exceeded its deadline.
     #[error("iroh Relay connection deadline expired")]
     Timeout,
+    /// A persistent authority commit failed closed.
+    #[error("iroh Relay authority persistence failed")]
+    Persistence,
 }
 
 /// Runs the pairing exchange and always asks the verifier to clean up its transient challenge.
@@ -1111,6 +1916,7 @@ async fn run_connection(
 }
 
 /// Runs the one control stream and then the bounded session stream set.
+// TEST:relay/src/iroh_endpoint.rs[tests::paired_connection_survives_control_silence]
 async fn run_connection_inner(
     connection: Connection,
     peer: EndpointId,
@@ -1119,10 +1925,19 @@ async fn run_connection_inner(
     state: &Arc<IrohRelayState>,
     verifier: &Arc<dyn PairingVerifier>,
 ) -> Result<(), IrohConnectionError> {
-    let accepted = timeout(config.control_timeout, connection.accept_bi())
-        .await
-        .map_err(|_| IrohConnectionError::Timeout)?
-        .map_err(|_| IrohConnectionError::Io)?;
+    // Subscribe after admission; checking the current value closes the startup/shutdown race.
+    let mut shutdown_rx = state.shutdown.subscribe();
+    if *shutdown_rx.borrow() {
+        return Ok(());
+    }
+    let accepted = tokio::select! {
+        _ = shutdown_rx.changed() => return Ok(()),
+        accepted = timeout(config.control_timeout, connection.accept_bi()) => {
+            accepted
+                .map_err(|_| IrohConnectionError::Timeout)?
+                .map_err(|_| IrohConnectionError::Io)?
+        }
+    };
     let (mut control_send, mut control_recv) = accepted;
     let mut paired = state.is_paired(peer);
     let mut pairing_started = false;
@@ -1133,13 +1948,20 @@ async fn run_connection_inner(
         let read_timeout = pairing_submit_deadline
             .map(|deadline| deadline.saturating_duration_since(Instant::now()))
             .unwrap_or(config.control_timeout);
-        let frame = timeout(
-            read_timeout,
-            read_hdp_frame(&mut control_recv, HDP1_MAX_FRAME_BYTES),
-        )
-        .await
-        .map_err(|_| IrohConnectionError::Timeout)?
-        .map_err(|_| IrohConnectionError::Protocol)?;
+        let frame = tokio::select! {
+            _ = shutdown_rx.changed() => {
+                send_goaway(&mut control_send, config.control_timeout).await;
+                return Ok(());
+            }
+            frame = timeout(
+                read_timeout,
+                read_hdp_frame(&mut control_recv, HDP1_MAX_FRAME_BYTES),
+            ) => {
+                frame
+                    .map_err(|_| IrohConnectionError::Timeout)?
+                    .map_err(|_| IrohConnectionError::Protocol)?
+            }
+        };
         match frame.kind() {
             HdpKind::PairingStart => {
                 if pairing_started || !frame.payload.is_empty() {
@@ -1196,10 +2018,18 @@ async fn run_connection_inner(
                     .await
                     .unwrap_or(false);
                 if accepted {
-                    if !state.mark_paired(peer) {
-                        send_hdp_status(&mut control_send, HdpKind::PairingRejected, 4).await?;
-                        connection.close(0u32.into(), b"pairing capacity");
-                        return Ok(());
+                    match state.mark_paired(peer) {
+                        Ok(true) => {}
+                        Ok(false) => {
+                            send_hdp_status(&mut control_send, HdpKind::PairingRejected, 4).await?;
+                            connection.close(0u32.into(), b"pairing capacity");
+                            return Ok(());
+                        }
+                        Err(_) => {
+                            send_hdp_status(&mut control_send, HdpKind::PairingRejected, 4).await?;
+                            connection.close(0u32.into(), b"pairing persistence failed");
+                            return Err(IrohConnectionError::Persistence);
+                        }
                     }
                     paired = true;
                     send_hdp_status(&mut control_send, HdpKind::PairingAccepted, 0).await?;
@@ -1229,6 +2059,7 @@ async fn run_connection_inner(
         config,
         control_send,
         control_recv,
+        shutdown_rx,
     )
     .await
 }
@@ -1240,6 +2071,7 @@ async fn run_paired_connection(
     config: &IrohRelayConfig,
     mut control_send: SendStream,
     mut control_recv: RecvStream,
+    mut shutdown_rx: watch::Receiver<bool>,
 ) -> Result<(), IrohConnectionError> {
     let registry = Arc::new(Mutex::new(
         SessionRegistry::new(
@@ -1271,6 +2103,12 @@ async fn run_paired_connection(
     let result = async {
         loop {
             tokio::select! {
+                biased;
+                _ = shutdown_rx.changed() => {
+                    // The handler hook has already bounded this drain; this write has its own deadline.
+                    send_goaway(&mut control_send, config.control_timeout).await;
+                    break;
+                }
                 control = control_rx.recv() => {
                     let Some(frame) = control else {
                         break;
@@ -1627,6 +2465,12 @@ where
     HdqmFrame::decode(&bytes).map_err(|_| HdpFrameError::LengthMismatch)
 }
 
+/// Sends the frozen HDP1 GoAway frame under the existing control deadline.
+// TEST:relay/src/iroh_endpoint.rs[tests::paired_connection_survives_control_silence]
+async fn send_goaway(send: &mut SendStream, timeout_duration: Duration) {
+    let _ = timeout(timeout_duration, send_hdp_status(send, HdpKind::GoAway, 0)).await;
+}
+
 /// Sends one HDP1 status frame without finishing the long-lived control stream.
 async fn send_hdp_status(
     send: &mut SendStream,
@@ -1792,7 +2636,7 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use iroh::endpoint::Endpoint;
+    use crate::authority_store::AuthorityDeleteOutcome;
     use std::{
         fs,
         os::unix::fs::PermissionsExt,
@@ -1829,6 +2673,442 @@ mod tests {
         fn cancel(&self, _peer: EndpointId) -> Pin<Box<dyn Future<Output = ()> + Send>> {
             Box::pin(async {})
         }
+    }
+
+    /// Creates a unique local/generated directory for Relay recovery tests.
+    fn recovery_test_root() -> PathBuf {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let root = PathBuf::from(format!(
+            "/private/tmp/herdr-dog-relay-recovery-{}-{nonce}",
+            std::process::id()
+        ));
+        fs::create_dir(&root).expect("recovery root");
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).expect("recovery root mode");
+        root
+    }
+
+    /// Verify deletion uses revision CAS, is idempotent for missing records, and permits recreation.
+    // TEST:relay/src/authority_store.rs[FileAuthorityStore::delete]
+    #[test]
+    fn authority_store_delete_is_cas_bound_and_idempotent() {
+        let root = recovery_test_root();
+        let store = FileAuthorityStore::open(&root).expect("open delete store");
+        let key = "herdr-dog/test-delete";
+        let kind = "runtime_fence";
+        let filename = "delete-test.json";
+        let missing_root = recovery_test_root();
+        fs::remove_dir(&missing_root).expect("remove missing store root");
+        let missing_store = FileAuthorityStore::open(&missing_root).expect("open missing store");
+        assert_eq!(
+            missing_store.delete(key, kind, filename, 0),
+            Ok(AuthorityDeleteOutcome::Missing)
+        );
+        assert!(!missing_root.exists());
+        let revision = store
+            .commit(key, kind, filename, 1, "active", b"delete-me", 0)
+            .expect("initial delete record");
+        assert_eq!(revision, 1);
+        assert_eq!(
+            store.delete(key, kind, filename, 0),
+            Err(AuthorityStoreError::Conflict)
+        );
+        assert_eq!(
+            store.delete(key, kind, filename, revision),
+            Ok(AuthorityDeleteOutcome::Deleted)
+        );
+        assert!(
+            store
+                .load(key, kind, filename)
+                .expect("deleted record load")
+                .is_none()
+        );
+        assert_eq!(
+            store.delete(key, kind, filename, revision),
+            Ok(AuthorityDeleteOutcome::Missing)
+        );
+        assert_eq!(
+            store
+                .commit(key, kind, filename, 1, "active", b"recreated", 0)
+                .expect("recreate after delete"),
+            1
+        );
+        assert_eq!(
+            store.delete(key, kind, filename, 1),
+            Ok(AuthorityDeleteOutcome::Deleted)
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// Verifies pairing tombstones and runtime epochs survive Relay restarts safely.
+    // TEST:relay/src/iroh_endpoint.rs[tests::relay_authority_store_round_trip]
+    #[tokio::test(flavor = "current_thread")]
+    async fn relay_authority_store_round_trip() {
+        let root = recovery_test_root();
+        let config = IrohRelayConfig::new(4, 4, DEFAULT_CONTROL_TIMEOUT)
+            .expect("bounded config")
+            .without_network_relay_for_test()
+            .with_bind_addr(
+                "127.0.0.1:0"
+                    .parse::<SocketAddr>()
+                    .expect("loopback address"),
+            )
+            .with_development_recovery_dir(&root)
+            .expect("recovery directory");
+        let peer = SecretKey::generate().public();
+        let relay_secret_key = SecretKey::generate();
+
+        let first = IrohRelayEndpoint::bind_with_secret_key(
+            config.clone(),
+            Arc::new(FakePairingVerifier),
+            relay_secret_key,
+        )
+        .await
+        .expect("first Relay bind");
+        let first_endpoint_id = first.endpoint_id();
+        assert_eq!(first.state.runtime_epoch, 1);
+        assert!(
+            first
+                .state
+                .mark_paired(peer)
+                .expect("persist first pairing")
+        );
+        assert_eq!(first.paired_peer_count(), 1);
+        first.shutdown().await.expect("first Relay shutdown");
+
+        let second = IrohRelayEndpoint::bind(config.clone(), Arc::new(FakePairingVerifier))
+            .await
+            .expect("restart Relay bind");
+        assert_eq!(second.endpoint_id(), first_endpoint_id);
+        assert_eq!(second.state.runtime_epoch, 2);
+        assert_eq!(second.paired_peer_count(), 1);
+        let restored_relation = lock(&second.state.pairings)[&peer];
+        assert_eq!(
+            restored_relation.local_identity_generation,
+            second.state.local_identity_generation
+        );
+        assert_eq!(
+            restored_relation.peer_identity_generation,
+            INITIAL_PEER_IDENTITY_GENERATION
+        );
+        assert_eq!(restored_relation.pairing_generation, 1);
+        assert!(restored_relation.updated_at_epoch_seconds > 0);
+        assert!(restored_relation.last_attempt_id > 0);
+        assert_eq!(*lock(&second.state.pairing_revision), 1);
+        assert!(second.try_revoke_peer(peer).expect("persist revocation"));
+        assert_eq!(second.paired_peer_count(), 0);
+        second.shutdown().await.expect("second Relay shutdown");
+
+        let third = IrohRelayEndpoint::bind(config, Arc::new(FakePairingVerifier))
+            .await
+            .expect("revoked restart Relay bind");
+        assert_eq!(third.state.runtime_epoch, 3);
+        assert_eq!(third.paired_peer_count(), 0);
+        assert_eq!(lock(&third.state.pairings).len(), 1);
+        assert!(!third.state.is_paired(peer));
+        third.shutdown().await.expect("third Relay shutdown");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// Verifies an explicit empty pairing replacement survives restart as distinct from missing state.
+    // TEST:relay/src/iroh_endpoint.rs[tests::empty_pairing_authority_replacement_recovers]
+    #[test]
+    fn empty_pairing_authority_replacement_recovers() {
+        let root = recovery_test_root();
+        let store = FileAuthorityStore::open(&root).expect("open pairing store");
+        let pairings = BTreeMap::new();
+        let (payload, generation) = encode_pairing_authority(&pairings).expect("encode empty set");
+        let revision = store
+            .commit(
+                PAIRING_AUTHORITY_STORAGE_KEY,
+                PAIRING_AUTHORITY_RECORD_KIND,
+                PAIRING_AUTHORITY_FILENAME,
+                generation,
+                "active",
+                &payload,
+                0,
+            )
+            .expect("persist empty relation set");
+        let (restored, restored_revision, next_attempt_id, generation) =
+            restore_pairing_authority(&store, INITIAL_IDENTITY_GENERATION)
+                .expect("restore empty relation set");
+        assert_eq!(generation, 1);
+        assert_eq!(next_attempt_id, INITIAL_PAIRING_ATTEMPT_ID);
+        assert!(restored.is_empty());
+        assert_eq!(restored_revision, revision);
+        fs::remove_dir_all(root).expect("pairing recovery cleanup");
+    }
+
+    /// Verifies stale pairing relations are replaced when the Relay identity generation changes.
+    // TEST:relay/src/iroh_endpoint.rs[tests::stale_pairing_authority_is_replaced]
+    #[test]
+    fn stale_pairing_authority_is_replaced() {
+        let root = recovery_test_root();
+        let store = FileAuthorityStore::open(&root).expect("open stale pairing store");
+        let peer = SecretKey::generate().public();
+        let mut pairings = BTreeMap::new();
+        pairings.insert(
+            peer,
+            PairingRecord {
+                pairing_generation: 1,
+                local_identity_generation: 1,
+                peer_identity_generation: INITIAL_PEER_IDENTITY_GENERATION,
+                paired: true,
+                revoked: false,
+                updated_at_epoch_seconds: 1,
+                last_attempt_id: 1,
+                failed_attempts: 0,
+                challenge_window_started: Instant::now(),
+                challenge_count: 0,
+            },
+        );
+        let (payload, generation) = encode_pairing_authority(&pairings).expect("encode stale");
+        assert_eq!(
+            store
+                .commit(
+                    PAIRING_AUTHORITY_STORAGE_KEY,
+                    PAIRING_AUTHORITY_RECORD_KIND,
+                    PAIRING_AUTHORITY_FILENAME,
+                    generation,
+                    "active",
+                    &payload,
+                    0,
+                )
+                .expect("persist stale relation"),
+            1
+        );
+        let (restored, revision, next_attempt_id, generation) =
+            restore_pairing_authority(&store, 2).expect("replace stale relation");
+        assert_eq!(generation, 2);
+        assert!(restored.is_empty());
+        assert_eq!(revision, 2);
+        assert_eq!(next_attempt_id, INITIAL_PAIRING_ATTEMPT_ID);
+        let record = store
+            .load(
+                PAIRING_AUTHORITY_STORAGE_KEY,
+                PAIRING_AUTHORITY_RECORD_KIND,
+                PAIRING_AUTHORITY_FILENAME,
+            )
+            .expect("load replacement")
+            .expect("replacement record");
+        let (_revision, generation, state, payload) = record.into_parts();
+        let decoded = serde_json::from_slice::<PersistedPairingAuthority>(&payload)
+            .expect("decode replacement");
+        assert_eq!(generation, 2);
+        assert_eq!(state, "active");
+        assert!(decoded.relations.is_empty());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// Verifies the persisted pairing bound and control-frame debug redaction.
+    // TEST:relay/src/iroh_endpoint.rs[tests::pairing_authority_capacity_and_redaction]
+    #[test]
+    fn pairing_authority_capacity_and_redaction() {
+        let mut pairings = BTreeMap::new();
+        for index in 0..=MAX_PERSISTED_PAIRING_RELATIONS {
+            let mut bytes = [0_u8; 32];
+            bytes[..8].copy_from_slice(&(index as u64 + 1).to_be_bytes());
+            bytes[8] = 0x5a;
+            let peer = SecretKey::from_bytes(&bytes).public();
+            pairings.insert(
+                peer,
+                PairingRecord {
+                    pairing_generation: index as u64 + 1,
+                    local_identity_generation: INITIAL_IDENTITY_GENERATION,
+                    peer_identity_generation: INITIAL_PEER_IDENTITY_GENERATION,
+                    paired: true,
+                    revoked: false,
+                    updated_at_epoch_seconds: 1,
+                    last_attempt_id: index as u64 + 1,
+                    failed_attempts: 0,
+                    challenge_window_started: Instant::now(),
+                    challenge_count: 0,
+                },
+            );
+        }
+        assert_eq!(
+            encode_pairing_authority(&pairings),
+            Err(AuthorityStoreError::Invalid)
+        );
+        let frame = HdpFrame::new(HdpKind::PairingSubmit, b"123456");
+        let debug = format!("{frame:?}");
+        assert!(!debug.contains("123456"));
+        assert!(!debug.contains("payload:"));
+    }
+
+    /// Verifies malformed persisted pairing data fails closed before admission.
+    // TEST:relay/src/iroh_endpoint.rs[tests::pairing_authority_rejects_corrupt_payload]
+    #[test]
+    fn pairing_authority_rejects_corrupt_payload() {
+        let root = recovery_test_root();
+        let store = FileAuthorityStore::open(&root).expect("open corrupt pairing store");
+        store
+            .commit(
+                PAIRING_AUTHORITY_STORAGE_KEY,
+                PAIRING_AUTHORITY_RECORD_KIND,
+                PAIRING_AUTHORITY_FILENAME,
+                INITIAL_PAIRING_GENERATION,
+                "active",
+                b"not-json",
+                0,
+            )
+            .expect("persist malformed pairing payload");
+        assert!(matches!(
+            restore_pairing_authority(&store, INITIAL_IDENTITY_GENERATION),
+            Err(AuthorityStoreError::Corrupt)
+        ));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// Verifies an explicit key cannot replace a different development-recovered identity.
+    // TEST:relay/src/iroh_endpoint.rs[tests::relay_identity_rejects_mismatched_supplied_key]
+    #[tokio::test(flavor = "current_thread")]
+    async fn relay_identity_rejects_mismatched_supplied_key() {
+        let root = recovery_test_root();
+        let config = IrohRelayConfig::new(4, 4, DEFAULT_CONTROL_TIMEOUT)
+            .expect("bounded config")
+            .without_network_relay_for_test()
+            .with_bind_addr(
+                "127.0.0.1:0"
+                    .parse::<SocketAddr>()
+                    .expect("loopback address"),
+            )
+            .with_development_recovery_dir(&root)
+            .expect("recovery directory");
+        let first = IrohRelayEndpoint::bind_with_secret_key(
+            config.clone(),
+            Arc::new(FakePairingVerifier),
+            SecretKey::generate(),
+        )
+        .await
+        .expect("first Relay bind");
+        first.shutdown().await.expect("first Relay shutdown");
+
+        let result = IrohRelayEndpoint::bind_with_secret_key(
+            config,
+            Arc::new(FakePairingVerifier),
+            SecretKey::generate(),
+        )
+        .await;
+        assert!(matches!(result, Err(IrohEndpointError::AuthorityStorage)));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// Verifies first-writer conflict reconciliation adopts the matching committed identity.
+    // TEST:relay/src/iroh_endpoint.rs[tests::relay_identity_first_writer_conflict_adopts_matching_key]
+    #[test]
+    fn relay_identity_first_writer_conflict_adopts_matching_key() {
+        let root = recovery_test_root();
+        let store = FileAuthorityStore::open(&root).expect("open identity store");
+        let candidate = SecretKey::generate();
+        let competing = candidate.clone();
+        let (recovered, generation) =
+            load_or_create_relay_identity_with_before_commit(&store, Some(&candidate), |store| {
+                let payload = encode_relay_identity(&competing).expect("encode competing identity");
+                store
+                    .commit(
+                        RELAY_IDENTITY_STORAGE_KEY,
+                        RELAY_IDENTITY_RECORD_KIND,
+                        RELAY_IDENTITY_FILENAME,
+                        INITIAL_IDENTITY_GENERATION,
+                        "active",
+                        payload.as_slice(),
+                        0,
+                    )
+                    .expect("commit competing first writer");
+            })
+            .expect("reconcile first-writer conflict");
+        assert_eq!(recovered.public(), candidate.public());
+        assert_eq!(generation, INITIAL_IDENTITY_GENERATION);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// Verifies missing recovery identity requires explicit development provisioning.
+    // TEST:relay/src/iroh_endpoint.rs[tests::relay_missing_identity_requires_explicit_key]
+    #[tokio::test(flavor = "current_thread")]
+    async fn relay_missing_identity_requires_explicit_key() {
+        let root = recovery_test_root();
+        let config = IrohRelayConfig::new(4, 4, DEFAULT_CONTROL_TIMEOUT)
+            .expect("bounded config")
+            .without_network_relay_for_test()
+            .with_bind_addr(
+                "127.0.0.1:0"
+                    .parse::<SocketAddr>()
+                    .expect("loopback address"),
+            )
+            .with_development_recovery_dir(&root)
+            .expect("recovery directory");
+        assert!(matches!(
+            IrohRelayEndpoint::bind(config.clone(), Arc::new(FakePairingVerifier)).await,
+            Err(IrohEndpointError::AuthorityStorage)
+        ));
+        let endpoint = IrohRelayEndpoint::provision_development_identity(
+            config,
+            Arc::new(FakePairingVerifier),
+        )
+        .await
+        .expect("explicit identity creation");
+        endpoint.shutdown().await.expect("shutdown Relay");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// Verifies explicit development provisioning rejects a missing recovery directory.
+    // TEST:relay/src/iroh_endpoint.rs[tests::development_identity_requires_recovery_directory]
+    #[tokio::test(flavor = "current_thread")]
+    async fn development_identity_requires_recovery_directory() {
+        let config = IrohRelayConfig::default()
+            .without_network_relay_for_test()
+            .with_bind_addr(
+                "127.0.0.1:0"
+                    .parse::<SocketAddr>()
+                    .expect("loopback address"),
+            );
+        let result = IrohRelayEndpoint::provision_development_identity(
+            config,
+            Arc::new(FakePairingVerifier),
+        )
+        .await;
+        assert!(matches!(
+            result,
+            Err(IrohEndpointError::InvalidConfiguration {
+                field: "development_recovery_dir"
+            })
+        ));
+    }
+
+    /// Verifies a corrupt persisted identity blocks Relay startup rather than generating a fallback.
+    // TEST:relay/src/iroh_endpoint.rs[tests::relay_identity_corruption_fails_closed]
+    #[tokio::test(flavor = "current_thread")]
+    async fn relay_identity_corruption_fails_closed() {
+        let root = recovery_test_root();
+        let record_path = root.join(RELAY_IDENTITY_FILENAME);
+        fs::write(&record_path, b"{}").expect("corrupt identity record");
+        fs::set_permissions(&record_path, fs::Permissions::from_mode(0o600))
+            .expect("identity record mode");
+        let config = IrohRelayConfig::new(4, 4, DEFAULT_CONTROL_TIMEOUT)
+            .expect("bounded config")
+            .without_network_relay_for_test()
+            .with_bind_addr(
+                "127.0.0.1:0"
+                    .parse::<SocketAddr>()
+                    .expect("loopback address"),
+            )
+            .with_development_recovery_dir(&root)
+            .expect("recovery directory");
+        let result = IrohRelayEndpoint::bind(config, Arc::new(FakePairingVerifier)).await;
+        assert!(matches!(result, Err(IrohEndpointError::AuthorityStorage)));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// Verifies a large connection limit cannot expand the persisted pairing-record bound.
+    // TEST:relay/src/iroh_endpoint.rs[tests::pairing_registry_cap_is_fixed]
+    #[test]
+    fn pairing_registry_cap_is_fixed() {
+        let state = IrohRelayState::new(MAX_IROH_CONNECTIONS, None, 1, INITIAL_IDENTITY_GENERATION)
+            .expect("test state");
+        assert_eq!(state.max_pairing_records, MAX_PAIRING_RECORDS);
     }
 
     /// Creates a loopback-only client endpoint for the endpoint integration tests.
@@ -2095,8 +3375,7 @@ mod tests {
         server.shutdown().await.expect("shutdown relay endpoint");
     }
 
-    /// Verifies a paired connection stays alive when no control frame is sent during the old
-    /// control-timeout interval.
+    /// Verifies a paired connection stays alive during control silence and receives shutdown GoAway.
     // TEST:relay/src/iroh_endpoint.rs[tests::paired_connection_survives_control_silence]
     #[tokio::test(flavor = "current_thread")]
     async fn paired_connection_survives_control_silence() {
@@ -2145,9 +3424,16 @@ mod tests {
         );
         tokio::time::sleep(Duration::from_millis(100)).await;
         assert_eq!(server.active_connection_count(), 1);
-        connection.close(0u32.into(), b"test");
+        let shutdown = tokio::spawn(async move { server.shutdown().await });
+        let goaway = tokio::time::timeout(Duration::from_secs(1), read_control_frame(&mut recv))
+            .await
+            .expect("bounded GoAway delivery");
+        assert_eq!(goaway.kind(), HdpKind::GoAway);
+        shutdown
+            .await
+            .expect("shutdown task")
+            .expect("shutdown relay endpoint");
         connection.closed().await;
-        server.shutdown().await.expect("shutdown relay endpoint");
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -2327,7 +3613,8 @@ mod tests {
     // TEST:relay/src/iroh_endpoint.rs[tests::pairing_challenge_rate_is_bounded]
     #[test]
     fn pairing_challenge_rate_is_bounded() {
-        let state = IrohRelayState::new(4);
+        let state =
+            IrohRelayState::new(4, None, 1, INITIAL_IDENTITY_GENERATION).expect("test state");
         let peer = SecretKey::generate().public();
 
         for _ in 0..MAX_PAIRING_CHALLENGES_PER_WINDOW {
@@ -2346,7 +3633,8 @@ mod tests {
     // TEST:relay/src/iroh_endpoint.rs[tests::pairing_registry_is_bounded]
     #[test]
     fn pairing_registry_is_bounded() {
-        let state = IrohRelayState::new(1);
+        let state =
+            IrohRelayState::new(1, None, 1, INITIAL_IDENTITY_GENERATION).expect("test state");
         let first = SecretKey::generate().public();
         let second = SecretKey::generate().public();
         assert!(state.record_pairing_failure(first));
@@ -2425,6 +3713,73 @@ mod tests {
         second_connection.close(0u32.into(), b"test disconnect");
         second_connection.closed().await;
         server.shutdown().await.expect("shutdown relay endpoint");
+    }
+
+    /// Verifies failed durable revocation closes the peer and does not claim success.
+    // TEST:relay/src/iroh_endpoint.rs[tests::revoke_failure_closes_active_peer_without_claiming_success]
+    #[tokio::test(flavor = "current_thread")]
+    async fn revoke_failure_closes_active_peer_without_claiming_success() {
+        let root = recovery_test_root();
+        let config = IrohRelayConfig::default()
+            .without_network_relay_for_test()
+            .with_bind_addr(
+                "127.0.0.1:0"
+                    .parse::<SocketAddr>()
+                    .expect("loopback address"),
+            )
+            .with_development_recovery_dir(&root)
+            .expect("recovery directory");
+        let server = IrohRelayEndpoint::bind_with_secret_key(
+            config,
+            Arc::new(FakePairingVerifier),
+            SecretKey::generate(),
+        )
+        .await
+        .expect("bind relay endpoint");
+        let client = client_endpoint().await;
+        let connection = client
+            .connect(server.endpoint_addr(), IROH_RELAY_ALPN)
+            .await
+            .expect("connect relay endpoint");
+        let (mut send, mut recv) = connection.open_bi().await.expect("control stream");
+        send.write_all(
+            &HdpFrame::new(HdpKind::PairingStart, Vec::new())
+                .encode()
+                .expect("pairing start"),
+        )
+        .await
+        .expect("write pairing start");
+        assert_eq!(
+            read_control_frame(&mut recv).await.kind(),
+            HdpKind::PairingRejected
+        );
+        send.write_all(
+            &HdpFrame::new(HdpKind::PairingSubmit, b"123456".to_vec())
+                .encode()
+                .expect("pairing submit"),
+        )
+        .await
+        .expect("write pairing submit");
+        assert_eq!(
+            read_control_frame(&mut recv).await.kind(),
+            HdpKind::PairingAccepted
+        );
+        assert_eq!(
+            read_control_frame(&mut recv).await.kind(),
+            HdpKind::ConnectionReady
+        );
+        assert_eq!(server.paired_peer_count(), 1);
+
+        // Force a stale expected revision to model a failed/uncertain durable revoke.
+        *lock(&server.state.pairing_revision) = 0;
+        assert_eq!(
+            server.try_revoke_peer(client.id()),
+            Err(IrohEndpointError::AuthorityStorage)
+        );
+        assert_eq!(server.paired_peer_count(), 0);
+        connection.closed().await;
+        server.shutdown().await.expect("shutdown relay endpoint");
+        let _ = fs::remove_dir_all(root);
     }
 
     /// Verifies revocation clears pairing state and closes the active connection.

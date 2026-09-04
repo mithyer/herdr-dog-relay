@@ -1,23 +1,23 @@
 # herdogrelay
 
-`herdogrelay` is a secure, device-scoped QUIC relay for connecting Core to Herdr sessions on a remote machine.
+`herdogrelay` is an iroh application Relay for connecting Core to Herdr sessions on a remote machine.
 
 ## What it does
 
-- Serves one configurable UDP endpoint for one remote Herdr device.
-- Maintains one authenticated QUIC connection per device.
-- Provides one control stream and isolated session streams.
+- Owns one iroh `Endpoint` and `Router` for bounded Core connections.
+- Authenticates peers with iroh `EndpointId` and the fixed application ALPN `herdr-dog-iroh/1`.
+- Provides one control stream and isolated session streams per Core connection.
 - Validates session authority and the destination Herdr Unix socket before forwarding data.
 - Supports bounded resource usage and fail-closed connection handling.
 - Runs as a user-level service on supported macOS and Linux environments.
 
 ## Security model
 
-- QUIC TLS 1.3 is always used.
-- Production deployments require certificate verification and mutual TLS.
-- The Relay uses the fixed ALPN `herdr-dog-relay-quic/1`.
-- Session failures are isolated from other sessions on the same device.
-- Credentials, session tokens and private key material are not included in releases or logged by the Relay.
+- `EndpointTicket` is bootstrap input; application pairing is required before normal sessions are admitted.
+- The application Relay is separate from iroh network-relay infrastructure.
+- The iroh runtime has no certificate or Quinn fallback.
+- `herdogrelay run` without `development_recovery_directory` uses a per-process disposable generated identity with no restart persistence for local development/tests only. Store-backed startup is the path for restart-safe local recovery; missing or corrupt records remain fail-closed.
+- Credentials, session tokens and private key material are not returned in status or logged by the Relay.
 
 ## Protocol boundary
 
@@ -31,7 +31,7 @@ Published releases currently target supported macOS and Linux architectures list
 
 ## Installation and releases
 
-Installers and release archives are published with the project releases. Use the release instructions and configuration template that match the installed version. Certificate and private-key material must be provisioned separately and must never be copied into the repository or release archive.
+Installers and release archives are published with the project releases. Use the release instructions and iroh configuration template that match the installed version. Inspect the template with `herdogrelay --print-default-config`; a user-level run uses `herdogrelay --config ~/.config/herdr-dog/iroh-relay.toml`. Do not place credentials, tickets, pairing codes or private key material in the repository or release archive.
 
 ## Limitations
 

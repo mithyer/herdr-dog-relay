@@ -971,14 +971,21 @@ mod tests {
     };
     use tar::{Builder, EntryType, Header};
 
-    /// Builds one enabled updater policy rooted in an isolated temporary directory.
+    /// Builds a unique private updater root even when tests start within one clock tick.
     fn updater() -> (FixedSourceUpdater, PathBuf) {
-        let suffix = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("time")
-            .as_nanos();
-        let directory = std::env::temp_dir().join(format!("herdr-dog-updater-{suffix}"));
-        fs::create_dir(&directory).expect("directory");
+        let directory = (0..32)
+            .map(|attempt| {
+                let suffix = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .expect("time")
+                    .as_nanos();
+                std::env::temp_dir().join(format!(
+                    "herdr-dog-updater-{}-{suffix}-{attempt}",
+                    std::process::id()
+                ))
+            })
+            .find(|path| fs::create_dir(path).is_ok())
+            .expect("directory");
         fs::set_permissions(&directory, fs::Permissions::from_mode(0o700)).expect("directory mode");
         let config = UpdateConfig::from_toml_for_test(directory.clone());
         let mut updater = FixedSourceUpdater::new(config).expect("updater");

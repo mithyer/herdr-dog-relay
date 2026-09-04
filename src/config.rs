@@ -3,7 +3,11 @@
 //! The configuration has one generic UDP listener and one QUIC TLS policy. Network classes and
 //! per-session port/process settings are intentionally absent from this public shape.
 
-use crate::error::{RelayError, RelayResult};
+use crate::{
+    error::{RelayError, RelayResult},
+    iroh_endpoint::IrohRelayConfig,
+    socket::UnixSocketConnector,
+};
 use serde::{Deserialize, Deserializer, de::Error as _};
 use std::{
     fs,
@@ -11,8 +15,454 @@ use std::{
     path::{Path, PathBuf},
 };
 
-/// The complete commented QRM configuration template.
+/// Default TOML template for the legacy certificate-era CLI commands.
+///
+/// The iroh `run` command uses [`DEFAULT_IROH_CONFIG_TOML`] instead; this constant remains for
+/// callers that still need to inspect the retired update/revoke configuration template.
 pub const DEFAULT_CONFIG_TOML: &str = include_str!("../config/default.toml");
+/// Default TOML template for the iroh application Relay runtime.
+pub const DEFAULT_IROH_CONFIG_TOML: &str = include_str!("../config/iroh-default.toml");
+
+/// Provider profile selected by Core/admin provisioning for the application Relay.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum IrohRelayProvider {
+    /// Shared n0 public relays requiring no user-owned configuration.
+    OfficialPublic,
+    /// Iroh Services dedicated relays requiring a provisioned project secret reference.
+    OfficialManaged,
+    /// Operator-provided dedicated relays configured by the deployment owner.
+    SelfHosted,
+}
+
+/// Fixed Herdr workspace verifier settings for the iroh Relay pairing path.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct IrohPairingConfig {
+    /// Absolute Herdr Unix socket path used by the fixed verifier.
+    socket_path: PathBuf,
+    /// Expected owner UID for the Herdr Unix socket.
+    expected_uid: u32,
+    /// Normalized Herdr session used for verification workspaces.
+    session: String,
+    /// Protected absolute cwd supplied to verification workspaces.
+    verification_cwd: PathBuf,
+}
+
+impl IrohPairingConfig {
+    /// Return the configured Herdr Unix socket path.
+    pub fn socket_path(&self) -> &Path {
+        &self.socket_path
+    }
+
+    /// Return the expected Herdr Unix socket owner UID.
+    pub const fn expected_uid(&self) -> u32 {
+        self.expected_uid
+    }
+
+    /// Return the normalized Herdr verification session.
+    pub fn session(&self) -> &str {
+        &self.session
+    }
+
+    /// Return the protected absolute verification cwd.
+    pub fn verification_cwd(&self) -> &Path {
+        &self.verification_cwd
+    }
+}
+
+/// Provider and lifecycle configuration for the iroh application Relay runtime.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct IrohRuntimeConfig {
+    /// Local IP and port used by the application Relay endpoint.
+    #[serde(default = "default_iroh_bind_address")]
+    bind_address: String,
+    /// Core/admin-selected network-relay provider profile.
+    #[serde(default = "default_iroh_provider")]
+    provider: IrohRelayProvider,
+    /// Bounded provisioned relay URL list for managed or self-hosted profiles.
+    #[serde(default)]
+    relay_urls: Vec<String>,
+    /// Protected reference for an official managed project API key.
+    #[serde(default)]
+    api_secret_ref: Option<String>,
+    /// Protected reference for a self-hosted access token, when required by its mode.
+    #[serde(default)]
+    access_token_ref: Option<String>,
+    /// Maximum active Core connections accepted by the application Relay.
+    #[serde(default = "default_iroh_max_connections")]
+    max_connections: usize,
+    /// Maximum active session streams permitted per Core connection.
+    #[serde(default = "default_iroh_max_sessions")]
+    max_sessions_per_connection: usize,
+    /// Ordinary control-stream timeout in seconds.
+    #[serde(default = "default_iroh_control_timeout_secs")]
+    control_timeout_secs: u64,
+    /// Nonzero Relay identity generation for the runtime.
+    #[serde(default = "default_iroh_generation")]
+    relay_generation: u64,
+    /// Optional development-only local authority directory.
+    #[serde(default)]
+    development_recovery_directory: Option<PathBuf>,
+    /// Optional fixed Herdr workspace verifier configuration.
+    #[serde(default)]
+    pairing: Option<IrohPairingConfig>,
+}
+
+/// Top-level TOML wrapper for the iroh runtime configuration file.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct IrohRuntimeFile {
+    /// Nested iroh runtime settings.
+    iroh: IrohRuntimeConfig,
+}
+
+/// Default bind address for a local iroh application Relay.
+fn default_iroh_bind_address() -> String {
+    "127.0.0.1:18743".to_owned()
+}
+
+/// Default provider profile for development and public interoperability checks.
+fn default_iroh_provider() -> IrohRelayProvider {
+    IrohRelayProvider::OfficialPublic
+}
+
+/// Default bounded Core connection capacity.
+fn default_iroh_max_connections() -> usize {
+    64
+}
+
+/// Default bounded session-stream capacity.
+fn default_iroh_max_sessions() -> usize {
+    64
+}
+
+/// Default ordinary iroh control timeout.
+fn default_iroh_control_timeout_secs() -> u64 {
+    5
+}
+
+/// Default nonzero Relay identity generation.
+fn default_iroh_generation() -> u64 {
+    1
+}
+
+impl IrohRuntimeConfig {
+    /// Parse and validate an iroh runtime TOML document.
+    ///
+    /// # Parameters
+    /// * `contents` - TOML document containing one `[iroh]` section.
+    ///
+    /// # Returns
+    /// A bounded runtime configuration or a redacted configuration error.
+    // TEST:relay/src/config.rs[tests::iroh_runtime_configuration_matrix]
+    pub fn from_toml_str(contents: &str) -> RelayResult<Self> {
+        let file = toml::from_str::<IrohRuntimeFile>(contents)
+            .map_err(|_| RelayError::ConfigurationSyntax)?;
+        file.iroh.validate()?;
+        Ok(file.iroh)
+    }
+
+    /// Read and validate an iroh runtime TOML file.
+    ///
+    /// # Parameters
+    /// * `path` - Configuration file path.
+    ///
+    /// # Returns
+    /// A bounded runtime configuration or a redacted read/validation error.
+    pub fn from_path(path: &Path) -> RelayResult<Self> {
+        let contents = fs::read_to_string(path).map_err(|_| RelayError::ConfigurationRead)?;
+        Self::from_toml_str(&contents)
+    }
+
+    /// Override the configured bind port for a command-line invocation.
+    ///
+    /// # Parameters
+    /// * `port` - Port selected by the caller; zero keeps an ephemeral listener valid for tests.
+    ///
+    /// # Returns
+    /// A validated configuration with the same bind address and the requested port.
+    pub fn with_bind_port(mut self, port: u16) -> RelayResult<Self> {
+        let address = self.bind_address.parse::<SocketAddr>().map_err(|_| {
+            RelayError::InvalidConfiguration {
+                field: "iroh.bind_address",
+                reason: "must be a socket address",
+            }
+        })?;
+        self.bind_address = SocketAddr::new(address.ip(), port).to_string();
+        self.validate()?;
+        Ok(self)
+    }
+
+    /// Return the configured bind address.
+    pub fn bind_address(&self) -> RelayResult<SocketAddr> {
+        self.bind_address
+            .parse::<SocketAddr>()
+            .map_err(|_| RelayError::InvalidConfiguration {
+                field: "iroh.bind_address",
+                reason: "must be a socket address",
+            })
+    }
+
+    /// Return the selected network-relay provider.
+    pub const fn provider(&self) -> IrohRelayProvider {
+        self.provider
+    }
+
+    /// Return the bounded provisioned relay URLs.
+    pub fn relay_urls(&self) -> &[String] {
+        &self.relay_urls
+    }
+
+    /// Report whether an official managed API-key reference was configured.
+    pub fn has_api_secret_ref(&self) -> bool {
+        self.api_secret_ref.is_some()
+    }
+
+    /// Report whether a self-hosted access-token reference was configured.
+    pub fn has_access_token_ref(&self) -> bool {
+        self.access_token_ref.is_some()
+    }
+
+    /// Return the configured maximum Core connection count.
+    pub const fn max_connections(&self) -> usize {
+        self.max_connections
+    }
+
+    /// Return the configured session-stream limit.
+    pub const fn max_sessions_per_connection(&self) -> usize {
+        self.max_sessions_per_connection
+    }
+
+    /// Return the ordinary control timeout.
+    pub const fn control_timeout_secs(&self) -> u64 {
+        self.control_timeout_secs
+    }
+
+    /// Return the configured Relay identity generation.
+    pub const fn relay_generation(&self) -> u64 {
+        self.relay_generation
+    }
+
+    /// Return the optional development-only recovery directory.
+    pub fn development_recovery_directory(&self) -> Option<&Path> {
+        self.development_recovery_directory.as_deref()
+    }
+
+    /// Return the optional fixed Herdr workspace verifier settings.
+    pub fn pairing(&self) -> Option<&IrohPairingConfig> {
+        self.pairing.as_ref()
+    }
+
+    /// Build the internal iroh endpoint policy from the validated TOML surface.
+    ///
+    /// # Returns
+    /// A bounded endpoint configuration. Official managed hosting remains typed as unavailable
+    /// until protected API-secret resolution is supplied by the Core/admin boundary.
+    pub fn to_endpoint_config(&self) -> RelayResult<IrohRelayConfig> {
+        let control_timeout = std::time::Duration::from_secs(self.control_timeout_secs);
+        let mut config = IrohRelayConfig::new(
+            self.max_connections,
+            self.max_sessions_per_connection,
+            control_timeout,
+        )
+        .map_err(RelayError::from)?
+        .with_bind_addr(self.bind_address()?);
+        config = config
+            .with_relay_generation(self.relay_generation)
+            .map_err(RelayError::from)?;
+        match self.provider {
+            IrohRelayProvider::OfficialPublic => {}
+            IrohRelayProvider::OfficialManaged => {
+                return Err(RelayError::IrohEndpoint {
+                    reason: "provider_unavailable",
+                });
+            }
+            IrohRelayProvider::SelfHosted => {
+                if self.access_token_ref.is_some() {
+                    // Secret resolution is owned by the later Core/admin boundary; fail closed
+                    // until the selected access mode can receive its protected token.
+                    return Err(RelayError::IrohEndpoint {
+                        reason: "provider_unavailable",
+                    });
+                }
+                config = config
+                    .with_relay_urls(&self.relay_urls)
+                    .map_err(RelayError::from)?;
+            }
+        }
+        if let Some(pairing) = self.pairing.as_ref() {
+            let connector =
+                UnixSocketConnector::new(pairing.socket_path.clone(), pairing.expected_uid)
+                    .map_err(|_| RelayError::InvalidConfiguration {
+                        field: "iroh.pairing.socket_path",
+                        reason: "must be an absolute validated Unix socket path",
+                    })?;
+            config = config.with_socket_connector(connector);
+        }
+        if let Some(root) = self.development_recovery_directory.as_ref() {
+            config = config
+                .with_development_recovery_dir(root)
+                .map_err(RelayError::from)?;
+        }
+        Ok(config)
+    }
+
+    /// Return the optional fixed Herdr workspace verifier configuration for endpoint wiring.
+    pub fn pairing_config(&self) -> Option<&IrohPairingConfig> {
+        self.pairing.as_ref()
+    }
+
+    /// Validate provider, resource, path and verifier invariants without side effects.
+    fn validate(&self) -> RelayResult<()> {
+        if self.bind_address.parse::<SocketAddr>().is_err() {
+            return Err(RelayError::InvalidConfiguration {
+                field: "iroh.bind_address",
+                reason: "must be a socket address",
+            });
+        }
+        if self.relay_generation == 0 {
+            return Err(RelayError::InvalidConfiguration {
+                field: "iroh.relay_generation",
+                reason: "must be nonzero",
+            });
+        }
+        if self.max_connections == 0 || self.max_connections > 64 {
+            return Err(RelayError::InvalidConfiguration {
+                field: "iroh.max_connections",
+                reason: "must be between 1 and 64",
+            });
+        }
+        if self.max_sessions_per_connection == 0 || self.max_sessions_per_connection > 64 {
+            return Err(RelayError::InvalidConfiguration {
+                field: "iroh.max_sessions_per_connection",
+                reason: "must be between 1 and 64",
+            });
+        }
+        if self.control_timeout_secs == 0 || self.control_timeout_secs > 30 {
+            return Err(RelayError::InvalidConfiguration {
+                field: "iroh.control_timeout_secs",
+                reason: "must be between 1 and 30 seconds",
+            });
+        }
+        if self.relay_urls.len() > 4 {
+            return Err(RelayError::InvalidConfiguration {
+                field: "iroh.relay_urls",
+                reason: "must contain at most four URLs",
+            });
+        }
+        if self.relay_urls.iter().any(|url| {
+            url.is_empty()
+                || url.len() > 512
+                || !url.is_ascii()
+                || url.chars().any(|character| character.is_whitespace())
+        }) {
+            return Err(RelayError::InvalidConfiguration {
+                field: "iroh.relay_urls",
+                reason: "must contain bounded non-whitespace ASCII URLs",
+            });
+        }
+        if self.api_secret_ref.as_deref().is_some_and(|value| {
+            value.is_empty()
+                || value.len() > 128
+                || !value.is_ascii()
+                || value.chars().any(|character| character.is_whitespace())
+        }) {
+            return Err(RelayError::InvalidConfiguration {
+                field: "iroh.api_secret_ref",
+                reason: "must be a bounded non-whitespace ASCII reference",
+            });
+        }
+        if self.access_token_ref.as_deref().is_some_and(|value| {
+            value.is_empty()
+                || value.len() > 128
+                || !value.is_ascii()
+                || value.chars().any(|character| character.is_whitespace())
+        }) {
+            return Err(RelayError::InvalidConfiguration {
+                field: "iroh.access_token_ref",
+                reason: "must be a bounded non-whitespace ASCII reference",
+            });
+        }
+        match self.provider {
+            IrohRelayProvider::OfficialPublic => {
+                if !self.relay_urls.is_empty()
+                    || self.api_secret_ref.is_some()
+                    || self.access_token_ref.is_some()
+                {
+                    return Err(RelayError::InvalidConfiguration {
+                        field: "iroh.provider",
+                        reason: "official_public does not accept URL or credential fields",
+                    });
+                }
+            }
+            IrohRelayProvider::OfficialManaged => {
+                if self.relay_urls.is_empty()
+                    || self.api_secret_ref.is_none()
+                    || self.access_token_ref.is_some()
+                {
+                    return Err(RelayError::InvalidConfiguration {
+                        field: "iroh.provider",
+                        reason: "official_managed requires relay URLs and api_secret_ref only",
+                    });
+                }
+            }
+            IrohRelayProvider::SelfHosted => {
+                if self.relay_urls.is_empty() || self.api_secret_ref.is_some() {
+                    return Err(RelayError::InvalidConfiguration {
+                        field: "iroh.provider",
+                        reason: "self_hosted requires relay URLs and forbids api_secret_ref",
+                    });
+                }
+            }
+        }
+        if let Some(directory) = self.development_recovery_directory.as_ref()
+            && !directory.is_absolute()
+        {
+            return Err(RelayError::InvalidConfiguration {
+                field: "iroh.development_recovery_directory",
+                reason: "must be absolute",
+            });
+        }
+        if let Some(pairing) = self.pairing.as_ref() {
+            if !pairing.socket_path.is_absolute() {
+                return Err(RelayError::InvalidConfiguration {
+                    field: "iroh.pairing.socket_path",
+                    reason: "must be absolute",
+                });
+            }
+            if !pairing.verification_cwd.is_absolute() {
+                return Err(RelayError::InvalidConfiguration {
+                    field: "iroh.pairing.verification_cwd",
+                    reason: "must be absolute",
+                });
+            }
+            if pairing.session.is_empty()
+                || pairing.session.len() > 64
+                || pairing.session == "."
+                || pairing.session == ".."
+            {
+                return Err(RelayError::InvalidConfiguration {
+                    field: "iroh.pairing.session",
+                    reason: "must be a bounded normalized session",
+                });
+            }
+            if !pairing
+                .session
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+            {
+                return Err(RelayError::InvalidConfiguration {
+                    field: "iroh.pairing.session",
+                    reason: "contains unsupported characters",
+                });
+            }
+        }
+        Ok(())
+    }
+}
+
 /// The default single-device UDP port.
 pub const QRM_DEFAULT_PORT: u16 = 18_743;
 /// The maximum complete HDQM frame size.
@@ -765,6 +1215,58 @@ buffer_bytes = 65536
 handshake_timeout_secs = 5
 idle_timeout_secs = 900
 "#;
+
+    // TEST:relay/src/config.rs[tests::iroh_runtime_configuration_matrix]
+    #[test]
+    fn iroh_runtime_configuration_matrix() {
+        let parse = |body: &str| IrohRuntimeConfig::from_toml_str(&format!("[iroh]\n{body}"));
+        let public = parse("").expect("official public defaults");
+        assert_eq!(public.provider(), IrohRelayProvider::OfficialPublic);
+        assert_eq!(
+            public
+                .with_bind_port(18_744)
+                .unwrap()
+                .bind_address()
+                .unwrap()
+                .port(),
+            18_744
+        );
+        assert!(parse("relay_urls = [\"https://relay.example.test\"]").is_err());
+        assert!(parse("api_secret_ref = \"secret/ref\"").is_err());
+        assert!(parse("access_token_ref = \"secret/ref\"").is_err());
+        assert!(
+            parse("provider = \"official_managed\"\nrelay_urls = [\"https://relay.example.test\"]")
+                .is_err()
+        );
+
+        let managed = parse("provider = \"official_managed\"\nrelay_urls = [\"https://relay.example.test\"]\napi_secret_ref = \"secret/ref\"").expect("managed profile");
+        assert!(matches!(
+            managed.to_endpoint_config(),
+            Err(RelayError::IrohEndpoint {
+                reason: "provider_unavailable"
+            })
+        ));
+        let self_hosted =
+            parse("provider = \"self_hosted\"\nrelay_urls = [\"https://relay.example.test\"]")
+                .expect("self-hosted profile");
+        assert!(self_hosted.to_endpoint_config().is_ok());
+        let self_hosted_auth = parse("provider = \"self_hosted\"\nrelay_urls = [\"https://relay.example.test\"]\naccess_token_ref = \"secret/ref\"").expect("self-hosted auth profile");
+        assert!(matches!(
+            self_hosted_auth.to_endpoint_config(),
+            Err(RelayError::IrohEndpoint {
+                reason: "provider_unavailable"
+            })
+        ));
+
+        // Relative pairing paths are rejected before endpoint construction.
+        assert!(parse("[iroh.pairing]\nsocket_path = \"relative.sock\"\nexpected_uid = 1\nsession = \"default\"\nverification_cwd = \"/tmp\"").is_err());
+        // Relative recovery roots cannot scope authority records safely.
+        assert!(parse("development_recovery_directory = \"relative\"").is_err());
+        let defaults =
+            IrohRuntimeConfig::from_toml_str(DEFAULT_IROH_CONFIG_TOML).expect("default template");
+        assert_eq!(defaults.bind_address().unwrap().port(), 18_743);
+        assert!(defaults.to_endpoint_config().is_ok());
+    }
 
     // TEST:relay/src/config.rs[tests::qrm_config_has_one_listener]
     #[test]

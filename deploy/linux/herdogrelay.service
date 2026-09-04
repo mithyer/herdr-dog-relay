@@ -7,7 +7,7 @@ StartLimitIntervalSec=300
 StartLimitBurst=5
 
 [Service]
-ExecStart=%h/.local/bin/herdogrelay --config %h/.config/herdr-dog/relay.toml
+ExecStart=%h/.local/bin/herdogrelay --config %h/.config/herdr-dog/iroh-relay.toml
 Restart=on-failure
 RestartSec=30s
 UMask=0077

@@ -1,0 +1,21 @@
+# iroh application Relay runtime template.
+# Replace the placeholder pairing paths with the protected local Herdr configuration.
+[iroh]
+bind_address = "127.0.0.1:18743"
+provider = "official_public"
+relay_urls = []
+max_connections = 64
+max_sessions_per_connection = 64
+control_timeout_secs = 5
+relay_generation = 1
+# Omit development_recovery_directory for a per-process disposable generated identity with no restart
+# persistence (local development/tests only). Set it for store-backed, restart-safe local recovery;
+# missing or corrupt records fail closed.
+# development_recovery_directory = "/absolute/path/to/local/recovery"
+
+# Omitting this section keeps pairing fail-closed until a verifier is configured.
+# [iroh.pairing]
+# socket_path = "/absolute/path/to/herdr.sock"
+# expected_uid = 501
+# session = "default"
+# verification_cwd = "/absolute/path/to/verification-cwd"

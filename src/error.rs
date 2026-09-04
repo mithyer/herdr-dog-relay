@@ -45,6 +45,12 @@ pub enum RelayError {
         /// Stable startup reason.
         reason: &'static str,
     },
+    /// A failure occurred in the native iroh application Relay endpoint.
+    #[error("iroh endpoint operation failed: {reason}")]
+    IrohEndpoint {
+        /// Stable endpoint failure category without provider or path details.
+        reason: &'static str,
+    },
     /// A TLS certificate, key or trust configuration failed.
     #[error("TLS configuration failed: {reason}")]
     TlsConfiguration {
@@ -102,6 +108,22 @@ impl RelayError {
             operation,
             kind: source.kind(),
         }
+    }
+}
+
+impl From<crate::iroh_endpoint::IrohEndpointError> for RelayError {
+    /// Map an iroh endpoint failure into the public redacted Relay error surface.
+    fn from(error: crate::iroh_endpoint::IrohEndpointError) -> Self {
+        let reason = match error {
+            crate::iroh_endpoint::IrohEndpointError::InvalidConfiguration { .. } => {
+                "invalid_configuration"
+            }
+            crate::iroh_endpoint::IrohEndpointError::Bind => "bind",
+            crate::iroh_endpoint::IrohEndpointError::Shutdown => "shutdown",
+            crate::iroh_endpoint::IrohEndpointError::ProviderUnavailable => "provider_unavailable",
+            crate::iroh_endpoint::IrohEndpointError::AuthorityStorage => "authority_storage",
+        };
+        Self::IrohEndpoint { reason }
     }
 }
 

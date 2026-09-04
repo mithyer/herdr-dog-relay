@@ -32,6 +32,8 @@ pub(crate) fn is_valid_hdb1_session(value: &str) -> bool {
 
 /// Protected persistent App allowlist and generation store.
 pub mod allowlist;
+/// Relay-owned bounded development-insecure recovery records.
+pub(crate) mod authority_store;
 /// Schema-neutral Relay-side HDB1 hidden-workspace verifier and issuance fake.
 #[cfg(any(test, feature = "contract-test-support"))]
 #[allow(dead_code)]
